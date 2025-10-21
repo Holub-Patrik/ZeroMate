@@ -1,5 +1,5 @@
 include_guard()
-cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.10)
 
 # General info about the project
 project(ZeroMate

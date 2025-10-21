@@ -8,6 +8,8 @@
 
 // STL imports (excluded from Doxygen)
 /// \cond
+#include <algorithm>
+#include <cstddef>
 #include <filesystem>
 #include <unordered_map>
 /// \endcond
@@ -173,15 +175,12 @@ namespace zero_mate::gui
         {
             // Render external peripherals.
             // clang-format off
-            std::for_each(s_windows.begin(),
-                          s_windows.end(),
+            std::ranges::for_each(s_windows,
                           [](const auto& window) -> void { window->Render(); });
             // clang-format on
 
             /// Render emulator windows and peripheral windows
-            std::for_each(soc::g_external_peripherals.begin(),
-                          soc::g_external_peripherals.end(),
-                          [](const auto& window) -> void { window->Render(); });
+            std::ranges::for_each(soc::g_external_peripherals, [](const auto& window) -> void { window->Render(); });
         }
 
         // -------------------------------------------------------------------------------------------------------------
@@ -191,12 +190,10 @@ namespace zero_mate::gui
         // -------------------------------------------------------------------------------------------------------------
         void Init_External_GUIs(ImGuiContext* imgui_context, ImPlotContext* implot_context)
         {
-            std::for_each(soc::g_external_peripherals.begin(),
-                          soc::g_external_peripherals.end(),
-                          [&](const auto& window) -> void {
-                              window->Set_ImGui_Context(imgui_context);
-                              window->Set_ImPlot_Context(implot_context);
-                          });
+            std::ranges::for_each(soc::g_external_peripherals, [&](const auto& window) -> void {
+                window->Set_ImGui_Context(imgui_context);
+                window->Set_ImPlot_Context(implot_context);
+            });
         }
     }
 

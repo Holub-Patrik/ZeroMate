@@ -58,6 +58,7 @@ target_link_libraries(zero_mate
         capstone
         demangle
         logging_system
+        tbb
 )
 
 # Set the rpath to look for shared libraries relative to the executable
