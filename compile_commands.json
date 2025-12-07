@@ -1,1 +1,1 @@
-build/unix_makefiles/clang/release/compile_commands.json
+build/ninja/clang/release/compile_commands.json
