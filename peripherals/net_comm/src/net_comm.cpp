@@ -124,7 +124,7 @@ CRemote_GPIO::CRemote_GPIO(const std::string& name,
     std::strncpy(m_remote_ip_buffer, "127.0.0.1", sizeof(m_remote_ip_buffer));
 
     // Subscribe to all pins passed in construction
-    for (auto pin : m_pins)
+    for (const auto& pin : m_pins)
     {
         m_gpio_subscription.insert(pin);
     }
@@ -178,8 +178,15 @@ void CRemote_GPIO::Init_Socket()
     inet_pton(AF_INET, m_remote_ip_buffer, &m_remote_addr.sin_addr);
 
     m_connected = true;
-    Start_Listening_Thread();
-    m_logging_system->Info("UDP Socket Initialized");
+    Init_Listening_Thread();
+    const auto msg = std::string{ "UDP Socket Initialized on fd: " } + std::to_string(m_sockfd);
+    m_logging_system->Info(msg.c_str());
+}
+
+void CRemote_GPIO::Init_Listening_Thread()
+{
+    m_running = true;
+    m_listener_thread = std::thread(&CRemote_GPIO::Listening_Loop, this);
 }
 
 void CRemote_GPIO::Start_Listening_Thread()
@@ -252,9 +259,14 @@ void CRemote_GPIO::Listening_Loop()
 
 void CRemote_GPIO::Send_UDP_Packet(std::uint8_t payload)
 {
+    const auto state =
+    std::string{ "Connected" } + (m_connected ? "True" : "False") + "| SockFD: " + std::to_string(m_sockfd);
+    m_logging_system->Debug(state.c_str());
+
     if (!m_connected || m_sockfd < 0)
         return;
 
+    m_logging_system->Debug("Sending packet");
     sendto(m_sockfd, &payload, sizeof(payload), 0, (const struct sockaddr*)&m_remote_addr, sizeof(m_remote_addr));
 }
 
@@ -266,6 +278,8 @@ std::uint8_t CRemote_GPIO::Construct_Packet(std::uint32_t net_pin, bool value)
     packet |= (CBit_Stream_Parser::Header_Pattern << 6); // Shift header to MSB
     packet |= ((net_pin & 0x1F) << 1);                   // Mask pin to 5 bits, shift
     packet |= (value ? 1 : 0);                           // LSB
+
+    m_logging_system->Debug("Packet assembled");
 
     return packet;
 }
@@ -282,16 +296,19 @@ void CRemote_GPIO::Increment_Passed_Cycles(std::uint32_t count)
         m_command_queue.pop();
 
         // Check if we have a mapping for this Net Pin to a Local GPIO
-        if (m_map_net_to_local.find(cmd.net_pin_idx) != m_map_net_to_local.end())
+        if (m_map_net_to_local.contains(cmd.net_pin_idx))
         {
             std::uint32_t local_pin = m_map_net_to_local[cmd.net_pin_idx];
             m_set_pin(local_pin, cmd.value);
 
             // Log for debug
-            // std::string msg = "NetPin " + std::to_string(cmd.net_pin_idx) +
-            //                   " -> Local " + std::to_string(local_pin) +
-            //                   " Val: " + std::to_string(cmd.value);
-            // m_logging_system->Debug(msg.c_str());
+            std::string msg = "NetPin " + std::to_string(cmd.net_pin_idx) + " -> Local " + std::to_string(local_pin) +
+                              " Val: " + std::to_string(cmd.value);
+            m_logging_system->Debug(msg.c_str());
+        }
+        else
+        {
+            m_logging_system->Debug("No mapping found Increment_Passed_Cycles Net -> Local");
         }
     }
 }
@@ -306,6 +323,10 @@ void CRemote_GPIO::GPIO_Subscription_Callback(std::uint32_t pin_idx)
 
         std::uint8_t payload = Construct_Packet(net_pin, state);
         Send_UDP_Packet(payload);
+    }
+    else
+    {
+        m_logging_system->Debug("No mapping found GPIO_Subscription_Callback Local -> Net");
     }
 }
 

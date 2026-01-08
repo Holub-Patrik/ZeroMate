@@ -88,6 +88,7 @@ public:
 private:
     // Network Management
     void Init_Socket();
+    void Init_Listening_Thread();
     void Start_Listening_Thread();
     void Stop_Listening_Thread();
     void Listening_Loop();

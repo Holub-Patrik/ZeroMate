@@ -5,5 +5,5 @@ cd build
 
 cmake -G "Unix Makefiles" -DCMAKE_TOOLCHAIN_FILE="toolchain-arm-none-eabi-rpi0.cmake" ..
 
-make
-#make VERBOSE=1
+# make
+make VERBOSE=1
