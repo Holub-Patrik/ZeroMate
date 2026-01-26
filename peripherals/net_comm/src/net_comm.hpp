@@ -12,11 +12,81 @@
 #include <map>
 #include <vector>
 #include <string>
-#include <netinet/in.h> // Assuming Linux/Unix for socket headers based on context
+#include <netinet/in.h>
 #include <arpa/inet.h>
+#include <array>
 
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
+
+constexpr std::uint8_t QuickMapSize = 64;
+
+using NoBitBehaviour = enum : std::uint8_t
+{
+    Zero,
+    One,
+    Repeat,
+};
+
+using ConnectionConfig = struct
+{
+    NoBitBehaviour behaviour;
+    int banging_rate;
+    struct sockaddr;
+};
+
+class GPIOMap
+{
+private:
+    std::array<std::uint8_t, QuickMapSize> m_map;
+
+public:
+    GPIOMap()
+    : m_map()
+    {
+        for (std::uint8_t& mapping : m_map)
+        {
+            mapping = UINT8_MAX;
+        }
+    }
+
+    void set(const std::uint8_t src, const std::uint8_t dst) noexcept
+    {
+        m_map[src] = dst;
+    }
+
+    [[nodiscard]] std::uint8_t get(const std::uint8_t src) const noexcept
+    {
+        return m_map[src];
+    }
+
+    [[nodiscard]] bool contains(const std::uint8_t pos) const noexcept
+    {
+        return m_map[pos] != UINT8_MAX;
+    }
+
+    [[nodiscard]] const std::array<std::uint8_t, QuickMapSize>& _get_arr() const noexcept
+    {
+        return m_map;
+    }
+};
+
+class Connection
+{
+private:
+    int* m_bit_r; // place to read the bit to set from
+    int m_bit_w;  // bit to write
+    ConnectionConfig m_conf;
+
+public:
+    void WriteLoop()
+    {
+    }
+
+    void ReadLoop()
+    {
+    }
+};
 
 // ---------------------------------------------------------------------------------------------------------------------
 /// \class CBit_Stream_Parser
@@ -92,10 +162,10 @@ private:
     void Start_Listening_Thread();
     void Stop_Listening_Thread();
     void Listening_Loop();
-    void Send_UDP_Packet(std::uint8_t payload);
+    void Send_UDP_Packet(const std::uint8_t payload);
 
     // Protocol Helper
-    std::uint8_t Construct_Packet(std::uint32_t net_pin, bool value);
+    std::uint8_t Construct_Packet(const std::uint8_t net_pin, const bool value);
 
     // UI Rendering
     void Render_Settings();
@@ -124,9 +194,9 @@ private:
 
     // Mappings
     // Key: Local GPIO Pin, Value: Net Pin ID (Outbound)
-    std::map<std::uint32_t, std::uint32_t> m_map_local_to_net;
+    GPIOMap m_map_local_to_net;
     // Key: Net Pin ID, Value: Local GPIO Pin (Inbound)
-    std::map<std::uint32_t, std::uint32_t> m_map_net_to_local;
+    GPIOMap m_map_net_to_local;
 
     // Parsing & Synchronization
     CBit_Stream_Parser m_parser;

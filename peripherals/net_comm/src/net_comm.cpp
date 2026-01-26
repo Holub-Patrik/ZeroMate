@@ -228,49 +228,34 @@ void CRemote_GPIO::Listening_Loop()
 
         ssize_t n = recvfrom(m_sockfd, buffer, sizeof(buffer), 0, (struct sockaddr*)&cliaddr, &len);
 
-        if (n > 0)
+        // Process all received bytes
+        for (ssize_t i = 0; i < n; ++i)
         {
-            // Process all received bytes
-            for (ssize_t i = 0; i < n; ++i)
-            {
-                auto cmds = m_parser.Parse_Byte(buffer[i]);
+            auto cmds = m_parser.Parse_Byte(buffer[i]);
 
-                if (!cmds.empty())
-                {
-                    std::lock_guard<std::mutex> lock(m_command_queue_mutex);
-                    for (const auto& cmd : cmds)
-                    {
-                        m_command_queue.push(cmd);
-                    }
-                }
-            }
-        }
-        else
-        {
-            // Error or closed
-            if (m_running)
+            if (!cmds.empty())
             {
-                // Simple yield/sleep to prevent tight loop on error
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                std::lock_guard<std::mutex> lock(m_command_queue_mutex);
+                for (const auto& cmd : cmds)
+                {
+                    m_command_queue.push(cmd);
+                }
             }
         }
     }
 }
 
-void CRemote_GPIO::Send_UDP_Packet(std::uint8_t payload)
+void CRemote_GPIO::Send_UDP_Packet(const std::uint8_t payload)
 {
-    const auto state =
-    std::string{ "Connected" } + (m_connected ? "True" : "False") + "| SockFD: " + std::to_string(m_sockfd);
-    m_logging_system->Debug(state.c_str());
-
     if (!m_connected || m_sockfd < 0)
+    {
         return;
+    }
 
-    m_logging_system->Debug("Sending packet");
     sendto(m_sockfd, &payload, sizeof(payload), 0, (const struct sockaddr*)&m_remote_addr, sizeof(m_remote_addr));
 }
 
-std::uint8_t CRemote_GPIO::Construct_Packet(std::uint32_t net_pin, bool value)
+std::uint8_t CRemote_GPIO::Construct_Packet(const std::uint8_t net_pin, const bool value)
 {
     // Format: 2 bits Header (01), 5 bits Pin, 1 bit Value
     std::uint8_t packet = 0;
@@ -278,8 +263,6 @@ std::uint8_t CRemote_GPIO::Construct_Packet(std::uint32_t net_pin, bool value)
     packet |= (CBit_Stream_Parser::Header_Pattern << 6); // Shift header to MSB
     packet |= ((net_pin & 0x1F) << 1);                   // Mask pin to 5 bits, shift
     packet |= (value ? 1 : 0);                           // LSB
-
-    m_logging_system->Debug("Packet assembled");
 
     return packet;
 }
@@ -298,12 +281,12 @@ void CRemote_GPIO::Increment_Passed_Cycles(std::uint32_t count)
         // Check if we have a mapping for this Net Pin to a Local GPIO
         if (m_map_net_to_local.contains(cmd.net_pin_idx))
         {
-            std::uint32_t local_pin = m_map_net_to_local[cmd.net_pin_idx];
+            std::uint8_t local_pin = m_map_net_to_local.get(cmd.net_pin_idx);
             m_set_pin(local_pin, cmd.value);
 
             // Log for debug
             std::string msg = "NetPin " + std::to_string(cmd.net_pin_idx) + " -> Local " + std::to_string(local_pin) +
-                              " Val: " + std::to_string(cmd.value);
+                              " Val: " + std::to_string(static_cast<int>(cmd.value));
             m_logging_system->Debug(msg.c_str());
         }
         else
@@ -315,11 +298,12 @@ void CRemote_GPIO::Increment_Passed_Cycles(std::uint32_t count)
 
 void CRemote_GPIO::GPIO_Subscription_Callback(std::uint32_t pin_idx)
 {
+    const std::uint8_t pin_idx_u8 = static_cast<std::uint8_t>(pin_idx);
     // Check if this local pin is mapped to a network pin (Outbound)
-    if (m_map_local_to_net.find(pin_idx) != m_map_local_to_net.end())
+    if (m_map_local_to_net.contains(pin_idx_u8))
     {
-        std::uint32_t net_pin = m_map_local_to_net[pin_idx];
-        bool state = m_read_pin(pin_idx);
+        const std::uint8_t net_pin = m_map_local_to_net.get(pin_idx_u8);
+        const bool state = m_read_pin(pin_idx);
 
         std::uint8_t payload = Construct_Packet(net_pin, state);
         Send_UDP_Packet(payload);
@@ -399,7 +383,7 @@ void CRemote_GPIO::Render_Mappings()
     ImGui::SameLine();
     if (ImGui::Button("Add##Out"))
     {
-        m_map_local_to_net[m_pins[m_ui_selected_local_pin_idx]] = m_ui_target_net_pin;
+        m_map_local_to_net.set(m_pins[m_ui_selected_local_pin_idx], m_ui_target_net_pin);
     }
 
     // List Outbound Mappings
@@ -409,22 +393,23 @@ void CRemote_GPIO::Render_Mappings()
         ImGui::TableSetupColumn("Net Pin ID");
         ImGui::TableHeadersRow();
 
-        for (auto it = m_map_local_to_net.begin(); it != m_map_local_to_net.end();)
+        std::size_t index = 0;
+        for (const std::uint8_t mapping : m_map_local_to_net._get_arr())
         {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::Text("%d", it->first);
-            ImGui::TableSetColumnIndex(1);
-            ImGui::Text("%d", it->second);
-            ImGui::SameLine();
-            if (ImGui::SmallButton(("X##Out" + std::to_string(it->first)).c_str()))
+            if (mapping != UINT8_MAX)
             {
-                it = m_map_local_to_net.erase(it);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("%zu", index);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%d", mapping);
+                ImGui::SameLine();
+                if (ImGui::SmallButton(("X##Out" + std::to_string(index)).c_str()))
+                {
+                    m_map_local_to_net.set(index, UINT8_MAX);
+                }
             }
-            else
-            {
-                ++it;
-            }
+            index++;
         }
         ImGui::EndTable();
     }
@@ -458,7 +443,7 @@ void CRemote_GPIO::Render_Mappings()
     ImGui::SameLine();
     if (ImGui::Button("Add##In"))
     {
-        m_map_net_to_local[m_ui_selected_net_pin_source] = m_pins[m_ui_target_local_pin_idx];
+        m_map_net_to_local.set(m_ui_selected_net_pin_source, m_pins[m_ui_selected_net_pin_source]);
     }
 
     // List Inbound Mappings
@@ -468,22 +453,23 @@ void CRemote_GPIO::Render_Mappings()
         ImGui::TableSetupColumn("Local GPIO");
         ImGui::TableHeadersRow();
 
-        for (auto it = m_map_net_to_local.begin(); it != m_map_net_to_local.end();)
+        std::size_t index = 0;
+        for (const std::uint8_t mapping : m_map_net_to_local._get_arr())
         {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::Text("%d", it->first);
-            ImGui::TableSetColumnIndex(1);
-            ImGui::Text("%d", it->second);
-            ImGui::SameLine();
-            if (ImGui::SmallButton(("X##In" + std::to_string(it->first)).c_str()))
+            if (mapping != UINT8_MAX)
             {
-                it = m_map_net_to_local.erase(it);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("%zu", index);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%d", mapping);
+                ImGui::SameLine();
+                if (ImGui::SmallButton(("X##Out" + std::to_string(index)).c_str()))
+                {
+                    m_map_net_to_local.set(index, UINT8_MAX);
+                }
             }
-            else
-            {
-                ++it;
-            }
+            index++;
         }
         ImGui::EndTable();
     }
