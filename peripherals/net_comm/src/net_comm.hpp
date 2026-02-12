@@ -1,15 +1,12 @@
 // ---------------------------------------------------------------------------------------------------------------------
 /// \file net_comm.hpp
-/// \brief Defines a remote GPIO peripheral communicating via UDP with a stateful bit-parser.
+/// \brief Defines a remote GPIO peripheral communicating via UDP
 // ---------------------------------------------------------------------------------------------------------------------
 
 #pragma once
 
 #include <thread>
 #include <atomic>
-#include <mutex>
-#include <queue>
-#include <map>
 #include <vector>
 #include <string>
 #include <netinet/in.h>
@@ -20,20 +17,6 @@
 #include "zero_mate/external_peripheral.hpp"
 
 constexpr std::uint8_t QuickMapSize = 64;
-
-using NoBitBehaviour = enum : std::uint8_t
-{
-    Zero,
-    One,
-    Repeat,
-};
-
-using ConnectionConfig = struct
-{
-    NoBitBehaviour behaviour;
-    int banging_rate;
-    struct sockaddr;
-};
 
 class GPIOMap
 {
@@ -71,70 +54,6 @@ public:
     }
 };
 
-class Connection
-{
-private:
-    int* m_bit_r; // place to read the bit to set from
-    int m_bit_w;  // bit to write
-    ConnectionConfig m_conf;
-
-public:
-    void WriteLoop()
-    {
-    }
-
-    void ReadLoop()
-    {
-    }
-};
-
-// ---------------------------------------------------------------------------------------------------------------------
-/// \class CBit_Stream_Parser
-/// \brief A stateful parser that consumes bits to form commands. Bit-agnostic implementation.
-// ---------------------------------------------------------------------------------------------------------------------
-class CBit_Stream_Parser
-{
-public:
-    struct TCommand
-    {
-        std::uint32_t net_pin_idx;
-        bool value;
-    };
-
-    enum class NState
-    {
-        Header,
-        Pin_Index,
-        Value,
-        Execute
-    };
-
-    // Protocol Constants
-    static constexpr std::uint8_t Header_Bits_Len = 2;
-    static constexpr std::uint8_t Header_Pattern = 0b01; // 0x01
-    static constexpr std::uint8_t Pin_Bits_Len = 5;
-    static constexpr std::uint8_t Value_Bits_Len = 1;
-
-public:
-    CBit_Stream_Parser();
-
-    /// \brief Pushes a byte into the parser (processed MSB to LSB or user pref).
-    /// \return A vector of commands parsed from this specific byte (could be 0 or more).
-    std::vector<TCommand> Parse_Byte(std::uint8_t byte);
-
-    /// \brief Resets the parser state.
-    void Reset();
-
-private:
-    void Process_Bit(bool bit, std::vector<TCommand>& commands);
-
-private:
-    NState m_state;
-    std::uint32_t m_accumulator;
-    std::uint32_t m_bits_read;
-    TCommand m_current_command;
-};
-
 // ---------------------------------------------------------------------------------------------------------------------
 /// \class CRemote_GPIO
 /// \brief External peripheral for UDP-based remote GPIO control.
@@ -162,10 +81,7 @@ private:
     void Start_Listening_Thread();
     void Stop_Listening_Thread();
     void Listening_Loop();
-    void Send_UDP_Packet(const std::uint8_t payload);
-
-    // Protocol Helper
-    std::uint8_t Construct_Packet(const std::uint8_t net_pin, const bool value);
+    void Send_UDP_Packet(const std::uint8_t value, const std::uint8_t source_pin);
 
     // UI Rendering
     void Render_Settings();
@@ -197,11 +113,6 @@ private:
     GPIOMap m_map_local_to_net;
     // Key: Net Pin ID, Value: Local GPIO Pin (Inbound)
     GPIOMap m_map_net_to_local;
-
-    // Parsing & Synchronization
-    CBit_Stream_Parser m_parser;
-    std::mutex m_command_queue_mutex;
-    std::queue<CBit_Stream_Parser::TCommand> m_command_queue;
 
     // UI Helpers
     int m_ui_selected_local_pin_idx;
