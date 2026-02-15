@@ -174,7 +174,7 @@ void CRemote_GPIO::Listening_Loop()
     }
 }
 
-void CRemote_GPIO::Send_UDP_Packet(const uint8_t value, const uint8_t source_pin)
+inline void CRemote_GPIO::Send_UDP_Packet(const uint8_t value, const uint8_t source_pin)
 {
     if (!m_connected || m_sockfd < 0)
     {
@@ -197,12 +197,12 @@ void CRemote_GPIO::GPIO_Subscription_Callback(std::uint32_t pin_idx)
     {
         const std::uint8_t net_pin = m_map_local_to_net.get(pin_idx_u8);
         const std::uint8_t state = m_read_pin(pin_idx) ? WRITE_ONE : WRITE_ZERO;
-
-        Send_UDP_Packet(state, pin_idx_u8);
-    }
-    else
-    {
-        m_logging_system->Debug("No mapping found GPIO_Subscription_Callback Local -> Net");
+        // attempt to reduce cals
+        if (state != m_state_map.get(pin_idx_u8))
+        {
+            Send_UDP_Packet(state, pin_idx_u8);
+            m_state_map.set(pin_idx_u8, state);
+        }
     }
 }
 

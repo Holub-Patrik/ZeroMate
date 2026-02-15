@@ -54,6 +54,32 @@ public:
     }
 };
 
+class GPIOLastState
+{
+private:
+    std::array<std::uint8_t, QuickMapSize> m_map;
+
+public:
+    GPIOLastState()
+    : m_map()
+    {
+        for (std::uint8_t& mapping : m_map)
+        {
+            mapping = 0;
+        }
+    }
+
+    void set(const std::uint8_t pin, const std::uint8_t value) noexcept
+    {
+        m_map[pin] = value;
+    }
+
+    [[nodiscard]] std::uint8_t get(const std::uint8_t pin) noexcept
+    {
+        return m_map[pin];
+    }
+};
+
 // ---------------------------------------------------------------------------------------------------------------------
 /// \class CRemote_GPIO
 /// \brief External peripheral for UDP-based remote GPIO control.
@@ -113,6 +139,9 @@ private:
     GPIOMap m_map_local_to_net;
     // Key: Net Pin ID, Value: Local GPIO Pin (Inbound)
     GPIOMap m_map_net_to_local;
+
+    // Last state of pin to reduce send/recv calls
+    GPIOLastState m_state_map;
 
     // UI Helpers
     int m_ui_selected_local_pin_idx;
