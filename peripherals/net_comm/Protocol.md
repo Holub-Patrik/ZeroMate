@@ -2,21 +2,101 @@
 
 Client-Server doesn't matter in here, only the one who tries to connect to the other side
 
+The app should be relatively generic to support even more complex connection schemes.
+
 ## Communication steps
 
-1) Both sides open port for communication for setup and 2 ports for TX/RX for back and forth communication
+1) Both sides open port for communication for setup and  port for back and forth communication
 2) One side sends a configuration to the other, the other responds accept or decline
 3) In case of decline the connection is considered "dropped"
 4) After accept, an acknowledgement of accept should be sent
     - This step basically ensures that both sides are ok with sending/receiving data
 
 ## Setup definition
+### Send info
+- Magic byte
+- Protocol identifier (most likely a number from an enum)
+- Explicit/Implicit clock rate
+    - Implicit brings higher overhead in packets (data + diffs from 0th bit)
+    - Explicit is started with the 1st bit and abides the speed required
+    - Explicit doesn't require diffs so the data can be smaller
+- Port informatioa
+    - Opened port for RX (Incoming)
 
-- Protocol information (most likely a number from an enum)
-- Clock rate to use ?
+### ACK info
+- Magic byte
+- Accept/Decline
+- Port opened for RX (Incoming)
+
+## Data definition
+
+Scratch to work on data to be used
+
+TODO:
+- Where to store relation between pins and connections
+
+```cpp
+// configuration port/socket can be only one as it's data rate isn't too high
+in_port_t config_port;
+// for each connection a new port will be opened
+std::map<in_port_t, bool> opened_ports{};
+
+enum Protocol {
+    UART,
+    I2C,
+    SPI,
+};
+
+
+struct Connection {
+    enum Protocol;
+
+    // Explicit Clock rate will be (1 / (10^clock_unit)) * clock_value 
+    // so for example:
+    // - clock_unit = 6
+    // - clock_value = 10
+    // - final clock_rate = 10 microseconds
+    bool explicit_clock;
+    std::int8_t clock_unit;
+    std::uint64_t clock_value;
+
+    // when closing connection this is the port to shutdown
+    in_port_t opened_port; 
+
+    // used for recvfrom/sendto
+    // constructed from received config ip
+    struct sockaddr_in other_side;
+};
+
+// map using unique connection ids
+// This unique id is structured as such 0(2bytes) PORT(2bytes) IP(4bytes)
+std::map<std::uint64_t, Connection> connection_map;
+
+// I will need a way to map pins to connections they belong to
+std::map<std::uint8_t, std::uint64_t> pin_to_connection;
+```
+
+### Data notes
+
+#### Sockaddr_in
+```cpp
+struct sockaddr_in {
+    sa_family_t sin_family;
+    in_port_t sin_port; // uint16_t
+    struct in_addr sin_addr;
+};
+
+struct in_addr {
+    in_addr_t s_addr; // uint32_t
+};
+
+// uint32_t -> netlong -> htonl | ntohl
+// uint16_t -> netshort -> htons | ntohs
+```
 
 ## UART
-What needs to be defined:
+
+What needs to be defined in UI:
 
 Start bit count
 Data bit count
@@ -24,12 +104,17 @@ Parity style
 Stop bit count
 
 Depenging on that define the length of the buffer for the message (Most likely byte aligned)
-The messages sent can be quite large
+The messages sent can be quite large so I can afford say for example 4 bytes for data, each including the bit info.
 
 ## I2C
 
 Data message or clock message definition (1st byte)
 If data message, data bit needs to be sent and then a clock signal needs to sent
+
+For I2C from what I understand it will be communication based like this:
+1) The master sends a byte and clock
+2) My component will pulse data and clock for slave while accumulating data from slave
+3) Send back to master and pulse the data
 
 ## SPI
 
