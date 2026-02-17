@@ -5,23 +5,82 @@
 // ---------------------------------------------------------------------------------------------------------------------
 
 #include "net_comm.hpp"
+#include "CircularBufferQueue.hpp"
+
+#include <map>
 #include <unistd.h>
-#include <fcntl.h>
 #include <iostream>
 #include <cstring>
 
-// =====================================================================================================================
-// CBit_Stream_Parser Implementation
-// =====================================================================================================================
-
 constexpr int RECV_BUF_SIZE = 64;
+constexpr std::size_t QUEUE_SIZE = 32;
+
 constexpr std::uint8_t MAGIC_BYTE = 60; // 0x00111100
 constexpr std::uint8_t WRITE_ONE = UINT8_MAX;
 constexpr std::uint8_t WRITE_ZERO = 0;
 
-// =====================================================================================================================
-// CRemote_GPIO Implementation
-// =====================================================================================================================
+// Helper function local to this cpp file
+namespace
+{
+    // constructs a unique id for each connection which is looks like this
+    // 0(2bytes) PORT(2bytes) IP(4bytes)
+    std::uint64_t get_conn_id(struct sockaddr_in* addr)
+    {
+        constexpr unsigned int bit_amount = 8;
+        constexpr unsigned int shift_amount = sizeof(std::uint32_t) * bit_amount;
+
+        auto ret_val = static_cast<std::uint64_t>(0);
+        // this is wrong if the struct isn't 32 bits, add proper conversion to take 1st 4 bytes
+        ret_val |= ntohl(std::bit_cast<std::uint32_t>(addr->sin_addr));
+        const auto temp = static_cast<std::uint64_t>(ntohs(addr->sin_port));
+        ret_val |= (temp << shift_amount);
+
+        return ret_val;
+    }
+
+    // descriptive typedef
+    using conn_id = std::uint64_t;
+}
+
+using protocol = enum : std::uint8_t
+{
+    UART = 0,
+    I2C = 1,
+    SPI = 2,
+};
+
+using conn_info = struct
+{
+    bool explicit_clock;
+    protocol protocol;
+
+    std::int8_t clock_unit;
+    std::uint64_t clock_value;
+    in_port_t opened_port;
+    struct sockaddr_in other_side;
+
+    std::string name;
+};
+
+// Defines the logic and data for accepting new connections
+class Server
+{
+    std::map<conn_id, conn_info> connection_map;
+    // convert this one into a directo lookup later
+    // This might a good usecase for the 3 array datastructure
+    // This map is needed due to callback nature of handling the pin callback
+    std::map<std::uint8_t, conn_id> pin_to_connection;
+    std::map<conn_id, CB::Writer<std::uint8_t, QUEUE_SIZE>> connection_to_queue_map;
+    CB::Reader<std::pair<std::uint8_t, std::uint8_t>, QUEUE_SIZE> pin_write_queue;
+};
+
+// Defines the logic and data for each individual connection
+class Connection
+{
+    conn_info connection;
+    // this will be interesting if it will be fast enough
+    CB::Reader<std::uint8_t, QUEUE_SIZE> bit_queue;
+};
 
 CRemote_GPIO::CRemote_GPIO(const std::string& name,
                            const std::vector<std::uint32_t>& pins,
@@ -122,8 +181,6 @@ void CRemote_GPIO::Start_Listening_Thread()
 void CRemote_GPIO::Stop_Listening_Thread()
 {
     m_running = false;
-    // We might need to send a dummy packet to self to unblock recvfrom,
-    // or close socket. Closing socket is usually enough to wake recvfrom with error.
     if (m_sockfd >= 0)
     {
         shutdown(m_sockfd, SHUT_RDWR);
@@ -131,10 +188,7 @@ void CRemote_GPIO::Stop_Listening_Thread()
         m_sockfd = -1;
     }
 
-    if (m_listener_thread.joinable())
-    {
-        m_listener_thread.join();
-    }
+    m_listener_thread.join();
     m_connected = false;
 }
 
@@ -336,7 +390,7 @@ void CRemote_GPIO::Render_Mappings()
     ImGui::SameLine();
     if (ImGui::Button("Add##In"))
     {
-        if (m_ui_selected_net_pin_source >= 0 && m_ui_selected_net_pin_source < QuickMapSize)
+        if (m_ui_selected_net_pin_source >= 0 && m_ui_selected_net_pin_source < GPIOMapSize)
         {
             m_map_net_to_local.set(static_cast<std::uint8_t>(m_ui_selected_net_pin_source),
                                    static_cast<std::uint8_t>(m_pins[m_ui_target_local_pin_idx]));

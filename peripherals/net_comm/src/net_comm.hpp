@@ -16,12 +16,13 @@
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
 
-constexpr std::uint8_t QuickMapSize = 64;
+// this out to be enough since there are only 52 GPIO pins
+constexpr std::uint8_t GPIOMapSize = 64;
 
 class GPIOMap
 {
 private:
-    std::array<std::uint8_t, QuickMapSize> m_map;
+    std::array<std::uint8_t, GPIOMapSize> m_map;
 
 public:
     GPIOMap()
@@ -48,7 +49,7 @@ public:
         return m_map[pos] != UINT8_MAX;
     }
 
-    [[nodiscard]] const std::array<std::uint8_t, QuickMapSize>& _get_arr() const noexcept
+    [[nodiscard]] const std::array<std::uint8_t, GPIOMapSize>& _get_arr() const noexcept
     {
         return m_map;
     }
@@ -57,7 +58,7 @@ public:
 class GPIOLastState
 {
 private:
-    std::array<std::uint8_t, QuickMapSize> m_map;
+    std::array<std::uint8_t, GPIOMapSize> m_map;
 
 public:
     GPIOLastState()
