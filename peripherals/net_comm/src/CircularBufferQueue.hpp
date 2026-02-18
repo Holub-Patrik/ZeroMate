@@ -5,6 +5,7 @@
  * - There are only 2 threads accessing the queue
  * - Each thread has a clear role, and never switch during the run of the
  * program
+ * - Basically it is meant for Single Producer Single Consumer scenarios
  *
  * The conditions need to be met, since the implementation expects that:
  * - only the writer can advance the write position
@@ -12,6 +13,8 @@
  *
  * The implementation uses std::array as backing type for circular buffers
  * The buffers will be aligned to a power of 2 to allow for faster math
+ * - Instead of modulo, bit masking is used. The same is done in linux kernel
+ *
  * The classes are generic thanks to templates
  * Within templates:
  * - Size specifies the backing array size
@@ -60,15 +63,41 @@ namespace CB
         std::uint64_t cached_write_pos;
 
     public:
+        Reader() = delete;
+        ~Reader() = default;
+
         explicit Reader(Buffer<Type, align_array_size(Size)>& buf)
         : buffer(buf)
         , cached_write_pos(buffer.write_pos.load(std::memory_order_relaxed))
         {
         }
 
+        Reader(const Reader<Type, Size>& other) = delete;
+        Reader& operator=(const Reader<Type, Size>& other) = delete;
+
+        Reader(Reader<Type, Size>&& other) = delete;
+        Reader& operator=(Reader<Type, Size>&& other) = delete;
+
         const Type& peek() const
         {
             return buffer.data[buffer.read_pos.load(std::memory_order_relaxed)];
+        }
+
+        bool try_advance() noexcept
+        {
+            const auto current_read = buffer.read_pos.load(std::memory_order_relaxed);
+            const auto next_read = buffer.advanced_pos(current_read);
+
+            if (next_read == cached_write_pos)
+            {
+                cached_write_pos = buffer.write_pos.load(std::memory_order_acquire);
+                if (next_read == cached_write_pos)
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         bool advance() noexcept
@@ -98,11 +127,20 @@ namespace CB
         std::uint64_t cached_read_pos;
 
     public:
+        Writer() = delete;
+        ~Writer() = default;
+
         explicit Writer(Buffer<Type, align_array_size(Size)>& buf)
         : buffer(buf)
         , cached_read_pos(buffer.read_pos.load(std::memory_order_relaxed))
         {
         }
+
+        Writer(const Writer<Type, Size>& other) = delete;
+        Writer& operator=(const Writer<Type, Size>& other) = delete;
+
+        Writer(Writer<Type, Size>&& other) = delete;
+        Writer& operator=(Writer<Type, Size>&& other) = delete;
 
         bool insert(const Type& item) noexcept
         {
@@ -120,6 +158,22 @@ namespace CB
             buffer.data[buffer.write_pos] = item;
             const auto next_write = buffer.advanced_pos(current_write);
             buffer.write_pos.store(next_write, std::memory_order_release);
+            return true;
+        }
+
+        bool try_insert() noexcept
+        {
+            const auto current_write = buffer.write_pos.load(std::memory_order_relaxed);
+
+            if (current_write == cached_read_pos)
+            {
+                cached_read_pos = buffer.read_pos.load(std::memory_order_acquire);
+                if (current_write == cached_read_pos)
+                {
+                    return false;
+                }
+            }
+
             return true;
         }
     };

@@ -22,6 +22,23 @@ constexpr std::uint8_t WRITE_ZERO = 0;
 // Helper function local to this cpp file
 namespace
 {
+    inline void cpu_relax()
+    {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    #ifdef _MSC_VER
+        #include <intrin.h>
+        _mm_pause();
+    #else
+        __builtin_ia32_pause();
+    #endif
+#elif defined(__aarch64__) || defined(__arm__)
+        asm volatile("yield");
+#else
+        // Fallback compiler barrier to force memory reload
+        asm volatile("" ::: "memory");
+#endif
+    }
+
     // constructs a unique id for each connection which is looks like this
     // 0(2bytes) PORT(2bytes) IP(4bytes)
     std::uint64_t get_conn_id(struct sockaddr_in* addr)
@@ -30,7 +47,8 @@ namespace
         constexpr unsigned int shift_amount = sizeof(std::uint32_t) * bit_amount;
 
         auto ret_val = static_cast<std::uint64_t>(0);
-        // this is wrong if the struct isn't 32 bits, add proper conversion to take 1st 4 bytes
+        // this is wrong if the struct isn't 32 bits
+        // TODO: add proper conversion to take 1st 4 bytes
         ret_val |= ntohl(std::bit_cast<std::uint32_t>(addr->sin_addr));
         const auto temp = static_cast<std::uint64_t>(ntohs(addr->sin_port));
         ret_val |= (temp << shift_amount);
@@ -62,20 +80,214 @@ using conn_info = struct
     std::string name;
 };
 
-// Defines the logic and data for accepting new connections
-class Server
+class ExponentialBackoff final
 {
+private:
+    const std::uint64_t max_cycles;
+    std::uint64_t cycles{ 0 };
+
+public:
+    ExponentialBackoff() = delete;
+    ~ExponentialBackoff() = default;
+
+    explicit ExponentialBackoff(const std::uint64_t max_cycles)
+    : max_cycles(max_cycles)
+    {
+    }
+
+    ExponentialBackoff(const ExponentialBackoff& other) = delete;
+    ExponentialBackoff& operator=(const ExponentialBackoff& other) = delete;
+
+    ExponentialBackoff(ExponentialBackoff&& other) = delete;
+    ExponentialBackoff& operator=(ExponentialBackoff&& other) = delete;
+
+    void wait() noexcept
+    {
+        if (cycles < max_cycles)
+        {
+            cycles++;
+            return;
+        }
+        cpu_relax();
+    }
+
+    void reset() noexcept
+    {
+        cycles = 0;
+    }
+};
+
+template<typename TimeUnit>
+class NetExponentialBackoff final
+{
+private:
+    const std::uint64_t max_cycles_fast;
+    const std::uint64_t max_cycles_relaxed;
+
+    const TimeUnit wait_time{ std::chrono::microseconds{ 100 } };
+
+    std::uint64_t cycles_fast{ 0 };
+    std::uint64_t cycles_relaxed{ 0 };
+
+public:
+    NetExponentialBackoff<TimeUnit>() = delete;
+    ~NetExponentialBackoff<TimeUnit>() = default;
+
+    explicit NetExponentialBackoff<TimeUnit>(const std::uint64_t max_cycles_fast,
+                                             const std::uint64_t max_cycles_relaxed,
+                                             const TimeUnit& wait_time)
+    : max_cycles_fast(max_cycles_fast)
+    , max_cycles_relaxed(max_cycles_relaxed)
+    , wait_time(wait_time)
+    {
+    }
+
+    NetExponentialBackoff<TimeUnit>(const NetExponentialBackoff<TimeUnit>& other) = delete;
+    NetExponentialBackoff<TimeUnit>& operator=(const NetExponentialBackoff<TimeUnit>& other) = delete;
+
+    NetExponentialBackoff<TimeUnit>(NetExponentialBackoff<TimeUnit>&& other) = delete;
+    NetExponentialBackoff<TimeUnit>& operator=(NetExponentialBackoff<TimeUnit>&& other) = delete;
+
+    void wait() noexcept
+    {
+        if (cycles_fast < max_cycles_fast)
+        {
+            cycles_fast++;
+            return;
+        }
+
+        if (cycles_relaxed < max_cycles_relaxed)
+        {
+            cycles_relaxed++;
+            cpu_relax();
+            return;
+        }
+
+        std::this_thread::sleep_for(wait_time);
+    }
+
+    void reset() noexcept
+    {
+        cycles_fast = 0;
+        cycles_relaxed = 0;
+    }
+};
+
+class Spinlock final
+{
+private:
+    std::atomic<bool> lock_ = { false };
+
+public:
+    Spinlock() = default;
+    ~Spinlock() = default;
+
+    Spinlock(const Spinlock& other) = delete;
+    Spinlock& operator=(const Spinlock& other) = delete;
+
+    Spinlock(Spinlock&& other) = delete;
+    Spinlock& operator=(Spinlock&& other) = delete;
+
+    void lock() noexcept
+    {
+        for (;;)
+        {
+            if (!lock_.exchange(true, std::memory_order_acquire))
+            {
+                return;
+            }
+            while (lock_.load(std::memory_order_relaxed))
+            {
+                cpu_relax();
+            }
+        }
+    }
+
+    bool try_lock() noexcept
+    {
+        return !lock_.load(std::memory_order_relaxed) && !lock_.exchange(true, std::memory_order_acquire);
+    }
+
+    void unlock() noexcept
+    {
+        lock_.store(false, std::memory_order_release);
+    }
+};
+
+// Defines the logic and data for accepting new connections
+class GPIOServer final
+{
+private:
+    static constexpr std::uint64_t BACKOFF_CYCLES = 1024;
+    static constexpr auto NET_WAIT_TIME = std::chrono::microseconds{ 100 };
+
     std::map<conn_id, conn_info> connection_map;
     // convert this one into a directo lookup later
     // This might a good usecase for the 3 array datastructure
+    // - The 3 array solution might be good since connections opening/closing isn't guaranteed to be in order
     // This map is needed due to callback nature of handling the pin callback
     std::map<std::uint8_t, conn_id> pin_to_connection;
     std::map<conn_id, CB::Writer<std::uint8_t, QUEUE_SIZE>> connection_to_queue_map;
-    CB::Reader<std::pair<std::uint8_t, std::uint8_t>, QUEUE_SIZE> pin_write_queue;
+
+    CB::Buffer<std::pair<std::uint8_t, std::uint8_t>, QUEUE_SIZE> pin_write_queue_buf{};
+    CB::Reader<std::pair<std::uint8_t, std::uint8_t>, QUEUE_SIZE> pin_write_queue_reader;
+    CB::Writer<std::pair<std::uint8_t, std::uint8_t>, QUEUE_SIZE> pin_write_queue_writer;
+
+    Spinlock pin_write_spinlock;
+    ExponentialBackoff backoff_fast{ BACKOFF_CYCLES };
+    NetExponentialBackoff<std::chrono::microseconds> backoff_net{ BACKOFF_CYCLES,
+                                                                  (BACKOFF_CYCLES * BACKOFF_CYCLES),
+                                                                  NET_WAIT_TIME };
+
+    zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin;
+
+    void pin_write()
+    {
+        while (!pin_write_queue_reader.try_advance())
+        {
+            backoff_net.wait();
+        }
+        backoff_net.reset();
+
+        const auto [pin, value] = pin_write_queue_reader.peek();
+        pin_write_queue_reader.advance();
+
+        func_set_pin(static_cast<std::uint32_t>(pin), value > 0);
+    }
+
+public:
+    GPIOServer() = delete;
+    explicit GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin)
+    : pin_write_queue_reader(pin_write_queue_buf)
+    , pin_write_queue_writer(pin_write_queue_buf)
+    , func_set_pin(func_set_pin)
+    {
+    }
+    ~GPIOServer() = default;
+
+    GPIOServer(const GPIOServer& other) = delete;
+    GPIOServer& operator=(const GPIOServer& other) = delete;
+
+    GPIOServer(GPIOServer&& other) = delete;
+    GPIOServer& operator=(GPIOServer&& other) = delete;
+
+    void write_to_pin(const std::uint8_t pin, const std::uint8_t value)
+    {
+        pin_write_spinlock.lock();
+        while (!pin_write_queue_writer.try_insert())
+        {
+            backoff_fast.wait();
+        }
+        backoff_fast.reset();
+
+        pin_write_queue_writer.insert({ pin, value });
+
+        pin_write_spinlock.unlock();
+    }
 };
 
 // Defines the logic and data for each individual connection
-class Connection
+class GPIOConnection final
 {
     conn_info connection;
     // this will be interesting if it will be fast enough
