@@ -8,8 +8,8 @@
 #include "CircularBufferQueue.hpp"
 
 #include <map>
+#include <optional>
 #include <unistd.h>
-#include <iostream>
 #include <cstring>
 
 constexpr int RECV_BUF_SIZE = 64;
@@ -284,14 +284,105 @@ public:
 
         pin_write_spinlock.unlock();
     }
+
+    void run()
+    {
+        while (!pin_write_queue_reader.try_advance())
+        {
+            // within net backoff, a condition variable might be better to sleep until woken up by
+            backoff_net.wait();
+        }
+    }
+};
+
+class Parser
+{
+public:
+    Parser() = default;
+
+    Parser(const Parser&) = delete;
+    Parser& operator=(const Parser&) = delete;
+
+    Parser(Parser&&) = delete;
+    Parser& operator=(Parser&&) = delete;
+
+    virtual ~Parser() = default;
+
+    virtual bool accumulate_bit(const std::uint8_t bit, const std::uint64_t diff) = 0;
+    virtual std::vector<std::uint8_t> get_packet_data(bool implicit_clock) = 0;
 };
 
 // Defines the logic and data for each individual connection
 class GPIOConnection final
 {
     conn_info connection;
-    // this will be interesting if it will be fast enough
+    std::unique_ptr<Parser> parser;
+
     CB::Reader<std::uint8_t, QUEUE_SIZE> bit_queue;
+};
+
+class UARTParser final : public Parser
+{
+private:
+    static constexpr std::uint64_t PROTOCOL_MSG_BIT_LENGTH = 8;
+    std::vector<std::pair<std::uint8_t, std::uint64_t>> accumulator;
+
+public:
+    UARTParser()
+    : accumulator(PROTOCOL_MSG_BIT_LENGTH)
+    {
+    }
+
+    bool accumulate_bit(const std::uint8_t bit, const std::uint64_t diff) final
+    {
+        accumulator.emplace_back(bit, diff);
+        return accumulator.size() == PROTOCOL_MSG_BIT_LENGTH;
+    }
+
+    std::vector<std::uint8_t> get_packet_data(bool implicit_clock) final
+    {
+        std::vector<std::uint8_t> packet{};
+
+        if (implicit_clock)
+        {
+        }
+        else
+        {
+        }
+
+        return packet;
+    }
+};
+
+class I2CParser final : public Parser
+{
+public:
+    I2CParser()
+    {
+    }
+
+    bool accumulate_bit(const std::uint8_t bit, const std::uint64_t diff) final
+    {
+    }
+
+    std::vector<std::uint8_t> get_packet_data(bool implicit_clock) final
+    {
+    }
+};
+
+class SPIParser final : public Parser
+{
+    SPIParser()
+    {
+    }
+
+    bool accumulate_bit(const std::uint8_t bit, const std::uint64_t diff) final
+    {
+    }
+
+    std::vector<std::uint8_t> get_packet_data(bool implicit_clock) final
+    {
+    }
 };
 
 CRemote_GPIO::CRemote_GPIO(const std::string& name,
