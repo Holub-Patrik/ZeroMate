@@ -60,46 +60,71 @@ namespace
     using conn_id = std::uint64_t;
 }
 
-using protocol = enum : std::uint8_t
+using protocol_info = struct
 {
-    UART = 0,
-    I2C = 1,
-    SPI = 2,
+    enum : std::uint8_t
+    {
+        UART = 0,
+        I2C = 1,
+        SPI = 2,
+    } p;
+
+    union {
+        struct UART
+        {
+            // Point-to-point connection
+            struct sockaddr_in other_side;
+        };
+
+        struct I2C
+        {
+            // Broadcast address and intent everywhere
+            // START signal | 7 bit address | 1 bit intent (0 - Write | 1 - Read)
+            std::vector<struct sockaddr_in> slaves;
+        };
+
+        struct SPI
+        {
+            // Chip select here works basically as an index into the array
+            // Of course chip select signal has to sent into the slave first
+            int chip_select;
+            std::vector<struct sockaddr_in> slaves;
+        };
+    } info;
 };
 
 using conn_info = struct
 {
     bool explicit_clock;
-    protocol protocol;
-
     std::int8_t clock_unit;
     std::uint64_t clock_value;
+
     in_port_t opened_port;
-    struct sockaddr_in other_side;
+    protocol_info protocol;
 
     std::string name;
 };
 
-class ExponentialBackoff final
+class Backoff final
 {
 private:
     const std::uint64_t max_cycles;
     std::uint64_t cycles{ 0 };
 
 public:
-    ExponentialBackoff() = delete;
-    ~ExponentialBackoff() = default;
+    Backoff() = delete;
+    ~Backoff() = default;
 
-    explicit ExponentialBackoff(const std::uint64_t max_cycles)
+    explicit Backoff(const std::uint64_t max_cycles)
     : max_cycles(max_cycles)
     {
     }
 
-    ExponentialBackoff(const ExponentialBackoff& other) = delete;
-    ExponentialBackoff& operator=(const ExponentialBackoff& other) = delete;
+    Backoff(const Backoff& other) = delete;
+    Backoff& operator=(const Backoff& other) = delete;
 
-    ExponentialBackoff(ExponentialBackoff&& other) = delete;
-    ExponentialBackoff& operator=(ExponentialBackoff&& other) = delete;
+    Backoff(Backoff&& other) = delete;
+    Backoff& operator=(Backoff&& other) = delete;
 
     void wait() noexcept
     {
@@ -118,7 +143,7 @@ public:
 };
 
 template<typename TimeUnit>
-class NetExponentialBackoff final
+class SleepBackoff final
 {
 private:
     const std::uint64_t max_cycles_fast;
@@ -130,23 +155,23 @@ private:
     std::uint64_t cycles_relaxed{ 0 };
 
 public:
-    NetExponentialBackoff<TimeUnit>() = delete;
-    ~NetExponentialBackoff<TimeUnit>() = default;
+    SleepBackoff<TimeUnit>() = delete;
+    ~SleepBackoff<TimeUnit>() = default;
 
-    explicit NetExponentialBackoff<TimeUnit>(const std::uint64_t max_cycles_fast,
-                                             const std::uint64_t max_cycles_relaxed,
-                                             const TimeUnit& wait_time)
+    explicit SleepBackoff<TimeUnit>(const std::uint64_t max_cycles_fast,
+                                    const std::uint64_t max_cycles_relaxed,
+                                    const TimeUnit& wait_time)
     : max_cycles_fast(max_cycles_fast)
     , max_cycles_relaxed(max_cycles_relaxed)
     , wait_time(wait_time)
     {
     }
 
-    NetExponentialBackoff<TimeUnit>(const NetExponentialBackoff<TimeUnit>& other) = delete;
-    NetExponentialBackoff<TimeUnit>& operator=(const NetExponentialBackoff<TimeUnit>& other) = delete;
+    SleepBackoff<TimeUnit>(const SleepBackoff<TimeUnit>& other) = delete;
+    SleepBackoff<TimeUnit>& operator=(const SleepBackoff<TimeUnit>& other) = delete;
 
-    NetExponentialBackoff<TimeUnit>(NetExponentialBackoff<TimeUnit>&& other) = delete;
-    NetExponentialBackoff<TimeUnit>& operator=(NetExponentialBackoff<TimeUnit>&& other) = delete;
+    SleepBackoff<TimeUnit>(SleepBackoff<TimeUnit>&& other) = delete;
+    SleepBackoff<TimeUnit>& operator=(SleepBackoff<TimeUnit>&& other) = delete;
 
     void wait() noexcept
     {
@@ -234,10 +259,10 @@ private:
     CB::Writer<std::pair<std::uint8_t, std::uint8_t>, QUEUE_SIZE> pin_write_queue_writer;
 
     Spinlock pin_write_spinlock;
-    ExponentialBackoff backoff_fast{ BACKOFF_CYCLES };
-    NetExponentialBackoff<std::chrono::microseconds> backoff_net{ BACKOFF_CYCLES,
-                                                                  (BACKOFF_CYCLES * BACKOFF_CYCLES),
-                                                                  NET_WAIT_TIME };
+    Backoff backoff_fast{ BACKOFF_CYCLES };
+    SleepBackoff<std::chrono::microseconds> backoff_net{ BACKOFF_CYCLES,
+                                                         (BACKOFF_CYCLES * BACKOFF_CYCLES),
+                                                         NET_WAIT_TIME };
 
     zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin;
 

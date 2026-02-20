@@ -6,24 +6,27 @@ The app should be relatively generic to support even more complex connection sch
 
 ## Communication steps
 
-1) Both sides open port for communication for setup and  port for back and forth communication
-2) One side sends a configuration to the other, the other responds accept or decline
-3) In case of decline the connection is considered "dropped"
-4) After accept, an acknowledgement of accept should be sent
-    - This step basically ensures that both sides are ok with sending/receiving data
+1. Both sides open port for communication for setup and port for back and forth communication
+1. One side sends a configuration to the other, the other responds accept or decline
+1. In case of decline the connection is considered "dropped"
+1. After accept, an acknowledgement of accept should be sent
+   - This step basically ensures that both sides are ok with sending/receiving data
 
 ## Setup definition
+
 ### Send info
+
 - Magic byte
 - Protocol identifier (most likely a number from an enum)
 - Explicit/Implicit clock rate
-    - Implicit brings higher overhead in packets (data + diffs from 0th bit)
-    - Explicit is started with the 1st bit and abides the speed required
-    - Explicit doesn't require diffs so the data can be smaller
+  - Implicit brings higher overhead in packets (data + diffs from 0th bit)
+  - Explicit is started with the 1st bit and abides the speed required
+  - Explicit doesn't require diffs so the data can be smaller
 - Port informatioa
-    - Opened port for RX (Incoming)
+  - Opened port for RX (Incoming)
 
 ### ACK info
+
 - Magic byte
 - Accept/Decline
 - Port opened for RX (Incoming)
@@ -33,6 +36,7 @@ The app should be relatively generic to support even more complex connection sch
 Scratch to work on data to be used
 
 TODO:
+
 - Where to store relation between pins and connections
 
 ```cpp
@@ -47,6 +51,29 @@ enum Protocol {
     SPI,
 };
 
+struct UART {
+    struct sockaddr_in other_side;
+};
+
+struct I2C {
+    std::vector<struct sockaddr_in> slaves;
+};
+
+struct SPI {
+    std::vector<struct sockaddr_in> slaves;
+    int chip_select;
+};
+
+union ConnectionInfo {
+    struct UART,
+    struct I2C,
+    struct SPI,
+};
+
+struct ProtocolConnectionInfo {
+    enum Protocol p;
+    union ConnectionInfo info;
+};
 
 struct Connection {
     enum Protocol;
@@ -65,7 +92,7 @@ struct Connection {
 
     // used for recvfrom/sendto
     // constructed from received config ip
-    struct sockaddr_in other_side;
+    struct ProtocolConnectionInfo prot_conn;
 };
 
 // map using unique connection ids
@@ -79,6 +106,7 @@ std::map<std::uint8_t, std::uint64_t> pin_to_connection;
 ### Data notes
 
 #### Sockaddr_in
+
 ```cpp
 struct sockaddr_in {
     sa_family_t sin_family;
@@ -112,9 +140,10 @@ Data message or clock message definition (1st byte)
 If data message, data bit needs to be sent and then a clock signal needs to sent
 
 For I2C from what I understand it will be communication based like this:
-1) The master sends a byte and clock
-2) My component will pulse data and clock for slave while accumulating data from slave
-3) Send back to master and pulse the data
+
+1. The master sends a byte and clock
+1. My component will pulse data and clock for slave while accumulating data from slave
+1. Send back to master and pulse the data
 
 ## SPI
 
