@@ -12,13 +12,41 @@ The app should be relatively generic to support even more complex connection sch
 1. After accept, an acknowledgement of accept should be sent
    - This step basically ensures that both sides are ok with sending/receiving data
 
+### Datatypes information:
+
+#### Conf message
+- Magic | 1B set of bits (number)
+- Opened Port | 2B number
+- Protocol Identifier | 1B Enum
+- Protocol Information | Arbitrary Length data bounded by protocol identifier
+    - UART - 4B
+        - Baudrate
+    - I2C - 1B
+        - Slave/Master
+    - SPI - 1B
+        - Slave/Master
+    - General Buffered
+    - General Unbuffered
+- Clock | 1B T/F
+- Clock Unit | 1B number
+- Clock Value | 4B number
+
+#### Accept/Decline
+- Magic | 1B set of bits
+- Accept | 1B T/F
+- Port | 2B number
+
+#### Accept Ack
+- Magic | 1B set of bits
+- Ack | 1B T/F
+
 ## Setup definition
 
 ### Send info
 
 - Magic byte
 - Protocol identifier (most likely a number from an enum)
-- Explicit/Implicit clock rate
+- Explicit/Implicit clock rate 
   - Implicit brings higher overhead in packets (data + diffs from 0th bit)
   - Explicit is started with the 1st bit and abides the speed required
   - Explicit doesn't require diffs so the data can be smaller

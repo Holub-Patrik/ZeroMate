@@ -6,11 +6,12 @@
 
 #include "net_comm.hpp"
 #include "CircularBufferQueue.hpp"
+#include "Parser.hpp"
 
 #include <map>
-#include <optional>
 #include <unistd.h>
 #include <cstring>
+#include <variant>
 
 constexpr int RECV_BUF_SIZE = 64;
 constexpr std::size_t QUEUE_SIZE = 32;
@@ -22,22 +23,6 @@ constexpr std::uint8_t WRITE_ZERO = 0;
 // Helper function local to this cpp file
 namespace
 {
-    inline void cpu_relax()
-    {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    #ifdef _MSC_VER
-        #include <intrin.h>
-        _mm_pause();
-    #else
-        __builtin_ia32_pause();
-    #endif
-#elif defined(__aarch64__) || defined(__arm__)
-        asm volatile("yield");
-#else
-        // Fallback compiler barrier to force memory reload
-        asm volatile("" ::: "memory");
-#endif
-    }
 
     // constructs a unique id for each connection which is looks like this
     // 0(2bytes) PORT(2bytes) IP(4bytes)
@@ -60,183 +45,156 @@ namespace
     using conn_id = std::uint64_t;
 }
 
-using protocol_info = struct
+using UART_P = struct UART_ProtocolInfo
 {
-    enum : std::uint8_t
-    {
-        UART = 0,
-        I2C = 1,
-        SPI = 2,
-    } p;
 
-    union {
-        struct UART
-        {
-            // Point-to-point connection
-            struct sockaddr_in other_side;
-        };
-
-        struct I2C
-        {
-            // Broadcast address and intent everywhere
-            // START signal | 7 bit address | 1 bit intent (0 - Write | 1 - Read)
-            std::vector<struct sockaddr_in> slaves;
-        };
-
-        struct SPI
-        {
-            // Chip select here works basically as an index into the array
-            // Of course chip select signal has to sent into the slave first
-            int chip_select;
-            std::vector<struct sockaddr_in> slaves;
-        };
-    } info;
+    std::uint32_t baudrate{ UINT32_MAX };
+    std::uint32_t tx_pin{ UINT32_MAX }; // transmit
+    std::uint32_t rx_pin{ UINT32_MAX }; // receive (ignore the callback on this one)
+    // Point-to-point connection
+    struct sockaddr_in other_side{};
 };
+
+using I2C_P = struct I2C_ProtocolInfo
+{
+    std::uint32_t scl_pin{ UINT32_MAX };
+    std::uint32_t sda_pin{ UINT32_MAX };
+    // Broadcast address and intent everywhere
+    // START signal | 7 bit address | 1 bit intent (0 - Write | 1 - Read)
+    std::vector<struct sockaddr_in> slaves;
+};
+
+using SPI_P = struct SPI_ProtocolInfo
+{
+    std::uint32_t sclk_pin{ UINT32_MAX };
+    std::uint32_t mosi_pin{ UINT32_MAX }; // master out slave in
+    std::uint32_t miso_pin{ UINT32_MAX }; // master out slave in
+    // Chip select here works basically as an index into the array
+    // Of course chip select signal has to sent into the slave first
+    std::uint32_t chip_select{ UINT32_MAX };
+    std::vector<struct sockaddr_in> slaves;
+};
+
+// General buffered and unbuffered protocols
+// They are general for a reason and they might be inadequate
+// But they can be useful when speeds are low
+using GeneralBuffered_P = struct GeneralBuffered_ProtocolInfo
+{
+    int buf_length{ -1 };
+    struct sockaddr_in other_side{};
+
+    GPIOMap net_to_local;
+    GPIOMap local_to_net;
+    GPIOLastState state_map;
+};
+
+using GeneralUnbuffered_P = struct GeneralUnbuffered_ProtocolInfo
+{
+    struct sockaddr_in other_side{};
+    GPIOMap net_to_local;
+    GPIOMap local_to_net;
+    GPIOLastState state_map;
+};
+
+using ProtocolUnion = std::variant<UART_P, I2C_P, SPI_P, GeneralBuffered_P, GeneralUnbuffered_P>;
+
+using protocol_info = struct protocol_info
+{
+    ProtocolEnum p{ UART };
+    ProtocolUnion info;
+};
+
+namespace
+{
+    std::optional<protocol_info> parse_conf_from_net_msg(const std::vector<std::uint8_t>& msg,
+                                                         const struct sockaddr_in& other_side)
+    {
+        protocol_info prot{};
+        std::size_t msg_index{ 0 };
+        constexpr std::uint8_t BYTE_WIDTH = 8U;
+
+        if (msg[msg_index++] != MAGIC_BYTE)
+        {
+            return std::nullopt;
+        }
+        std::uint16_t opened_port{ 0 };
+        opened_port |= static_cast<std::uint16_t>(msg[msg_index++]);
+        // why is the warning that this is signed here ??????
+        opened_port |= static_cast<std::uint16_t>(msg[msg_index++]) << 8U;
+
+        // use the current address and change the port to the opened port
+        struct sockaddr_in other_side_new_port = other_side;
+        other_side_new_port.sin_port = htons(opened_port);
+
+        const auto extract_clock_info = [](const std::vector<std::uint8_t>& msg,
+                                           std::size_t& index) -> std::tuple<bool, std::uint8_t, std::uint8_t> {
+            bool implicit_clock{ false };
+            std::uint8_t clock_unit{ 0 };
+            std::uint8_t clock_value{ 0 };
+            implicit_clock = msg[index++] == 0;
+            clock_unit = msg[index++];
+            clock_value = msg[index++];
+
+            return { implicit_clock, clock_unit, clock_value };
+        };
+
+        const auto protocol_enum_value = static_cast<ProtocolEnum>(msg[msg_index++]);
+        std::uint32_t baudrate{ 0 };
+
+        std::tuple<bool, std::uint8_t, std::uint8_t> clock_info;
+        bool implicit_clock{ false };
+        std::uint8_t clock_unit{ 0 };
+        std::uint8_t clock_value{ 0 };
+
+        switch (protocol_enum_value)
+        {
+            case UART:
+                baudrate |= static_cast<std::uint32_t>(msg_index++);
+                baudrate |= static_cast<std::uint32_t>(msg_index++) << BYTE_WIDTH;
+                baudrate |= static_cast<std::uint32_t>(msg_index++) << BYTE_WIDTH * 2U;
+                baudrate |= static_cast<std::uint32_t>(msg_index++) << BYTE_WIDTH * 3U;
+
+                clock_info = extract_clock_info(msg, msg_index);
+
+                prot.info = UART_P{ .baudrate = baudrate, .other_side = other_side_new_port };
+                break;
+
+            case I2C:
+                // hehe, here's an issue >:(
+                prot.info = I2C_P{ .slaves = { other_side_new_port } };
+                break;
+
+            case SPI:
+                prot.info = SPI_P{ .slaves = { other_side_new_port } };
+                break;
+
+            case GeneralBuffered:
+                prot.info = GeneralBuffered_P{ .other_side = other_side_new_port };
+                break;
+
+            case GeneralUnbuffered:
+                prot.info = GeneralUnbuffered_P{ .other_side = other_side_new_port };
+                break;
+
+            default:
+                return std::nullopt;
+                break;
+        }
+
+        return prot;
+    }
+}
 
 using conn_info = struct
 {
     bool explicit_clock;
     std::int8_t clock_unit;
-    std::uint64_t clock_value;
+    std::uint32_t clock_value;
 
     in_port_t opened_port;
     protocol_info protocol;
 
     std::string name;
-};
-
-class Backoff final
-{
-private:
-    const std::uint64_t max_cycles;
-    std::uint64_t cycles{ 0 };
-
-public:
-    Backoff() = delete;
-    ~Backoff() = default;
-
-    explicit Backoff(const std::uint64_t max_cycles)
-    : max_cycles(max_cycles)
-    {
-    }
-
-    Backoff(const Backoff& other) = delete;
-    Backoff& operator=(const Backoff& other) = delete;
-
-    Backoff(Backoff&& other) = delete;
-    Backoff& operator=(Backoff&& other) = delete;
-
-    void wait() noexcept
-    {
-        if (cycles < max_cycles)
-        {
-            cycles++;
-            return;
-        }
-        cpu_relax();
-    }
-
-    void reset() noexcept
-    {
-        cycles = 0;
-    }
-};
-
-template<typename TimeUnit>
-class SleepBackoff final
-{
-private:
-    const std::uint64_t max_cycles_fast;
-    const std::uint64_t max_cycles_relaxed;
-
-    const TimeUnit wait_time{ std::chrono::microseconds{ 100 } };
-
-    std::uint64_t cycles_fast{ 0 };
-    std::uint64_t cycles_relaxed{ 0 };
-
-public:
-    SleepBackoff<TimeUnit>() = delete;
-    ~SleepBackoff<TimeUnit>() = default;
-
-    explicit SleepBackoff<TimeUnit>(const std::uint64_t max_cycles_fast,
-                                    const std::uint64_t max_cycles_relaxed,
-                                    const TimeUnit& wait_time)
-    : max_cycles_fast(max_cycles_fast)
-    , max_cycles_relaxed(max_cycles_relaxed)
-    , wait_time(wait_time)
-    {
-    }
-
-    SleepBackoff<TimeUnit>(const SleepBackoff<TimeUnit>& other) = delete;
-    SleepBackoff<TimeUnit>& operator=(const SleepBackoff<TimeUnit>& other) = delete;
-
-    SleepBackoff<TimeUnit>(SleepBackoff<TimeUnit>&& other) = delete;
-    SleepBackoff<TimeUnit>& operator=(SleepBackoff<TimeUnit>&& other) = delete;
-
-    void wait() noexcept
-    {
-        if (cycles_fast < max_cycles_fast)
-        {
-            cycles_fast++;
-            return;
-        }
-
-        if (cycles_relaxed < max_cycles_relaxed)
-        {
-            cycles_relaxed++;
-            cpu_relax();
-            return;
-        }
-
-        std::this_thread::sleep_for(wait_time);
-    }
-
-    void reset() noexcept
-    {
-        cycles_fast = 0;
-        cycles_relaxed = 0;
-    }
-};
-
-class Spinlock final
-{
-private:
-    std::atomic<bool> lock_ = { false };
-
-public:
-    Spinlock() = default;
-    ~Spinlock() = default;
-
-    Spinlock(const Spinlock& other) = delete;
-    Spinlock& operator=(const Spinlock& other) = delete;
-
-    Spinlock(Spinlock&& other) = delete;
-    Spinlock& operator=(Spinlock&& other) = delete;
-
-    void lock() noexcept
-    {
-        for (;;)
-        {
-            if (!lock_.exchange(true, std::memory_order_acquire))
-            {
-                return;
-            }
-            while (lock_.load(std::memory_order_relaxed))
-            {
-                cpu_relax();
-            }
-        }
-    }
-
-    bool try_lock() noexcept
-    {
-        return !lock_.load(std::memory_order_relaxed) && !lock_.exchange(true, std::memory_order_acquire);
-    }
-
-    void unlock() noexcept
-    {
-        lock_.store(false, std::memory_order_release);
-    }
 };
 
 // Defines the logic and data for accepting new connections
@@ -310,31 +268,21 @@ public:
         pin_write_spinlock.unlock();
     }
 
-    void run()
+    void writer_thread()
     {
         while (!pin_write_queue_reader.try_advance())
         {
             // within net backoff, a condition variable might be better to sleep until woken up by
+            // a callback/reader thread
             backoff_net.wait();
         }
     }
-};
 
-class Parser
-{
-public:
-    Parser() = default;
-
-    Parser(const Parser&) = delete;
-    Parser& operator=(const Parser&) = delete;
-
-    Parser(Parser&&) = delete;
-    Parser& operator=(Parser&&) = delete;
-
-    virtual ~Parser() = default;
-
-    virtual bool accumulate_bit(const std::uint8_t bit, const std::uint64_t diff) = 0;
-    virtual std::vector<std::uint8_t> get_packet_data(bool implicit_clock) = 0;
+    // bind socket and start listening
+    // a parser should be defined
+    void run()
+    {
+    }
 };
 
 // Defines the logic and data for each individual connection
@@ -344,70 +292,6 @@ class GPIOConnection final
     std::unique_ptr<Parser> parser;
 
     CB::Reader<std::uint8_t, QUEUE_SIZE> bit_queue;
-};
-
-class UARTParser final : public Parser
-{
-private:
-    static constexpr std::uint64_t PROTOCOL_MSG_BIT_LENGTH = 8;
-    std::vector<std::pair<std::uint8_t, std::uint64_t>> accumulator;
-
-public:
-    UARTParser()
-    : accumulator(PROTOCOL_MSG_BIT_LENGTH)
-    {
-    }
-
-    bool accumulate_bit(const std::uint8_t bit, const std::uint64_t diff) final
-    {
-        accumulator.emplace_back(bit, diff);
-        return accumulator.size() == PROTOCOL_MSG_BIT_LENGTH;
-    }
-
-    std::vector<std::uint8_t> get_packet_data(bool implicit_clock) final
-    {
-        std::vector<std::uint8_t> packet{};
-
-        if (implicit_clock)
-        {
-        }
-        else
-        {
-        }
-
-        return packet;
-    }
-};
-
-class I2CParser final : public Parser
-{
-public:
-    I2CParser()
-    {
-    }
-
-    bool accumulate_bit(const std::uint8_t bit, const std::uint64_t diff) final
-    {
-    }
-
-    std::vector<std::uint8_t> get_packet_data(bool implicit_clock) final
-    {
-    }
-};
-
-class SPIParser final : public Parser
-{
-    SPIParser()
-    {
-    }
-
-    bool accumulate_bit(const std::uint8_t bit, const std::uint64_t diff) final
-    {
-    }
-
-    std::vector<std::uint8_t> get_packet_data(bool implicit_clock) final
-    {
-    }
 };
 
 CRemote_GPIO::CRemote_GPIO(const std::string& name,
@@ -586,6 +470,7 @@ void CRemote_GPIO::GPIO_Subscription_Callback(std::uint32_t pin_idx)
             m_state_map.set(pin_idx_u8, state);
         }
     }
+    std::chrono::high_resolution_clock::now();
 }
 
 void CRemote_GPIO::Render()

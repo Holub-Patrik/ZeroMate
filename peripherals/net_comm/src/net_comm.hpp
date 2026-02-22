@@ -16,8 +16,34 @@
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
 
+inline void cpu_relax()
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    #ifdef _MSC_VER
+        #include <intrin.h>
+    _mm_pause();
+    #else
+    __builtin_ia32_pause();
+    #endif
+#elif defined(__aarch64__) || defined(__arm__)
+    asm volatile("yield");
+#else
+    // Fallback compiler barrier to force memory reload
+    asm volatile("" ::: "memory");
+#endif
+}
+
 // this out to be enough since there are only 52 GPIO pins
 constexpr std::uint8_t GPIOMapSize = 64;
+
+using ProtocolEnum = enum : std::uint8_t
+{
+    UART = 0,
+    I2C = 1,
+    SPI = 2,
+    GeneralBuffered = 3,
+    GeneralUnbuffered = 4,
+};
 
 class GPIOMap
 {
@@ -78,6 +104,140 @@ public:
     [[nodiscard]] std::uint8_t get(const std::uint8_t pin) noexcept
     {
         return m_map[pin];
+    }
+};
+
+class Backoff final
+{
+private:
+    const std::uint64_t max_cycles;
+    std::uint64_t cycles{ 0 };
+
+public:
+    Backoff() = delete;
+    ~Backoff() = default;
+
+    explicit Backoff(const std::uint64_t max_cycles)
+    : max_cycles(max_cycles)
+    {
+    }
+
+    Backoff(const Backoff& other) = delete;
+    Backoff& operator=(const Backoff& other) = delete;
+
+    Backoff(Backoff&& other) = delete;
+    Backoff& operator=(Backoff&& other) = delete;
+
+    void wait() noexcept
+    {
+        if (cycles < max_cycles)
+        {
+            cycles++;
+            return;
+        }
+        cpu_relax();
+    }
+
+    void reset() noexcept
+    {
+        cycles = 0;
+    }
+};
+
+template<typename TimeUnit>
+class SleepBackoff final
+{
+private:
+    const std::uint64_t max_cycles_fast;
+    const std::uint64_t max_cycles_relaxed;
+
+    const TimeUnit wait_time{ std::chrono::microseconds{ 100 } };
+
+    std::uint64_t cycles_fast{ 0 };
+    std::uint64_t cycles_relaxed{ 0 };
+
+public:
+    SleepBackoff<TimeUnit>() = delete;
+    ~SleepBackoff<TimeUnit>() = default;
+
+    explicit SleepBackoff<TimeUnit>(const std::uint64_t max_cycles_fast,
+                                    const std::uint64_t max_cycles_relaxed,
+                                    const TimeUnit& wait_time)
+    : max_cycles_fast(max_cycles_fast)
+    , max_cycles_relaxed(max_cycles_relaxed)
+    , wait_time(wait_time)
+    {
+    }
+
+    SleepBackoff<TimeUnit>(const SleepBackoff<TimeUnit>& other) = delete;
+    SleepBackoff<TimeUnit>& operator=(const SleepBackoff<TimeUnit>& other) = delete;
+
+    SleepBackoff<TimeUnit>(SleepBackoff<TimeUnit>&& other) = delete;
+    SleepBackoff<TimeUnit>& operator=(SleepBackoff<TimeUnit>&& other) = delete;
+
+    void wait() noexcept
+    {
+        if (cycles_fast < max_cycles_fast)
+        {
+            cycles_fast++;
+            return;
+        }
+
+        if (cycles_relaxed < max_cycles_relaxed)
+        {
+            cycles_relaxed++;
+            cpu_relax();
+            return;
+        }
+
+        std::this_thread::sleep_for(wait_time);
+    }
+
+    void reset() noexcept
+    {
+        cycles_fast = 0;
+        cycles_relaxed = 0;
+    }
+};
+
+class Spinlock final
+{
+private:
+    std::atomic<bool> lock_ = { false };
+
+public:
+    Spinlock() = default;
+    ~Spinlock() = default;
+
+    Spinlock(const Spinlock& other) = delete;
+    Spinlock& operator=(const Spinlock& other) = delete;
+
+    Spinlock(Spinlock&& other) = delete;
+    Spinlock& operator=(Spinlock&& other) = delete;
+
+    void lock() noexcept
+    {
+        for (;;)
+        {
+            if (!lock_.exchange(true, std::memory_order_acquire))
+            {
+                return;
+            }
+            while (lock_.load(std::memory_order_relaxed))
+            {
+                cpu_relax();
+            }
+        }
+    }
+
+    bool try_lock() noexcept
+    {
+        return !lock_.load(std::memory_order_relaxed) && !lock_.exchange(true, std::memory_order_acquire);
+    }
+
+    void unlock() noexcept
+    {
+        lock_.store(false, std::memory_order_release);
     }
 };
 
