@@ -45,6 +45,19 @@ namespace
     using conn_id = std::uint64_t;
 }
 
+using BusConnection = struct BusConnection_struct
+{
+    std::uint32_t bus_id;
+    std::vector<struct sockaddr_in> devices;
+};
+
+using P2PConnection = struct P2PConnection_struct
+{
+    struct sockaddr_in other_side;
+};
+
+using Connection = std::variant<BusConnection, P2PConnection>;
+
 using UART_P = struct UART_ProtocolInfo
 {
 
@@ -96,12 +109,12 @@ using GeneralUnbuffered_P = struct GeneralUnbuffered_ProtocolInfo
     GPIOLastState state_map;
 };
 
-using ProtocolUnion = std::variant<UART_P, I2C_P, SPI_P, GeneralBuffered_P, GeneralUnbuffered_P>;
+using Protocol = std::variant<UART_P, I2C_P, SPI_P, GeneralBuffered_P, GeneralUnbuffered_P>;
 
 using protocol_info = struct protocol_info
 {
     ProtocolEnum p{ UART };
-    ProtocolUnion info;
+    Protocol info;
 };
 
 namespace
