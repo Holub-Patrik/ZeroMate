@@ -112,36 +112,25 @@ namespace
 
 void GPIOServer::pin_write()
 {
-    while (!pin_write_queue_reader.try_advance())
-    {
-        backoff_net.wait();
-    }
-    backoff_net.reset();
-
-    const auto [pin, value] = pin_write_queue_reader.peek();
-    pin_write_queue_reader.advance();
-
+    // tries to read from the queue
+    // if nothing comes for a long enough time, start sleeping on a semaphore
+    const auto [pin, value] = pin_write_queue_reader.read(backoff_sem);
     func_set_pin(static_cast<std::uint32_t>(pin), value > 0);
 }
 
 void GPIOServer::write_to_pin(const std::uint8_t pin, const std::uint8_t value)
 {
     pin_write_spinlock.lock();
-    while (!pin_write_queue_writer.try_insert())
-    {
-        backoff_fast.wait();
-    }
-    backoff_fast.reset();
-
-    pin_write_queue_writer.insert({ pin, value });
-
+    pin_write_queue_writer.insert_with_backoff({ pin, value }, backoff_fast);
+    // if the time before insertion was too long, wake up the reader
+    backoff_sem.wake();
     pin_write_spinlock.unlock();
 }
 
 void GPIOServer::route_pin_info(const pin_pair pin_info)
 {
     const auto& [pin, value] = pin_info;
-    const auto& conn_id = id_to_conn.get(pin);
+    const auto& conn_id = pin_to_conn_id.get(pin);
     auto& writer_ref = out_queue_writers[conn_id];
     while (!writer_ref.try_insert())
     {
@@ -150,6 +139,10 @@ void GPIOServer::route_pin_info(const pin_pair pin_info)
     backoff_fast.reset();
 
     writer_ref.insert(pin_info);
+}
+
+void GPIOServer::construct_connection(const conn_info& info)
+{
 }
 
 void GPIOServer::run()

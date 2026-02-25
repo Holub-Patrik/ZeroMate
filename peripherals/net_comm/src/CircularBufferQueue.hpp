@@ -1,31 +1,46 @@
 /*
- * An implementation of "lockless" thread-safe queue
+ * High Throughput Thread-Safe Primitives Library
  *
- * Thread safety is guaranteed only when certain conditions are met:
- * - There are only 2 threads accessing the queue
- * - Each thread has a clear role, and never switch during the run of the
- * program
- * - Basically it is meant for Single Producer Single Consumer scenarios
+ * Implemented Primitives
  *
- * The conditions need to be met, since the implementation expects that:
- * - only the writer can advance the write position
- * - only the reader can advance the read position
+ * "Lockless" Single Produce Single Consumer Queue
+ * - Buffer class representing the data backing for the queue
+ * - Writer class representing an interface into data allowing to write into a queue
+ * - Reader class representing an interface into data allowing to read from the queue
  *
- * The implementation uses std::array as backing type for circular buffers
- * The buffers will be aligned to a power of 2 to allow for faster math
- * - Instead of modulo, bit masking is used. The same is done in linux kernel
+ * "Exponential" Backoffs
+ * - Usefull when spinning while waiting for other primitives
+ * - Basic Backoff
+ *   - Spins for a certain amount of cycles as fast as it can
+ *   - After that turns to spinning with a cpu_relax() instruction
  *
- * The classes are generic thanks to templates
- * Within templates:
- * - Size specifies the backing array size
- * - Type specifies the element type
+ * - Sleep Backoff
+ *   - Spins the same way as a basic backoff
+ *   - When it finishes fast and relaxed spinning, it start spinning with a sleep
+ *
+ * - Semaphore Backoff
+ *   - Spins the same way as basic backoff
+ *   - When it finishes fast and relaxed spinning, it puts the thread to sleep on binary semaphore
+ *   - This backoff needs to be waked from the sleeping state
+ *   - Usefull when there are bursts of high throughput and then for example wait for network
+ *
+ * To be implemented:
+ * - Spinlocks
+ * - Multiple Producer Multiple Consumer
+ * - More os specific optimizations to improve performance
+ * - Bulk data access (insert N, take as many as possible)
+ *
+ * Considering:
+ * - More data structures possibly
  */
 
 #pragma once
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <thread>
 
 #define ALIGNMENT 64
 
@@ -37,162 +52,443 @@ consteval std::size_t align_array_size(const std::size_t size)
     return ret_val;
 }
 
-namespace CB
+inline void cpu_relax()
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    #ifdef _MSC_VER
+        #include <intrin.h>
+    _mm_pause();
+    #else
+    __builtin_ia32_pause();
+    #endif
+#elif defined(__aarch64__) || defined(__arm__)
+    asm volatile("yield");
+#else
+    // Fallback compiler barrier to force memory reload
+    asm volatile("" ::: "memory");
+#endif
+}
+
+namespace TSP
 {
 
-    template<typename Type, std::size_t Size>
-    struct Buffer
+    namespace BF
     {
-        std::array<Type, align_array_size(Size)> data{};
-        // so the atomics don't suffer from false sharing
-        alignas(ALIGNMENT) std::atomic<std::uint64_t> read_pos{ 0 };
-        alignas(ALIGNMENT) std::atomic<std::uint64_t> write_pos{ 1 };
 
-        // doesn't advance position, only returns the position as if it was advanced
-        [[nodiscard]] std::uint64_t advanced_pos(const std::uint64_t cur_pos) const noexcept
+        template<class Derived>
+        class IBackoff
         {
-            return (cur_pos + 1) & (align_array_size(Size) - 1);
-        }
-    };
+        private:
+            IBackoff() = default;
 
-    template<typename Type, std::size_t Size>
-    class Reader final
-    {
-    private:
-        Buffer<Type, align_array_size(Size)>* buffer;
-        std::uint64_t cached_write_pos;
+        public:
+            virtual ~IBackoff() = default;
 
-    public:
-        Reader()
-        : buffer(nullptr)
-        , cached_write_pos(0) { };
-        ~Reader() = default;
+            IBackoff(const IBackoff&) = delete;
+            IBackoff& operator=(const IBackoff&) = delete;
 
-        explicit Reader(Buffer<Type, align_array_size(Size)>& buf)
-        : buffer(&buf)
-        , cached_write_pos(buffer->write_pos.load(std::memory_order_relaxed))
-        {
-        }
+            IBackoff(IBackoff&&) = delete;
+            IBackoff& operator=(IBackoff&&) = delete;
 
-        Reader(const Reader<Type, Size>& other) = delete;
-        Reader& operator=(const Reader<Type, Size>& other) = delete;
+            void wait() noexcept
+            {
+                static_cast<Derived*>(this)->wait_impl();
+            };
 
-        Reader(Reader<Type, Size>&& other) noexcept
-        : buffer(other.buffer)
-        , cached_write_pos(other.buffer->write_pos.load(std::memory_order_relaxed))
-        {
-        }
-        Reader& operator=(Reader<Type, Size>&& other) noexcept
-        {
-            std::swap(buffer, other.buffer);
-            cached_write_pos(buffer->write_pos.load(std::memory_order_relaxed));
+            template<typename Predicate>
+            void wait(Predicate&& pred) noexcept
+            {
+                static_cast<Derived*>(this)->wait_impl(std::forward(pred));
+            }
+
+            void reset() noexcept
+            {
+                static_cast<Derived*>(this)->reset_impl();
+            };
+
+            void wake() noexcept
+            {
+                static_cast<Derived*>(this)->wake_impl();
+            }
+
+            friend Derived;
         };
 
-        const Type& peek() const
+        class Backoff final : public IBackoff<Backoff>
         {
-            return buffer->data[buffer->read_pos.load(std::memory_order_relaxed)];
-        }
+        private:
+            const std::uint64_t max_cycles;
+            std::uint64_t cycles{ 0 };
 
-        bool try_advance() noexcept
-        {
-            const auto current_read = buffer->read_pos.load(std::memory_order_relaxed);
-            const auto next_read = buffer->advanced_pos(current_read);
+        public:
+            Backoff() = delete;
+            ~Backoff() final = default;
 
-            if (next_read == cached_write_pos)
+            explicit Backoff(const std::uint64_t max_cycles)
+            : max_cycles(max_cycles)
             {
-                cached_write_pos = buffer->write_pos.load(std::memory_order_acquire);
-                if (next_read == cached_write_pos)
-                {
-                    return false;
-                }
             }
 
-            return true;
-        }
+            Backoff(const Backoff& other) = delete;
+            Backoff& operator=(const Backoff& other) = delete;
 
-        bool advance() noexcept
-        {
-            const auto current_read = buffer->read_pos.load(std::memory_order_relaxed);
-            const auto next_read = buffer->advanced_pos(current_read);
+            Backoff(Backoff&& other) = delete;
+            Backoff& operator=(Backoff&& other) = delete;
 
-            if (next_read == cached_write_pos)
+            template<typename Predicate>
+            void wait_impl(Predicate&& /*pred*/) noexcept
             {
-                cached_write_pos = buffer->write_pos.load(std::memory_order_acquire);
-                if (next_read == cached_write_pos)
-                {
-                    return false;
-                }
+                wait_impl();
             }
 
-            buffer->read_pos.store(next_read, std::memory_order_release);
-            return true;
-        }
-    };
+            void wait_impl() noexcept
+            {
+                if (cycles < max_cycles)
+                {
+                    cycles++;
+                    return;
+                }
+                cpu_relax();
+            }
 
-    template<typename Type, std::size_t Size>
-    class Writer final
-    {
-    private:
-        Buffer<Type, align_array_size(Size)>* buffer;
-        std::uint64_t cached_read_pos;
+            void reset_impl() noexcept
+            {
+                cycles = 0;
+            }
 
-    public:
-        Writer()
-        : buffer(nullptr)
-        , cached_read_pos(0) { };
-        ~Writer() = default;
-
-        explicit Writer(Buffer<Type, align_array_size(Size)>& buf)
-        : buffer(buf)
-        , cached_read_pos(buffer->read_pos.load(std::memory_order_relaxed))
-        {
-        }
-
-        Writer(const Writer<Type, Size>& other) = delete;
-        Writer& operator=(const Writer<Type, Size>& other) = delete;
-
-        Writer(Writer<Type, Size>&& other) noexcept
-        : buffer(other.buffer)
-        , cached_read_pos(other.buffer->read_pos.load(std::memory_order_relaxed)) { };
-        Writer& operator=(Writer<Type, Size>&& other) noexcept
-        {
-            std::swap(buffer, other.buffer);
-            cached_read_pos = buffer->read_pos.load(std::memory_order_relaxed);
+            void wake_impl() const noexcept
+            {
+            }
         };
 
-        bool insert(const Type& item) noexcept
+        template<typename TimeUnit>
+        class SleepBackoff final : public IBackoff<SleepBackoff<TimeUnit>>
         {
-            const auto current_write = buffer->write_pos.load(std::memory_order_relaxed);
+        private:
+            const std::uint64_t max_cycles_fast;
+            const std::uint64_t max_cycles_relaxed;
 
-            if (current_write == cached_read_pos)
+            const TimeUnit wait_time{ std::chrono::microseconds{ 100 } };
+
+            std::uint64_t cycles_fast{ 0 };
+            std::uint64_t cycles_relaxed{ 0 };
+
+        public:
+            SleepBackoff<TimeUnit>() = delete;
+            ~SleepBackoff<TimeUnit>() final = default;
+
+            explicit SleepBackoff<TimeUnit>(const std::uint64_t max_cycles_fast,
+                                            const std::uint64_t max_cycles_relaxed,
+                                            const TimeUnit& wait_time)
+            : max_cycles_fast(max_cycles_fast)
+            , max_cycles_relaxed(max_cycles_relaxed)
+            , wait_time(wait_time)
             {
-                cached_read_pos = buffer->read_pos.load(std::memory_order_acquire);
-                if (current_write == cached_read_pos)
-                {
-                    return false;
-                }
             }
 
-            buffer->data[buffer->write_pos] = item;
-            const auto next_write = buffer->advanced_pos(current_write);
-            buffer->write_pos.store(next_write, std::memory_order_release);
-            return true;
-        }
+            SleepBackoff<TimeUnit>(const SleepBackoff<TimeUnit>& other) = delete;
+            SleepBackoff<TimeUnit>& operator=(const SleepBackoff<TimeUnit>& other) = delete;
 
-        bool try_insert() noexcept
-        {
-            const auto current_write = buffer->write_pos.load(std::memory_order_relaxed);
+            SleepBackoff<TimeUnit>(SleepBackoff<TimeUnit>&& other) = delete;
+            SleepBackoff<TimeUnit>& operator=(SleepBackoff<TimeUnit>&& other) = delete;
 
-            if (current_write == cached_read_pos)
+            template<typename Predicate>
+            void wait_impl(Predicate&& /*pred*/)
             {
-                cached_read_pos = buffer->read_pos.load(std::memory_order_acquire);
-                if (current_write == cached_read_pos)
-                {
-                    return false;
-                }
+                wait_impl();
             }
 
-            return true;
-        }
-    };
-} // namespace CB
+            void wait_impl() noexcept
+            {
+                if (cycles_fast < max_cycles_fast)
+                {
+                    cycles_fast++;
+                    return;
+                }
+
+                if (cycles_relaxed < max_cycles_relaxed)
+                {
+                    cycles_relaxed++;
+                    cpu_relax();
+                    return;
+                }
+
+                std::this_thread::sleep_for(wait_time);
+            }
+
+            void reset_impl() noexcept
+            {
+                cycles_fast = 0;
+                cycles_relaxed = 0;
+            }
+
+            void wake_impl() const noexcept
+            {
+            }
+        };
+
+        class SemBackoff final : public IBackoff<SemBackoff>
+        {
+        private:
+            const std::uint64_t max_cycles_fast;
+            const std::uint64_t max_cycles_relaxed;
+
+            std::uint64_t cycles_fast{ 0 };
+            std::uint64_t cycles_relaxed{ 0 };
+
+            std::binary_semaphore sem{ 0 };
+            std::atomic<bool> is_sleeping{ false };
+
+        public:
+            SemBackoff() = delete;
+            ~SemBackoff() final = default;
+
+            SemBackoff(const SemBackoff&) = delete;
+            SemBackoff& operator=(const SemBackoff&) = delete;
+
+            SemBackoff(SemBackoff&&) = delete;
+            SemBackoff& operator=(SemBackoff&&) = delete;
+
+            explicit SemBackoff(const std::uint64_t max_cycles_fast, const std::uint64_t max_cycles_relaxed)
+            : max_cycles_fast(max_cycles_fast)
+            , max_cycles_relaxed(max_cycles_relaxed)
+            {
+            }
+
+            template<typename Predicate>
+            void wait_impl(Predicate&& condition) noexcept
+            {
+                if (cycles_fast < max_cycles_fast)
+                {
+                    cycles_fast++;
+                    return;
+                }
+
+                if (cycles_relaxed < max_cycles_relaxed)
+                {
+                    cycles_relaxed++;
+                    cpu_relax();
+                    return;
+                }
+
+                is_sleeping.store(false, std::memory_order_seq_cst);
+                if (condition())
+                {
+                    is_sleeping.store(false, std::memory_order_relaxed);
+                    return;
+                }
+
+                sem.acquire();
+                is_sleeping.store(false, std::memory_order_relaxed);
+            }
+
+            void reset_impl() noexcept
+            {
+                cycles_fast = 0;
+                cycles_relaxed = 0;
+                is_sleeping.store(false, std::memory_order_relaxed);
+            }
+
+            void wake_impl() noexcept
+            {
+                if (is_sleeping.load(std::memory_order_seq_cst))
+                {
+                    sem.release();
+                }
+            }
+        };
+    }
+
+    namespace Queue
+    {
+        template<typename Type, std::size_t Size>
+        struct Buffer
+        {
+            std::array<Type, align_array_size(Size)> data{};
+            // so the atomics don't suffer from false sharing
+            alignas(ALIGNMENT) std::atomic<std::uint64_t> read_pos{ 0 };
+            alignas(ALIGNMENT) std::atomic<std::uint64_t> write_pos{ 1 };
+
+            // doesn't advance position, only returns the position as if it was advanced
+            [[nodiscard]] static std::uint64_t advanced_pos(const std::uint64_t cur_pos) noexcept
+            {
+                return (cur_pos + 1) & (align_array_size(Size) - 1);
+            }
+        };
+
+        template<typename Type, std::size_t Size>
+        class Reader final
+        {
+        private:
+            Buffer<Type, align_array_size(Size)>* buffer;
+            std::uint64_t cached_write_pos;
+
+        public:
+            Reader()
+            : buffer(nullptr)
+            , cached_write_pos(0) { };
+            ~Reader() = default;
+
+            explicit Reader(Buffer<Type, align_array_size(Size)>& buf)
+            : buffer(&buf)
+            , cached_write_pos(buffer->write_pos.load(std::memory_order_relaxed))
+            {
+            }
+
+            Reader(const Reader<Type, Size>& other) = delete;
+            Reader& operator=(const Reader<Type, Size>& other) = delete;
+
+            Reader(Reader<Type, Size>&& other) noexcept
+            : buffer(other.buffer)
+            , cached_write_pos(other.buffer->write_pos.load(std::memory_order_relaxed))
+            {
+            }
+            Reader& operator=(Reader<Type, Size>&& other) noexcept
+            {
+                std::swap(buffer, other.buffer);
+                cached_write_pos = buffer->write_pos.load(std::memory_order_relaxed);
+            };
+
+            [[nodiscard]] const Type& peek() const
+            {
+                return buffer->data[buffer->read_pos.load(std::memory_order_relaxed)];
+            }
+
+            template<typename BackoffType>
+            [[nodiscard]] const Type& read(BackoffType& backoff) noexcept
+            {
+                while (!try_advance())
+                {
+                    backoff.wait([this]() { return this->try_advance(); });
+                }
+                backoff.reset();
+
+                // advance without extra checks
+                const auto ret = peek();
+                const auto current_read = buffer->read_pos.load(std::memory_order_relaxed);
+                const auto next_read = Buffer<Type, align_array_size(Size)>::advanced_pos(current_read);
+                buffer->read_pos.store(next_read, std::memory_order_release);
+
+                return ret;
+            }
+
+            bool try_advance() noexcept
+            {
+                const auto current_read = buffer->read_pos.load(std::memory_order_relaxed);
+                const auto next_read = Buffer<Type, align_array_size(Size)>::advanced_pos(current_read);
+
+                if (next_read == cached_write_pos)
+                {
+                    cached_write_pos = buffer->write_pos.load(std::memory_order_acquire);
+                    if (next_read == cached_write_pos)
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            bool advance() noexcept
+            {
+                const auto current_read = buffer->read_pos.load(std::memory_order_relaxed);
+                const auto next_read = Buffer<Type, align_array_size(Size)>::advanced_pos(current_read);
+
+                if (next_read == cached_write_pos)
+                {
+                    cached_write_pos = buffer->write_pos.load(std::memory_order_acquire);
+                    if (next_read == cached_write_pos)
+                    {
+                        return false;
+                    }
+                }
+
+                buffer->read_pos.store(next_read, std::memory_order_release);
+                return true;
+            }
+        };
+
+        template<typename Type, std::size_t Size>
+        class Writer final
+        {
+        private:
+            Buffer<Type, align_array_size(Size)>* buffer;
+            std::uint64_t cached_read_pos;
+
+        public:
+            Writer()
+            : buffer(nullptr)
+            , cached_read_pos(0) { };
+            ~Writer() = default;
+
+            explicit Writer(Buffer<Type, align_array_size(Size)>& buf)
+            : buffer(buf)
+            , cached_read_pos(buffer->read_pos.load(std::memory_order_relaxed))
+            {
+            }
+
+            Writer(const Writer<Type, Size>& other) = delete;
+            Writer& operator=(const Writer<Type, Size>& other) = delete;
+
+            Writer(Writer<Type, Size>&& other) noexcept
+            : buffer(other.buffer)
+            , cached_read_pos(other.buffer->read_pos.load(std::memory_order_relaxed)) { };
+            Writer& operator=(Writer<Type, Size>&& other) noexcept
+            {
+                std::swap(buffer, other.buffer);
+                cached_read_pos = buffer->read_pos.load(std::memory_order_relaxed);
+            };
+
+            template<typename Backoff>
+            void insert_with_backoff(const Type& item, Backoff& backoff)
+            {
+                while (!try_insert())
+                {
+                    backoff.wait([this]() { return this->try_insert(); });
+                }
+                backoff.reset();
+
+                const auto current_write = buffer->write_pos.load(std::memory_order_relaxed);
+                buffer->data[current_write] = item;
+
+                const auto next_write = Buffer<Type, align_array_size(Size)>::advanced_pos(current_write);
+                buffer->write_pos.store(next_write, std::memory_order_release);
+            }
+
+            bool insert(const Type& item) noexcept
+            {
+                const auto current_write = buffer->write_pos.load(std::memory_order_relaxed);
+
+                if (current_write == cached_read_pos)
+                {
+                    cached_read_pos = buffer->read_pos.load(std::memory_order_acquire);
+                    if (current_write == cached_read_pos)
+                    {
+                        return false;
+                    }
+                }
+
+                buffer->data[current_write] = item;
+                const auto next_write = buffer->advanced_pos(current_write);
+                buffer->write_pos.store(next_write, std::memory_order_release);
+                return true;
+            }
+
+            bool try_insert() noexcept
+            {
+                const auto current_write = buffer->write_pos.load(std::memory_order_relaxed);
+
+                if (current_write == cached_read_pos)
+                {
+                    cached_read_pos = buffer->read_pos.load(std::memory_order_acquire);
+                    if (current_write == cached_read_pos)
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+        };
+    }
+}

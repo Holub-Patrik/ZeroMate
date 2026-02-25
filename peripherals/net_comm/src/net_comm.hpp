@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include <map>
+#include <memory>
 #include <thread>
 #include <atomic>
 #include <variant>
@@ -27,23 +27,6 @@ constexpr std::uint8_t MAGIC_BYTE = 60; // 0x00111100
 constexpr std::uint8_t WRITE_ONE = UINT8_MAX;
 constexpr std::uint8_t WRITE_ZERO = 0;
 
-inline void cpu_relax()
-{
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    #ifdef _MSC_VER
-        #include <intrin.h>
-    _mm_pause();
-    #else
-    __builtin_ia32_pause();
-    #endif
-#elif defined(__aarch64__) || defined(__arm__)
-    asm volatile("yield");
-#else
-    // Fallback compiler barrier to force memory reload
-    asm volatile("" ::: "memory");
-#endif
-}
-
 // this out to be enough since there are only 52 GPIO pins
 constexpr std::uint8_t GPIOMapSize = 64;
 
@@ -59,13 +42,13 @@ using ProtocolEnum = enum : std::uint8_t
 class FastMap
 {
 private:
-    std::array<std::uint8_t, GPIOMapSize> m_map;
+    std::array<std::uint8_t, GPIOMapSize> _map;
 
 public:
     FastMap()
-    : m_map()
+    : _map()
     {
-        for (std::uint8_t& mapping : m_map)
+        for (std::uint8_t& mapping : _map)
         {
             mapping = UINT8_MAX;
         }
@@ -73,115 +56,22 @@ public:
 
     void set(const std::uint8_t src, const std::uint8_t dst) noexcept
     {
-        m_map[src] = dst;
+        _map[src] = dst;
     }
 
     [[nodiscard]] std::uint8_t get(const std::uint8_t src) const noexcept
     {
-        return m_map[src];
+        return _map[src];
     }
 
     [[nodiscard]] bool contains(const std::uint8_t pos) const noexcept
     {
-        return m_map[pos] != UINT8_MAX;
+        return _map[pos] != UINT8_MAX;
     }
 
     [[nodiscard]] const std::array<std::uint8_t, GPIOMapSize>& _get_arr() const noexcept
     {
-        return m_map;
-    }
-};
-
-class Backoff final
-{
-private:
-    const std::uint64_t max_cycles;
-    std::uint64_t cycles{ 0 };
-
-public:
-    Backoff() = delete;
-    ~Backoff() = default;
-
-    explicit Backoff(const std::uint64_t max_cycles)
-    : max_cycles(max_cycles)
-    {
-    }
-
-    Backoff(const Backoff& other) = delete;
-    Backoff& operator=(const Backoff& other) = delete;
-
-    Backoff(Backoff&& other) = delete;
-    Backoff& operator=(Backoff&& other) = delete;
-
-    void wait() noexcept
-    {
-        if (cycles < max_cycles)
-        {
-            cycles++;
-            return;
-        }
-        cpu_relax();
-    }
-
-    void reset() noexcept
-    {
-        cycles = 0;
-    }
-};
-
-template<typename TimeUnit>
-class SleepBackoff final
-{
-private:
-    const std::uint64_t max_cycles_fast;
-    const std::uint64_t max_cycles_relaxed;
-
-    const TimeUnit wait_time{ std::chrono::microseconds{ 100 } };
-
-    std::uint64_t cycles_fast{ 0 };
-    std::uint64_t cycles_relaxed{ 0 };
-
-public:
-    SleepBackoff<TimeUnit>() = delete;
-    ~SleepBackoff<TimeUnit>() = default;
-
-    explicit SleepBackoff<TimeUnit>(const std::uint64_t max_cycles_fast,
-                                    const std::uint64_t max_cycles_relaxed,
-                                    const TimeUnit& wait_time)
-    : max_cycles_fast(max_cycles_fast)
-    , max_cycles_relaxed(max_cycles_relaxed)
-    , wait_time(wait_time)
-    {
-    }
-
-    SleepBackoff<TimeUnit>(const SleepBackoff<TimeUnit>& other) = delete;
-    SleepBackoff<TimeUnit>& operator=(const SleepBackoff<TimeUnit>& other) = delete;
-
-    SleepBackoff<TimeUnit>(SleepBackoff<TimeUnit>&& other) = delete;
-    SleepBackoff<TimeUnit>& operator=(SleepBackoff<TimeUnit>&& other) = delete;
-
-    void wait() noexcept
-    {
-        if (cycles_fast < max_cycles_fast)
-        {
-            cycles_fast++;
-            return;
-        }
-
-        if (cycles_relaxed < max_cycles_relaxed)
-        {
-            cycles_relaxed++;
-            cpu_relax();
-            return;
-        }
-
-        std::this_thread::sleep_for(wait_time);
-    }
-
-    void reset() noexcept
-    {
-        cycles_fast = 0;
-        cycles_relaxed = 0;
+        return _map;
     }
 };
 
@@ -296,16 +186,15 @@ using protocol_info = struct protocol_info
     Protocol info;
 };
 
-using conn_info = struct
+using conn_info = struct conn_info_struct
 {
-    bool explicit_clock;
-    std::int8_t clock_unit;
-    std::uint32_t clock_value;
+    bool explicit_clock{};
+    std::int8_t clock_unit{};
+    std::uint32_t clock_value{};
 
-    in_port_t opened_port;
+    in_port_t opened_port{};
     protocol_info protocol;
-
-    std::string name;
+    std::uint32_t net_id{};
 };
 
 using conn_id = std::uint64_t;
@@ -314,42 +203,35 @@ using pin_pair = std::pair<std::uint8_t, std::uint8_t>;
 class GPIOServer final
 {
 private:
-    static constexpr std::uint64_t BACKOFF_CYCLES = 1024;
+    static constexpr std::uint64_t BACKOFF_CYCLES = 1000;
+    static constexpr std::uint64_t BACKOFF_CYCLES_RELAXED = 20'000;
     static constexpr auto NET_WAIT_TIME = std::chrono::microseconds{ 100 };
     static constexpr std::size_t MAX_CONNECTION_COUNT = 16;
     static constexpr std::size_t BUFFER_COUNT = MAX_CONNECTION_COUNT;
     static constexpr std::size_t BUFFER_SIZE = 512;
 
-    std::map<conn_id, conn_info> connection_map;
-    // convert this one into a directo lookup later
-    // This might a good usecase for the 3 array datastructure
-    // - The 3 array solution might be good since connections opening/closing isn't guaranteed to be in order
-    // This map is needed due to callback nature of handling the pin callback
-    std::map<std::uint8_t, conn_id> pin_to_connection;
-    std::map<conn_id, CB::Writer<std::uint8_t, QUEUE_SIZE>> connection_to_queue_map;
-
-    CB::Buffer<pin_pair, QUEUE_SIZE> pin_write_queue_buf{};
-    CB::Reader<pin_pair, QUEUE_SIZE> pin_write_queue_reader;
-    CB::Writer<pin_pair, QUEUE_SIZE> pin_write_queue_writer;
-
+    // Pin write entirely here since there will be multiple writers, so spinlock is added to ensure safety
+    TSP::Queue::Buffer<pin_pair, QUEUE_SIZE> pin_write_queue_buf{};
+    TSP::Queue::Reader<pin_pair, QUEUE_SIZE> pin_write_queue_reader;
+    TSP::Queue::Writer<pin_pair, QUEUE_SIZE> pin_write_queue_writer;
     Spinlock pin_write_spinlock;
-    Backoff backoff_fast{ BACKOFF_CYCLES };
-    SleepBackoff<std::chrono::microseconds> backoff_net{ BACKOFF_CYCLES,
-                                                         (BACKOFF_CYCLES * BACKOFF_CYCLES),
-                                                         NET_WAIT_TIME };
+
+    TSP::BF::Backoff backoff_fast{ BACKOFF_CYCLES };
+    TSP::BF::SemBackoff backoff_sem{ BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED };
 
     // a bit map lookup might be best to assign new threads
-    std::array<CB::Buffer<pin_pair, BUFFER_SIZE>, BUFFER_COUNT> out_queue_buffers;
-    std::array<CB::Writer<pin_pair, BUFFER_SIZE>, BUFFER_COUNT> out_queue_writers;
+    std::array<TSP::Queue::Buffer<pin_pair, BUFFER_SIZE>, BUFFER_COUNT> out_queue_buffers;
+    std::array<TSP::Queue::Writer<pin_pair, BUFFER_SIZE>, BUFFER_COUNT> out_queue_writers;
 
     // this could be converted into a bit map, but bit instruction are extra instructions
     std::array<bool, MAX_CONNECTION_COUNT> connection_bit_map{};
-    // vector used even though it will be always MAX_CONNECTION_COUNT size
-    std::vector<std::thread> connection_threads;
-    std::vector<std::thread> connection_data;
 
-    // Every connection when registered, will set entries in this map so the routing routes
-    FastMap id_to_conn;
+    // abuse std::destroy_at{} and std::construct_at{} to use arrays
+    std::array<std::thread, MAX_CONNECTION_COUNT> connection_threads;
+    std::array<conn_info, MAX_CONNECTION_COUNT> connection_data;
+
+    FastMap pin_to_conn_id;
+    FastMap net_id_to_conn_id;
 
     zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin;
 
@@ -365,7 +247,7 @@ public:
     {
         for (int i = 0; i < out_queue_buffers.size(); i++)
         {
-            out_queue_writers[i] = std::move(CB::Writer<pin_pair, BUFFER_SIZE>{ out_queue_buffers[i] });
+            std::construct_at(&out_queue_writers[i], out_queue_buffers[i]);
         }
     }
     ~GPIOServer() = default;
@@ -378,6 +260,7 @@ public:
 
     void write_to_pin(const std::uint8_t pin, const std::uint8_t value);
     void route_pin_info(const pin_pair pin_info);
+    void construct_connection(const conn_info& info);
     void run();
 };
 
@@ -387,10 +270,13 @@ private:
     conn_info connection;
     std::unique_ptr<Parser> parser;
 
-    CB::Reader<std::uint8_t, QUEUE_SIZE> bit_queue;
+    TSP::Queue::Reader<std::uint8_t, QUEUE_SIZE> bit_queue;
 
 public:
     GPIOConnection() = delete;
+    explicit GPIOConnection(const conn_info& info);
+
+    GPIOConnection(const GPIOConnection& other) = delete;
     void run();
 };
 
