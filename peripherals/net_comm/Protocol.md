@@ -134,6 +134,23 @@ std::map<std::uint64_t, Connection> connection_map;
 
 // I will need a way to map pins to connections they belong to
 std::map<std::uint8_t, std::uint64_t> pin_to_connection;
+
+```
+
+How the hell should the routing happen ?? And how to do it so it actually runs fast ??
+This is a question what needs to be associated with each pin
+The data pushed will have to be a pair of pin and value
+The connection information saved will have to do the ruouting later
+
+```cpp
+struct Connection {
+    int queue_idx; // into which queue to place the data. But what data?
+};
+
+struct PinInfo{
+    Connection conn;
+}
+
 ```
 
 ### Data notes

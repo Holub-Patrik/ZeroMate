@@ -59,38 +59,48 @@ namespace CB
     class Reader final
     {
     private:
-        Buffer<Type, align_array_size(Size)>& buffer;
+        Buffer<Type, align_array_size(Size)>* buffer;
         std::uint64_t cached_write_pos;
 
     public:
-        Reader() = delete;
+        Reader()
+        : buffer(nullptr)
+        , cached_write_pos(0) { };
         ~Reader() = default;
 
         explicit Reader(Buffer<Type, align_array_size(Size)>& buf)
-        : buffer(buf)
-        , cached_write_pos(buffer.write_pos.load(std::memory_order_relaxed))
+        : buffer(&buf)
+        , cached_write_pos(buffer->write_pos.load(std::memory_order_relaxed))
         {
         }
 
         Reader(const Reader<Type, Size>& other) = delete;
         Reader& operator=(const Reader<Type, Size>& other) = delete;
 
-        Reader(Reader<Type, Size>&& other) = delete;
-        Reader& operator=(Reader<Type, Size>&& other) = delete;
+        Reader(Reader<Type, Size>&& other) noexcept
+        : buffer(other.buffer)
+        , cached_write_pos(other.buffer->write_pos.load(std::memory_order_relaxed))
+        {
+        }
+        Reader& operator=(Reader<Type, Size>&& other) noexcept
+        {
+            std::swap(buffer, other.buffer);
+            cached_write_pos(buffer->write_pos.load(std::memory_order_relaxed));
+        };
 
         const Type& peek() const
         {
-            return buffer.data[buffer.read_pos.load(std::memory_order_relaxed)];
+            return buffer->data[buffer->read_pos.load(std::memory_order_relaxed)];
         }
 
         bool try_advance() noexcept
         {
-            const auto current_read = buffer.read_pos.load(std::memory_order_relaxed);
-            const auto next_read = buffer.advanced_pos(current_read);
+            const auto current_read = buffer->read_pos.load(std::memory_order_relaxed);
+            const auto next_read = buffer->advanced_pos(current_read);
 
             if (next_read == cached_write_pos)
             {
-                cached_write_pos = buffer.write_pos.load(std::memory_order_acquire);
+                cached_write_pos = buffer->write_pos.load(std::memory_order_acquire);
                 if (next_read == cached_write_pos)
                 {
                     return false;
@@ -102,19 +112,19 @@ namespace CB
 
         bool advance() noexcept
         {
-            const auto current_read = buffer.read_pos.load(std::memory_order_relaxed);
-            const auto next_read = buffer.advanced_pos(current_read);
+            const auto current_read = buffer->read_pos.load(std::memory_order_relaxed);
+            const auto next_read = buffer->advanced_pos(current_read);
 
             if (next_read == cached_write_pos)
             {
-                cached_write_pos = buffer.write_pos.load(std::memory_order_acquire);
+                cached_write_pos = buffer->write_pos.load(std::memory_order_acquire);
                 if (next_read == cached_write_pos)
                 {
                     return false;
                 }
             }
 
-            buffer.read_pos.store(next_read, std::memory_order_release);
+            buffer->read_pos.store(next_read, std::memory_order_release);
             return true;
         }
     };
@@ -123,51 +133,59 @@ namespace CB
     class Writer final
     {
     private:
-        Buffer<Type, align_array_size(Size)>& buffer;
+        Buffer<Type, align_array_size(Size)>* buffer;
         std::uint64_t cached_read_pos;
 
     public:
-        Writer() = delete;
+        Writer()
+        : buffer(nullptr)
+        , cached_read_pos(0) { };
         ~Writer() = default;
 
         explicit Writer(Buffer<Type, align_array_size(Size)>& buf)
         : buffer(buf)
-        , cached_read_pos(buffer.read_pos.load(std::memory_order_relaxed))
+        , cached_read_pos(buffer->read_pos.load(std::memory_order_relaxed))
         {
         }
 
         Writer(const Writer<Type, Size>& other) = delete;
         Writer& operator=(const Writer<Type, Size>& other) = delete;
 
-        Writer(Writer<Type, Size>&& other) = delete;
-        Writer& operator=(Writer<Type, Size>&& other) = delete;
+        Writer(Writer<Type, Size>&& other) noexcept
+        : buffer(other.buffer)
+        , cached_read_pos(other.buffer->read_pos.load(std::memory_order_relaxed)) { };
+        Writer& operator=(Writer<Type, Size>&& other) noexcept
+        {
+            std::swap(buffer, other.buffer);
+            cached_read_pos = buffer->read_pos.load(std::memory_order_relaxed);
+        };
 
         bool insert(const Type& item) noexcept
         {
-            const auto current_write = buffer.write_pos.load(std::memory_order_relaxed);
+            const auto current_write = buffer->write_pos.load(std::memory_order_relaxed);
 
             if (current_write == cached_read_pos)
             {
-                cached_read_pos = buffer.read_pos.load(std::memory_order_acquire);
+                cached_read_pos = buffer->read_pos.load(std::memory_order_acquire);
                 if (current_write == cached_read_pos)
                 {
                     return false;
                 }
             }
 
-            buffer.data[buffer.write_pos] = item;
-            const auto next_write = buffer.advanced_pos(current_write);
-            buffer.write_pos.store(next_write, std::memory_order_release);
+            buffer->data[buffer->write_pos] = item;
+            const auto next_write = buffer->advanced_pos(current_write);
+            buffer->write_pos.store(next_write, std::memory_order_release);
             return true;
         }
 
         bool try_insert() noexcept
         {
-            const auto current_write = buffer.write_pos.load(std::memory_order_relaxed);
+            const auto current_write = buffer->write_pos.load(std::memory_order_relaxed);
 
             if (current_write == cached_read_pos)
             {
-                cached_read_pos = buffer.read_pos.load(std::memory_order_acquire);
+                cached_read_pos = buffer->read_pos.load(std::memory_order_acquire);
                 if (current_write == cached_read_pos)
                 {
                     return false;
