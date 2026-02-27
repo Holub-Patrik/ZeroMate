@@ -80,6 +80,8 @@ extern "C"
                       std::size_t pin_count,
                       zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
                       [[maybe_unused]] zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
+                      [[maybe_unused]] zero_mate::IExternal_Peripheral::Halt_t halt,
+                      [[maybe_unused]] zero_mate::IExternal_Peripheral::Start_t start,
                       [[maybe_unused]] zero_mate::utils::CLogging_System* logging_system)
     {
         // Only one pin shall be passed to the peripheral.

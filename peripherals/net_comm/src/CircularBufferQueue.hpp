@@ -98,7 +98,7 @@ namespace TSP
             template<typename Predicate>
             void wait(Predicate&& pred) noexcept
             {
-                static_cast<Derived*>(this)->wait_impl(std::forward(pred));
+                static_cast<Derived*>(this)->wait_impl(std::forward<decltype(pred)>(pred));
             }
 
             void reset() noexcept
@@ -329,8 +329,8 @@ namespace TSP
             , cached_write_pos(0) { };
             ~Reader() = default;
 
-            explicit Reader(Buffer<Type, align_array_size(Size)>& buf)
-            : buffer(&buf)
+            explicit Reader(Buffer<Type, align_array_size(Size)>* buf)
+            : buffer(buf)
             , cached_write_pos(buffer->write_pos.load(std::memory_order_relaxed))
             {
             }
@@ -364,7 +364,7 @@ namespace TSP
                 backoff.reset();
 
                 // advance without extra checks
-                const auto ret = peek();
+                const auto& ret = peek();
                 const auto current_read = buffer->read_pos.load(std::memory_order_relaxed);
                 const auto next_read = Buffer<Type, align_array_size(Size)>::advanced_pos(current_read);
                 buffer->read_pos.store(next_read, std::memory_order_release);
@@ -421,7 +421,7 @@ namespace TSP
             , cached_read_pos(0) { };
             ~Writer() = default;
 
-            explicit Writer(Buffer<Type, align_array_size(Size)>& buf)
+            explicit Writer(Buffer<Type, align_array_size(Size)>* buf)
             : buffer(buf)
             , cached_read_pos(buffer->read_pos.load(std::memory_order_relaxed))
             {

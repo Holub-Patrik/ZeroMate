@@ -117,7 +117,7 @@ namespace zero_mate::gui
 
     void CControl_Window::Render_Step_Button()
     {
-        if (ImGui::Button(ICON_FA_STEP_FORWARD " Step") && !m_cpu_running)
+        if (ImGui::Button(ICON_FA_STEP_FORWARD " Step") && Is_Stopped())
         {
             // Make sure a kernel has been loaded.
             if (!m_elf_file_has_been_loaded)
@@ -137,31 +137,60 @@ namespace zero_mate::gui
 
     void CControl_Window::Render_Stop_Button()
     {
-        if (ImGui::Button(ICON_FA_STOP " Stop") && m_cpu_running)
+        if (ImGui::Button(ICON_FA_STOP " Stop") && Is_Running())
         {
-            // Set the flag to stop CPU execution (running thread).
-            m_stop_cpu_thread = true;
+            Request_Stop();
         }
     }
 
     void CControl_Window::Render_Run_Button()
     {
-        if (ImGui::Button(ICON_FA_PLAY_CIRCLE " Run") && !m_cpu_running)
+        if (ImGui::Button(ICON_FA_PLAY_CIRCLE " Run") && Is_Stopped())
         {
-            // Make sure a kernel has been loaded.
             if (!m_elf_file_has_been_loaded)
             {
                 Print_No_ELF_File_Loaded_Error_Msg();
             }
             else
             {
-                // Set the flag to start CPU execution.
-                m_start_cpu_thread = true;
-
-                // Perform a single step regardless of any set breakpoints.
-                m_cpu->Step(true);
+                Request_Start();
             }
         }
+    }
+
+    void CControl_Window::Request_Stop() noexcept
+    {
+        if (m_cpu_running)
+        {
+            m_stop_cpu_thread = true;
+        }
+    }
+
+    void CControl_Window::Request_Start() noexcept
+    {
+        if (!m_cpu_running && m_elf_file_has_been_loaded)
+        {
+            // Set the flag to start CPU execution.
+            m_start_cpu_thread = true;
+
+            // Perform a single step regardless of any set breakpoints.
+            m_cpu->Step(true);
+        }
+    }
+
+    bool CControl_Window::Is_Running() const noexcept
+    {
+        return m_cpu_running && !m_stop_cpu_thread;
+    }
+
+    bool CControl_Window::Is_Stopping() const noexcept
+    {
+        return m_cpu_running && m_stop_cpu_thread;
+    }
+
+    bool CControl_Window::Is_Stopped() const noexcept
+    {
+        return !m_cpu_running;
     }
 
     void CControl_Window::Render_Control_Buttons()
@@ -193,11 +222,17 @@ namespace zero_mate::gui
         }
         else
         {
-            if (m_cpu_running)
+            if (Is_Running())
             {
                 // Running
                 ImGui::PushStyleColor(ImGuiCol_Text, color::Green);
                 ImGui::Text("Running");
+            }
+            else if (Is_Stopping())
+            {
+                // Stopping
+                ImGui::PushStyleColor(ImGuiCol_Text, color::Yellow);
+                ImGui::Text("Stopping");
             }
             else
             {

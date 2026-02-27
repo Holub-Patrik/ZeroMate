@@ -149,6 +149,20 @@ namespace zero_mate::soc
     /// Broadcom serial controller 3 (BSC 3)
     extern std::shared_ptr<peripheral::CBSC> g_bsc_3;
 
+    /// Type of a function that halts the CPU
+    using Halt_CPU_t = std::function<void()>;
+
+    /// Type of a function that starts the CPU
+    using Start_CPU_t = std::function<void()>;
+
+    /// This function needs to be filled from outside by some kind of controller
+    /// Global reference to a function that halts the CPU
+    extern Halt_CPU_t g_halt_cpu;
+
+    /// This function needs to be filled from outside by some kind of controller
+    /// Global reference to a function that starts the CPU
+    extern Start_CPU_t g_start_cpu;
+
     // -----------------------------------------------------------------------------------------------------------------
     /// \brief Initializes the system.
     ///

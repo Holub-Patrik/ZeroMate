@@ -83,6 +83,10 @@ namespace zero_mate::soc
     // BSC 3
     std::shared_ptr<peripheral::CBSC> g_bsc_3 = std::make_shared<peripheral::CBSC>(g_gpio);
 
+    // Halt and Start CPU functions
+    Halt_CPU_t g_halt_cpu{ nullptr };
+    Start_CPU_t g_start_cpu{ nullptr };
+
     // Initialize the collection of all internal peripherals as well as a collection of all external
     // peripherals that are connected to the board via GPIO.
     std::vector<std::shared_ptr<peripheral::IPeripheral>> g_peripherals{};
@@ -142,6 +146,28 @@ namespace zero_mate::soc
             const auto status =
             g_gpio->Set_Pin_State(pin_idx, static_cast<peripheral::CGPIO_Manager::CPin::NState>(set));
             return static_cast<int>(status);
+        }
+
+        // -------------------------------------------------------------------------------------------------------------
+        /// \brief Halts CPU execution.
+        // -------------------------------------------------------------------------------------------------------------
+        void Halt()
+        {
+            if (g_halt_cpu)
+            {
+                g_halt_cpu();
+            }
+        }
+
+        // -------------------------------------------------------------------------------------------------------------
+        /// \brief Starts CPU execution.
+        // -------------------------------------------------------------------------------------------------------------
+        void Start()
+        {
+            if (g_start_cpu)
+            {
+                g_start_cpu();
+            }
         }
 
         // -------------------------------------------------------------------------------------------------------------
@@ -342,6 +368,8 @@ namespace zero_mate::soc
                                                                          std::size_t,
                                                                          IExternal_Peripheral::Set_GPIO_Pin_t,
                                                                          IExternal_Peripheral::Read_GPIO_Pin_t,
+                                                                         IExternal_Peripheral::Halt_t,
+                                                                         IExternal_Peripheral::Start_t,
                                                                          utils::CLogging_System*)>("Create_Peripheral");
 
                 // Create room for the new external peripheral in the collection of all external peripherals
@@ -355,6 +383,8 @@ namespace zero_mate::soc
                                   config.connection.size(),
                                   &Set_GPIO_Pin,
                                   &Read_GPIO_Pin,
+                                  &Halt,
+                                  &Start,
                                   utils::CSingleton<utils::CLogging_System>::Get_Instance()));
 
                 switch (status)

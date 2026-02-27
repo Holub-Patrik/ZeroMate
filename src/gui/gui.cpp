@@ -104,11 +104,16 @@ namespace zero_mate::gui
             s_windows.emplace_back(std::make_shared<CDemo_Window>());
 
             // Control window
-            s_windows.emplace_back(std::make_shared<CControl_Window>(soc::g_cpu,
-                                                                     s_scroll_to_curr_line,
-                                                                     s_kernel_has_been_loaded,
-                                                                     s_cpu_running,
-                                                                     s_kernel_filename));
+            auto control_window = std::make_shared<CControl_Window>(soc::g_cpu,
+                                                                    s_scroll_to_curr_line,
+                                                                    s_kernel_has_been_loaded,
+                                                                    s_cpu_running,
+                                                                    s_kernel_filename);
+
+            soc::g_halt_cpu = [control_window]() { control_window->Request_Stop(); };
+            soc::g_start_cpu = [control_window]() { control_window->Request_Start(); };
+
+            s_windows.emplace_back(control_window);
 
             // Source code window
             // clang-format off

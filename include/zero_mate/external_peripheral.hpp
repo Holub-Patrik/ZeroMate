@@ -44,6 +44,12 @@ namespace zero_mate
         /// Alias for a function that reads the value of a GPIO pin
         using Read_GPIO_Pin_t = bool (*)(std::uint32_t);
 
+        /// Alias for a function that halts CPU execution
+        using Halt_t = void (*)();
+
+        /// Alias for a function that starts CPU execution
+        using Start_t = void (*)();
+
         // -------------------------------------------------------------------------------------------------------------
         /// \enum NInit_Status
         /// \brief Defines values that can be returned from the #Create_Peripheral function.
@@ -182,5 +188,7 @@ extern "C"
                       std::size_t pin_count,
                       [[maybe_unused]] zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
                       [[maybe_unused]] zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
+                      [[maybe_unused]] zero_mate::IExternal_Peripheral::Halt_t halt,
+                      [[maybe_unused]] zero_mate::IExternal_Peripheral::Start_t start,
                       [[maybe_unused]] zero_mate::utils::CLogging_System* logging_system);
 }

@@ -153,11 +153,15 @@ Remote_GPIO::Remote_GPIO(const std::string& name,
                          const std::vector<std::uint32_t>& pins,
                          zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
                          zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
+                         zero_mate::IExternal_Peripheral::Halt_t halt,
+                         zero_mate::IExternal_Peripheral::Start_t start,
                          zero_mate::utils::CLogging_System* logging_system)
 : name(name)
 , pins(pins)
 , read_pin(read_pin)
 , set_pin(set_pin)
+, halt(halt)
+, start(start)
 , logging_system(logging_system)
 , ImGui_context(nullptr)
 , ui_selected_local_pin_idx(0)
@@ -224,6 +228,8 @@ extern "C"
                       std::size_t pin_count,
                       zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
                       zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
+                      zero_mate::IExternal_Peripheral::Halt_t halt,
+                      zero_mate::IExternal_Peripheral::Start_t start,
                       zero_mate::utils::CLogging_System* logging_system)
     {
         std::vector<std::uint32_t> pins;
@@ -232,7 +238,7 @@ extern "C"
             pins.push_back(connection[i]);
         }
 
-        *peripheral = new (std::nothrow) Remote_GPIO(name, pins, read_pin, set_pin, logging_system);
+        *peripheral = new (std::nothrow) Remote_GPIO(name, pins, read_pin, set_pin, halt, start, logging_system);
 
         if (*peripheral == nullptr)
         {

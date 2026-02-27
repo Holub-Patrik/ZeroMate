@@ -241,13 +241,13 @@ public:
     GPIOServer() = delete;
 
     explicit GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin)
-    : pin_write_queue_reader(pin_write_queue_buf)
-    , pin_write_queue_writer(pin_write_queue_buf)
+    : pin_write_queue_reader(&pin_write_queue_buf)
+    , pin_write_queue_writer(&pin_write_queue_buf)
     , func_set_pin(func_set_pin)
     {
         for (int i = 0; i < out_queue_buffers.size(); i++)
         {
-            std::construct_at(&out_queue_writers[i], out_queue_buffers[i]);
+            std::construct_at(&out_queue_writers[i], &out_queue_buffers[i]);
         }
     }
     ~GPIOServer() = default;
@@ -297,6 +297,8 @@ public:
                          const std::vector<std::uint32_t>& pins,
                          zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
                          zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
+                         zero_mate::IExternal_Peripheral::Halt_t halt,
+                         zero_mate::IExternal_Peripheral::Start_t start,
                          zero_mate::utils::CLogging_System* logging_system);
 
     ~Remote_GPIO() final;
@@ -316,6 +318,8 @@ private:
     std::vector<std::uint32_t> pins; // Available local pins
     zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin;
     zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin;
+    zero_mate::IExternal_Peripheral::Halt_t halt;
+    zero_mate::IExternal_Peripheral::Start_t start;
     zero_mate::utils::CLogging_System* logging_system;
     ImGuiContext* ImGui_context;
 
