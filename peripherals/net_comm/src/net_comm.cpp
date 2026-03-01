@@ -4,11 +4,12 @@
 /// \brief Implementation of the Remote GPIO peripheral.
 // ---------------------------------------------------------------------------------------------------------------------
 
-#include "net_comm.hpp"
 #include "CircularBufferQueue.hpp"
+#include "net_comm.hpp"
 
-#include <unistd.h>
 #include <cstring>
+#include <unistd.h>
+#include <sys/socket.h>
 
 // Helper function local to this cpp file
 namespace
@@ -115,7 +116,10 @@ void GPIOServer::pin_write()
     // tries to read from the queue
     // if nothing comes for a long enough time, start sleeping on a semaphore
     const auto [pin, value] = pin_write_queue_reader.read(backoff_sem);
-    func_set_pin(static_cast<std::uint32_t>(pin), value > 0);
+    if (m_running.load())
+    {
+        func_set_pin(static_cast<std::uint32_t>(pin), value > 0);
+    }
 }
 
 void GPIOServer::write_to_pin(const std::uint8_t pin, const std::uint8_t value)
@@ -130,8 +134,14 @@ void GPIOServer::write_to_pin(const std::uint8_t pin, const std::uint8_t value)
 void GPIOServer::route_pin_info(const pin_pair pin_info)
 {
     const auto& [pin, value] = pin_info;
-    const auto& conn_id = pin_to_conn_id.get(pin);
-    auto& writer_ref = out_queue_writers[conn_id];
+    const auto conn_id_idx = pin_to_conn_id.get(pin);
+
+    if (conn_id_idx == UINT8_MAX)
+    {
+        return;
+    }
+
+    auto& writer_ref = out_queue_writers[conn_id_idx];
     while (!writer_ref.try_insert())
     {
         backoff_fast.wait();
@@ -143,12 +153,118 @@ void GPIOServer::route_pin_info(const pin_pair pin_info)
 
 void GPIOServer::construct_connection(const conn_info& info)
 {
+    for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; ++i)
+    {
+        if (!connection_bit_map[i])
+        {
+            connection_bit_map[i] = true;
+            connection_data[i] = info;
+            connection_threads[i] = std::thread([this, i]() {
+                GPIOConnection conn(connection_data[i], &out_queue_buffers[i], func_halt, func_start, *this, m_running);
+                conn.run();
+            });
+            return;
+        }
+    }
 }
 
 void GPIOServer::run()
 {
+    m_pin_write_thread = std::thread([this]() {
+        while (m_running.load())
+        {
+            pin_write();
+        }
+    });
+
+    // TODO: Main discovery/config loop (UDP recvfrom)
+    while (m_running.load())
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
+void GPIOServer::stop()
+{
+    m_running.store(false);
+    backoff_sem.wake();
+    if (m_pin_write_thread.joinable())
+    {
+        m_pin_write_thread.join();
+    }
+    for (auto& thread : connection_threads)
+    {
+        if (thread.joinable())
+        {
+            thread.join();
+        }
+    }
+}
+
+GPIOServer::~GPIOServer()
+{
+    stop();
+}
+
+GPIOConnection::GPIOConnection(const conn_info& info,
+                               TSP::Queue::Buffer<pin_pair, GPIOServer::BUFFER_SIZE>* buffer,
+                               zero_mate::IExternal_Peripheral::Halt_t halt,
+                               zero_mate::IExternal_Peripheral::Start_t start,
+                               GPIOServer& server,
+                               std::atomic<bool>& server_running)
+: connection(info)
+, m_queue_reader(buffer)
+, m_socket(-1)
+, m_halt(halt)
+, m_start(start)
+, m_server(server)
+, m_server_running(server_running)
+{
+    if (std::holds_alternative<UART_P>(info.protocol.info))
+    {
+        m_sm = std::make_unique<UARTStateMachine>(*this, std::get<UART_P>(info.protocol.info));
+    }
+}
+
+GPIOConnection::~GPIOConnection()
+{
+    if (m_socket != -1)
+    {
+        close(m_socket);
+    }
+}
+
+void GPIOConnection::run()
+{
+    if (m_sm)
+    {
+        m_sm->run();
+    }
+}
+
+pin_pair GPIOConnection::read_queue()
+{
+    TSP::BF::Backoff backoff(100);
+    return m_queue_reader.read(backoff);
+}
+
+void GPIOConnection::send_to_network(const std::vector<std::uint8_t>& data)
+{
+    if (m_socket != -1)
+    {
+        sendto(m_socket,
+               data.data(),
+               data.size(),
+               0,
+               reinterpret_cast<struct sockaddr*>(&m_other_side),
+               sizeof(m_other_side));
+    }
+}
+
+void GPIOConnection::write_to_pin(std::uint8_t pin, std::uint8_t value)
+{
+    m_server.write_to_pin(pin, value);
+}
 Remote_GPIO::Remote_GPIO(const std::string& name,
                          const std::vector<std::uint32_t>& pins,
                          zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
@@ -164,6 +280,7 @@ Remote_GPIO::Remote_GPIO(const std::string& name,
 , start(start)
 , logging_system(logging_system)
 , ImGui_context(nullptr)
+, server(set_pin, halt, start)
 , ui_selected_local_pin_idx(0)
 , ui_target_net_pin(0)
 , ui_selected_net_pin_source(0)
@@ -174,9 +291,16 @@ Remote_GPIO::Remote_GPIO(const std::string& name,
     {
         m_gpio_subscription.insert(pin);
     }
+
+    server_thread = std::thread(&GPIOServer::run, &server);
 }
 
-Remote_GPIO::~Remote_GPIO() = default;
+Remote_GPIO::~Remote_GPIO()
+{
+    m_running.store(false);
+    server.stop();
+    server_thread.join();
+}
 
 void Remote_GPIO::Set_ImGui_Context(void* context)
 {

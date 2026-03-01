@@ -200,9 +200,16 @@ using conn_info = struct conn_info_struct
 using conn_id = std::uint64_t;
 using pin_pair = std::pair<std::uint8_t, std::uint8_t>;
 
+class IProtocolStateMachine
+{
+public:
+    virtual ~IProtocolStateMachine() = default;
+    virtual void run() = 0;
+};
+
 class GPIOServer final
 {
-private:
+public:
     static constexpr std::uint64_t BACKOFF_CYCLES = 1000;
     static constexpr std::uint64_t BACKOFF_CYCLES_RELAXED = 20'000;
     static constexpr auto NET_WAIT_TIME = std::chrono::microseconds{ 100 };
@@ -210,6 +217,7 @@ private:
     static constexpr std::size_t BUFFER_COUNT = MAX_CONNECTION_COUNT;
     static constexpr std::size_t BUFFER_SIZE = 512;
 
+private:
     // Pin write entirely here since there will be multiple writers, so spinlock is added to ensure safety
     TSP::Queue::Buffer<pin_pair, QUEUE_SIZE> pin_write_queue_buf{};
     TSP::Queue::Reader<pin_pair, QUEUE_SIZE> pin_write_queue_reader;
@@ -234,23 +242,32 @@ private:
     FastMap net_id_to_conn_id;
 
     zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin;
+    zero_mate::IExternal_Peripheral::Halt_t func_halt;
+    zero_mate::IExternal_Peripheral::Start_t func_start;
+
+    std::atomic<bool> m_running{ true };
+    std::thread m_pin_write_thread;
 
     void pin_write();
 
 public:
     GPIOServer() = delete;
 
-    explicit GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin)
+    explicit GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin,
+                        zero_mate::IExternal_Peripheral::Halt_t func_halt,
+                        zero_mate::IExternal_Peripheral::Start_t func_start)
     : pin_write_queue_reader(&pin_write_queue_buf)
     , pin_write_queue_writer(&pin_write_queue_buf)
     , func_set_pin(func_set_pin)
+    , func_halt(func_halt)
+    , func_start(func_start)
     {
-        for (int i = 0; i < out_queue_buffers.size(); i++)
+        for (std::size_t i = 0; i < out_queue_buffers.size(); i++)
         {
             std::construct_at(&out_queue_writers[i], &out_queue_buffers[i]);
         }
     }
-    ~GPIOServer() = default;
+    ~GPIOServer();
 
     GPIOServer(const GPIOServer& other) = delete;
     GPIOServer& operator=(const GPIOServer& other) = delete;
@@ -262,22 +279,90 @@ public:
     void route_pin_info(const pin_pair pin_info);
     void construct_connection(const conn_info& info);
     void run();
+    void stop();
+
+    // used by GPIOConnection
+    [[nodiscard]] zero_mate::IExternal_Peripheral::Halt_t get_halt() const
+    {
+        return func_halt;
+    }
+    [[nodiscard]] zero_mate::IExternal_Peripheral::Start_t get_start() const
+    {
+        return func_start;
+    }
 };
 
 class GPIOConnection final
 {
 private:
     conn_info connection;
-    std::unique_ptr<Parser> parser;
+    std::unique_ptr<IProtocolStateMachine> m_sm;
 
-    TSP::Queue::Reader<std::uint8_t, QUEUE_SIZE> bit_queue;
+    TSP::Queue::Reader<pin_pair, GPIOServer::BUFFER_SIZE> m_queue_reader;
+
+    int m_socket;
+    struct sockaddr_in m_other_side;
+
+    zero_mate::IExternal_Peripheral::Halt_t m_halt;
+    zero_mate::IExternal_Peripheral::Start_t m_start;
+    GPIOServer& m_server;
+
+    std::atomic<bool>& m_server_running;
 
 public:
     GPIOConnection() = delete;
-    explicit GPIOConnection(const conn_info& info);
+    GPIOConnection(const conn_info& info,
+                   TSP::Queue::Buffer<pin_pair, GPIOServer::BUFFER_SIZE>* buffer,
+                   zero_mate::IExternal_Peripheral::Halt_t halt,
+                   zero_mate::IExternal_Peripheral::Start_t start,
+                   GPIOServer& server,
+                   std::atomic<bool>& server_running);
+
+    ~GPIOConnection();
 
     GPIOConnection(const GPIOConnection& other) = delete;
     void run();
+
+    // Helper for SM
+    pin_pair read_queue();
+    void send_to_network(const std::vector<std::uint8_t>& data);
+    void write_to_pin(std::uint8_t pin, std::uint8_t value);
+    void halt()
+    {
+        m_halt();
+    }
+    void start()
+    {
+        m_start();
+    }
+    [[nodiscard]] bool is_running() const
+    {
+        return m_server_running.load();
+    }
+};
+
+class UARTStateMachine : public IProtocolStateMachine
+{
+private:
+    GPIOConnection& m_conn;
+    UART_P m_params;
+
+public:
+    UARTStateMachine(GPIOConnection& conn, const UART_P& params)
+    : m_conn(conn)
+    , m_params(params)
+    {
+    }
+
+    void run() override
+    {
+        while (m_conn.is_running())
+        {
+            const auto change = m_conn.read_queue();
+            // TODO: UART logic
+            (void)change;
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -323,7 +408,8 @@ private:
     zero_mate::utils::CLogging_System* logging_system;
     ImGuiContext* ImGui_context;
 
-    GPIOServer server{ set_pin };
+    std::atomic<bool> m_running{ true };
+    GPIOServer server;
     std::thread server_thread;
 
     // UI Helpers
