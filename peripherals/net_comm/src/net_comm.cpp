@@ -153,7 +153,7 @@ void GPIOServer::route_pin_info(const pin_pair pin_info)
 
 void GPIOServer::construct_connection(const conn_info& info)
 {
-    for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; ++i)
+    for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; i++)
     {
         if (!connection_bit_map[i])
         {
@@ -265,6 +265,7 @@ void GPIOConnection::write_to_pin(std::uint8_t pin, std::uint8_t value)
 {
     m_server.write_to_pin(pin, value);
 }
+
 Remote_GPIO::Remote_GPIO(const std::string& name,
                          const std::vector<std::uint32_t>& pins,
                          zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,

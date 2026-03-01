@@ -135,6 +135,13 @@ using UART_P = struct UART_ProtocolInfo
     std::uint32_t baudrate{ UINT32_MAX };
     std::uint32_t tx_pin{ UINT32_MAX }; // transmit
     std::uint32_t rx_pin{ UINT32_MAX }; // receive (ignore the callback on this one)
+
+    // summed up to create buf size
+    std::uint32_t start_bits{ UINT32_MAX };
+    std::uint32_t data_bits{ UINT32_MAX };
+    std::uint32_t parity_bits{ UINT32_MAX };
+    std::uint32_t stop_bits{ UINT32_MAX };
+
     // Point-to-point connection
     struct sockaddr_in other_side{};
 };
@@ -341,20 +348,36 @@ public:
     }
 };
 
-class UARTStateMachine : public IProtocolStateMachine
+class UARTStateMachine final : public IProtocolStateMachine
 {
+public:
+    static constexpr std::size_t MAX_BUF_SIZE = 16;
+
 private:
     GPIOConnection& m_conn;
     UART_P m_params;
+
+    std::size_t buf_idx{ 0 };
+    std::array<std::uint32_t, MAX_BUF_SIZE> buf;
 
 public:
     UARTStateMachine(GPIOConnection& conn, const UART_P& params)
     : m_conn(conn)
     , m_params(params)
     {
+        std::uint32_t buf_size = params.start_bits;
+        buf_size += params.data_bits;
+        buf_size += params.parity_bits;
+        buf_size += params.stop_bits;
+
+        // do not allow to create buffers above max size
+        if (buf_size > MAX_BUF_SIZE)
+        {
+            throw std::exception{};
+        }
     }
 
-    void run() override
+    void run() final
     {
         while (m_conn.is_running())
         {
