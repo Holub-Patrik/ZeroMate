@@ -195,6 +195,41 @@ For I2C from what I understand it will be communication based like this:
 1. My component will pulse data and clock for slave while accumulating data from slave
 1. Send back to master and pulse the data
 
+States that I have to detect and define
+- START Condition
+- Repeated START Condition
+- Address
+- RW -> (ACK/NACK Master/Slave mode)
+- Data
+- STOP Condition
+
+Read/Write sync/stop conditions
+Address
+1. Accumulate eight bits
+1. Stop Master
+1. Send to all slaves
+1. Simulate 9 clocks
+1. Send ACK/NACK back to master
+
+Writing byte
+1. Accumulate eight bits
+2. Stop Master
+3. Emulate 9 clock cycles on slave
+4. Send ACK/NACK back to master
+5. Set bit on master, start master up again
+
+Reading byte
+1. Clock 8 more times to retrieve data
+1. Stop clock on slave
+1. Start master up again and present data to him
+1. Collect ack/nack
+1. Stop master
+1. Send to slave
+1. Clock the ack/nack bit
+1. If ack return to step 1, otherwise await stop condition from master
+
+Reading byte
+
 ## SPI
 
 The same basic idea, but here the data and clock needs to be sent at all times

@@ -16,6 +16,7 @@
 #include <arpa/inet.h>
 #include <array>
 #include <algorithm>
+#include <functional>
 
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
@@ -150,15 +151,20 @@ using UART_P = struct UART_ProtocolInfo
 
 using I2C_P = struct I2C_ProtocolInfo
 {
+    bool master_mode;
+
     std::uint32_t scl_pin{ UINT32_MAX };
     std::uint32_t sda_pin{ UINT32_MAX };
     // Broadcast address and intent everywhere
     // START signal | 7 bit address | 1 bit intent (0 - Write | 1 - Read)
     std::vector<struct sockaddr_in> slaves;
+    struct sockaddr_in master;
 };
 
 using SPI_P = struct SPI_ProtocolInfo
 {
+    bool master_mode;
+
     std::uint32_t sclk_pin{ UINT32_MAX };
     std::uint32_t mosi_pin{ UINT32_MAX }; // master out slave in
     std::uint32_t miso_pin{ UINT32_MAX }; // master out slave in
@@ -166,6 +172,7 @@ using SPI_P = struct SPI_ProtocolInfo
     // Of course chip select signal has to sent into the slave first
     std::uint32_t chip_select{ UINT32_MAX };
     std::vector<struct sockaddr_in> slaves;
+    struct sockaddr_in master;
 };
 
 // General buffered and unbuffered protocols
@@ -216,6 +223,8 @@ private:
     std::size_t bit_count{ 0 };
 
     static constexpr std::size_t BUFFER_SIZE = 128;
+    static constexpr std::uint32_t MASK_TIME = 0x7FFFFFFFU;
+    static constexpr std::uint32_t MASK_BIT_VALUE = 1U << 31U;
     std::array<std::uint32_t, BUFFER_SIZE> buf{ 0 };
 
 public:
@@ -224,8 +233,33 @@ public:
     {
     }
 
-    inline void process_bit(const pin_pair& pin, const std::uint32_t& delta)
+    inline void process_bit(const pin_pair& pair, const std::uint32_t& delta)
     {
+        const auto& [bit, pin] = pair;
+        uint32_t packed = (delta & MASK_TIME);
+        if (bit > 0)
+        {
+            packed |= MASK_BIT_VALUE;
+        }
+
+        buf[bit_count++] = packed;
+
+        if (bit_count == BUFFER_SIZE)
+        {
+            send_datagram();
+            bit_count = 0;
+        }
+    }
+
+    void receiver_thread()
+    {
+        // here it is simple, just expose the emulator writer queue
+        // receive data, parse out clock for writing bits to pin
+    }
+
+    void receiver_stop()
+    {
+        // simple again, force the socket to die and exit
     }
 
 private:
@@ -237,142 +271,203 @@ private:
 class I2C_Handler
 {
     I2C_P config;
+    TSP::Queue::Reader<std::uint8_t, RECV_BUF_SIZE> rx_queue;
+
+    zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin_func;
+    zero_mate::IExternal_Peripheral::Halt_t halt_func;
 
     // Physical bus state tracking
     bool scl_lvl = true;
     bool sda_lvl = true;
 
-    // Logical state tracking
-    enum class Phase : std::uint8_t
+    // Logical state tracking for synchronization
+    uint8_t bit_count = 0;
+    bool in_transaction = false;
+    bool is_read = false;
+    enum class Phase
     {
-        IDLE,
         ADDRESS,
         DATA
-    };
-    Phase phase = Phase::IDLE;
-    uint8_t bit_count = 0; // Tracks the 9-bit I2C cycle (8 bits + 1 ACK)
+    } phase = Phase::ADDRESS;
 
     static constexpr size_t BUFFER_SIZE = 128;
     std::array<uint32_t, BUFFER_SIZE> buf{ 0 };
     size_t buf_idx = 0;
 
-    // Bitmasks for our packed u32
-    static constexpr uint32_t MASK_VALUE = 1U << 31U;
-    static constexpr uint32_t MASK_ADDRESS = 1U << 30U;
-    static constexpr uint32_t MASK_ACK = 1U << 29U;
-    static constexpr uint32_t MASK_CTRL = 1U << 28U;  // Start/Stop
-    static constexpr uint32_t MASK_TIME = 0x0FFFFFFF; // 28 bits
+    // Bit 31: Pin (0 = SDA, 1 = SCL)
+    // Bit 30: Value (0 = Low, 1 = High)
+    // Bits 29-0: Delta (Nanoseconds since last transition)
+    static constexpr uint32_t MASK_PIN = 1U << 31U;
+    static constexpr uint32_t MASK_VALUE = 1U << 30U;
+    static constexpr uint32_t MASK_DELTA = 0x3FFFFFFF;
 
 public:
-    explicit I2C_Handler(I2C_P config)
+    explicit I2C_Handler(I2C_P config,
+                         zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
+                         TSP::Queue::Buffer<std::uint8_t, RECV_BUF_SIZE>* rx_buf,
+                         zero_mate::IExternal_Peripheral::Halt_t halt_func)
     : config(std::move(config))
+    , set_pin_func(set_pin)
+    , rx_queue(rx_buf)
+    , halt_func(halt_func)
     {
     }
+    ~I2C_Handler() = default;
+
+    I2C_Handler(const I2C_Handler&) = delete;
+    I2C_Handler& operator=(const I2C_Handler&) = delete;
+
+    I2C_Handler(I2C_Handler&&) noexcept = default;
+    I2C_Handler& operator=(I2C_Handler&&) noexcept = default;
 
     inline void process_bit(const pin_pair& pair, uint32_t delta)
     {
+        if (config.master_mode)
+        {
+            process_bit_master(pair, delta);
+        }
+        else
+        {
+            process_bit_slave(pair, delta);
+        }
+    }
+
+    inline void process_bit_slave(const pin_pair& pair, uint32_t delta)
+    {
+    }
+
+    inline void process_bit_master(const pin_pair& pair, uint32_t delta)
+    {
         const auto& [bit, pin] = pair;
         bool is_high = (bit != 0);
-        if (pin == config.sda_pin)
+        bool is_scl = (pin == config.scl_pin);
+
+        // 1. Determine current bus ownership
+        bool slave_drives = false;
+        if (in_transaction)
         {
-            handle_sda(is_high, delta);
+            if (phase == Phase::ADDRESS && bit_count == 8)
+            {
+                slave_drives = true;
+            }
+            else if (phase == Phase::DATA)
+            {
+                if ((is_read && bit_count < 8) || (!is_read && bit_count == 8))
+                {
+                    slave_drives = true;
+                }
+            }
         }
-        else if (pin == config.scl_pin)
+
+        // 2. Only pack transitions originating from the Master
+        if (is_scl || !slave_drives)
         {
-            handle_scl(is_high, delta);
+            uint32_t packed = (delta & MASK_DELTA);
+            if (is_scl)
+            {
+                packed |= MASK_PIN;
+            }
+            if (is_high)
+            {
+                packed |= MASK_VALUE;
+            }
+            buf[buf_idx++] = packed;
         }
+
+        // 3. Update state machine and handle synchronization
+        bool sync_point = false;
+        if (is_scl)
+        {
+            if (!scl_lvl && is_high && in_transaction) // Rising edge
+            {
+                bit_count++;
+                if (bit_count == 8 && phase == Phase::ADDRESS)
+                {
+                    is_read = sda_lvl;
+                }
+            }
+            else if (scl_lvl && !is_high && in_transaction) // Falling edge
+            {
+                if (bit_count == 8)
+                {
+                    sync_point = true;
+                }
+                else if (bit_count == 9)
+                {
+                    bit_count = 0;
+                    phase = Phase::DATA;
+                }
+
+                // Determine if slave drives the NEXT bit
+                bool slave_drives_next = false;
+                if (phase == Phase::ADDRESS && bit_count == 8)
+                {
+                    slave_drives_next = true;
+                }
+                else if (phase == Phase::DATA)
+                {
+                    if ((is_read && bit_count < 8) || (!is_read && bit_count == 8))
+                    {
+                        slave_drives_next = true;
+                    }
+                }
+
+                if (slave_drives_next && rx_queue.try_advance())
+                {
+                    set_pin_func(config.sda_pin, rx_queue.peek());
+                    rx_queue.advance();
+                }
+            }
+            scl_lvl = is_high;
+        }
+        else
+        {
+            // Detect START/STOP on SDA transitions while SCL is high
+            if (scl_lvl)
+            {
+                if (sda_lvl && !is_high)
+                {
+                    in_transaction = true;
+                    bit_count = 0;
+                    phase = Phase::ADDRESS;
+                }
+                else if (!sda_lvl && is_high)
+                {
+                    in_transaction = false;
+                }
+            }
+            sda_lvl = is_high;
+        }
+
+        if (sync_point || buf_idx == BUFFER_SIZE)
+        {
+            send_datagram();
+            if (sync_point)
+            {
+                halt_func();
+            }
+        }
+    }
+
+    void receiver_thread()
+    {
+    }
+
+    void receiver_stop()
+    {
     }
 
 private:
-    inline void handle_sda(bool is_high, uint32_t delta)
-    {
-        if (scl_lvl)
-        {
-            if (sda_lvl && !is_high)
-            {
-                // START Condition
-                phase = Phase::ADDRESS;
-                bit_count = 0;
-                accumulate_bit(1, false, false, true, delta); // Value=1, Control=1 (START)
-            }
-            else if (!sda_lvl && is_high)
-            {
-                // STOP Condition
-                phase = Phase::IDLE;
-                accumulate_bit(0, false, false, true, delta); // Value=0, Control=1 (STOP)
-                if (buf_idx > 0)
-                {
-                    send_datagram();
-                }
-            }
-        }
-        sda_lvl = is_high;
-    }
-
-    inline void handle_scl(bool is_high, uint32_t delta)
-    {
-        if (!scl_lvl && is_high && phase != Phase::IDLE)
-        {
-            // RISING EDGE: Sample Data
-            bit_count++;
-
-            bool isAddressPhase = (phase == Phase::ADDRESS);
-            bool isAckBit = (bit_count == 9);
-            uint8_t bitValue = sda_lvl ? 1 : 0;
-
-            accumulate_bit(bitValue, isAddressPhase, isAckBit, false, delta);
-
-            if (isAckBit)
-            {
-                bit_count = 0; // Reset for the next byte
-                // After the first 9 bits, we move from ADDRESS to DATA phase
-                if (phase == Phase::ADDRESS)
-                {
-                    phase = Phase::DATA;
-                }
-            }
-        }
-
-        scl_lvl = is_high;
-    }
-
-    inline void accumulate_bit(uint8_t val, bool is_addr, bool is_ack, bool is_ctrl, uint32_t delta)
-    {
-        uint32_t packed = 0;
-
-        if (val != 0U)
-        {
-            packed |= MASK_VALUE;
-        }
-        if (is_addr)
-        {
-            packed |= MASK_ADDRESS;
-        }
-        if (is_ack)
-        {
-            packed |= MASK_ACK;
-        }
-        if (is_ctrl)
-        {
-            packed |= MASK_CTRL;
-        }
-
-        packed |= (delta & MASK_TIME);
-
-        buf[buf_idx++] = packed;
-
-        if (buf_idx == BUFFER_SIZE)
-        {
-            send_datagram();
-        }
-    }
-
     void send_datagram()
     {
+        for (const auto& other_side : config.slaves)
+        {
+        }
+        buf_idx = 0;
     }
 };
 
-using protocol_variant = std::variant<UART_Handler>;
+using protocol_variant = std::variant<UART_Handler, I2C_Handler>;
 
 template<typename Type, std::size_t Size>
 class BitProcessor final
@@ -381,36 +476,55 @@ private:
     protocol_variant handler;
     TSP::Queue::Reader<Type, Size> queue_reader;
     TSP::BF::Backoff backoff; // simple for now, can be changed to sem later
+
     std::atomic<bool> running{ false };
-    std::thread worker;
+    std::thread sender;
+    std::thread receiver;
 
 public:
-    BitProcessor(const BitProcessor&) = delete;
-    BitProcessor(const protocol_variant& variant, TSP::Queue::Buffer<Type, Size>* buf)
-    : handler(variant)
+    BitProcessor(protocol_variant&& variant, TSP::Queue::Buffer<Type, Size>* buf)
+    : handler(std::move(variant))
     , queue_reader(buf)
     {
     }
 
     ~BitProcessor()
     {
+        stop();
+    }
+
+    BitProcessor(const BitProcessor&) = delete;
+    BitProcessor& operator=(const BitProcessor&) = delete;
+
+    BitProcessor(BitProcessor&&) = delete;
+    BitProcessor& operator=(BitProcessor&&) = delete;
+
+    void start()
+    {
+        running = true;
+        sender = std::thread{ &BitProcessor<Type, Size>::run_sender, this };
+        // Is this legal?
+        std::visit(
+        [this](auto& handler) -> void { receiver = std::thread(decltype(handler)::receiver_thread, handler); });
+    }
+
+    void stop()
+    {
         if (running)
         {
             running = false;
 
-            if (worker.joinable())
+            if (sender.joinable())
             {
-                worker.join();
+                sender.join();
             }
+
+            std::visit([](auto& handler) -> void { handler.receiver_stop(); });
         }
     }
 
-    BitProcessor(BitProcessor&&) = delete;
-    BitProcessor& operator=(const BitProcessor&) = delete;
-    BitProcessor& operator=(BitProcessor&&) = delete;
-
 private:
-    void run()
+    void run_sender()
     {
         auto last_time = std::chrono::high_resolution_clock::now();
 
@@ -421,7 +535,7 @@ private:
             const auto delta =
             static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_time).count());
             last_time = now;
-            std::visit([bit, delta](auto& handler) -> void { handler.processBit(bit, delta); });
+            std::visit([bit, delta](auto& handler) -> void { handler.process_bit(bit, delta); });
         }
     }
 };
