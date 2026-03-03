@@ -8,12 +8,14 @@
 #include <memory>
 #include <thread>
 #include <atomic>
+#include <utility>
 #include <variant>
 #include <vector>
 #include <string>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <array>
+#include <algorithm>
 
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
@@ -207,11 +209,221 @@ using conn_info = struct conn_info_struct
 using conn_id = std::uint64_t;
 using pin_pair = std::pair<std::uint8_t, std::uint8_t>;
 
-class IProtocolStateMachine
+class UART_Handler final
 {
+private:
+    UART_P config;
+    std::size_t bit_count{ 0 };
+
+    static constexpr std::size_t BUFFER_SIZE = 128;
+    std::array<std::uint32_t, BUFFER_SIZE> buf{ 0 };
+
 public:
-    virtual ~IProtocolStateMachine() = default;
-    virtual void run() = 0;
+    explicit UART_Handler(const UART_P& config)
+    : config(config)
+    {
+    }
+
+    inline void process_bit(const pin_pair& pin, const std::uint32_t& delta)
+    {
+    }
+
+private:
+    void send_datagram()
+    {
+    }
+};
+
+class I2C_Handler
+{
+    I2C_P config;
+
+    // Physical bus state tracking
+    bool scl_lvl = true;
+    bool sda_lvl = true;
+
+    // Logical state tracking
+    enum class Phase : std::uint8_t
+    {
+        IDLE,
+        ADDRESS,
+        DATA
+    };
+    Phase phase = Phase::IDLE;
+    uint8_t bit_count = 0; // Tracks the 9-bit I2C cycle (8 bits + 1 ACK)
+
+    static constexpr size_t BUFFER_SIZE = 128;
+    std::array<uint32_t, BUFFER_SIZE> buf{ 0 };
+    size_t buf_idx = 0;
+
+    // Bitmasks for our packed u32
+    static constexpr uint32_t MASK_VALUE = 1U << 31U;
+    static constexpr uint32_t MASK_ADDRESS = 1U << 30U;
+    static constexpr uint32_t MASK_ACK = 1U << 29U;
+    static constexpr uint32_t MASK_CTRL = 1U << 28U;  // Start/Stop
+    static constexpr uint32_t MASK_TIME = 0x0FFFFFFF; // 28 bits
+
+public:
+    explicit I2C_Handler(I2C_P config)
+    : config(std::move(config))
+    {
+    }
+
+    inline void process_bit(const pin_pair& pair, uint32_t delta)
+    {
+        const auto& [bit, pin] = pair;
+        bool is_high = (bit != 0);
+        if (pin == config.sda_pin)
+        {
+            handle_sda(is_high, delta);
+        }
+        else if (pin == config.scl_pin)
+        {
+            handle_scl(is_high, delta);
+        }
+    }
+
+private:
+    inline void handle_sda(bool is_high, uint32_t delta)
+    {
+        if (scl_lvl)
+        {
+            if (sda_lvl && !is_high)
+            {
+                // START Condition
+                phase = Phase::ADDRESS;
+                bit_count = 0;
+                accumulate_bit(1, false, false, true, delta); // Value=1, Control=1 (START)
+            }
+            else if (!sda_lvl && is_high)
+            {
+                // STOP Condition
+                phase = Phase::IDLE;
+                accumulate_bit(0, false, false, true, delta); // Value=0, Control=1 (STOP)
+                if (buf_idx > 0)
+                {
+                    send_datagram();
+                }
+            }
+        }
+        sda_lvl = is_high;
+    }
+
+    inline void handle_scl(bool is_high, uint32_t delta)
+    {
+        if (!scl_lvl && is_high && phase != Phase::IDLE)
+        {
+            // RISING EDGE: Sample Data
+            bit_count++;
+
+            bool isAddressPhase = (phase == Phase::ADDRESS);
+            bool isAckBit = (bit_count == 9);
+            uint8_t bitValue = sda_lvl ? 1 : 0;
+
+            accumulate_bit(bitValue, isAddressPhase, isAckBit, false, delta);
+
+            if (isAckBit)
+            {
+                bit_count = 0; // Reset for the next byte
+                // After the first 9 bits, we move from ADDRESS to DATA phase
+                if (phase == Phase::ADDRESS)
+                {
+                    phase = Phase::DATA;
+                }
+            }
+        }
+
+        scl_lvl = is_high;
+    }
+
+    inline void accumulate_bit(uint8_t val, bool is_addr, bool is_ack, bool is_ctrl, uint32_t delta)
+    {
+        uint32_t packed = 0;
+
+        if (val != 0U)
+        {
+            packed |= MASK_VALUE;
+        }
+        if (is_addr)
+        {
+            packed |= MASK_ADDRESS;
+        }
+        if (is_ack)
+        {
+            packed |= MASK_ACK;
+        }
+        if (is_ctrl)
+        {
+            packed |= MASK_CTRL;
+        }
+
+        packed |= (delta & MASK_TIME);
+
+        buf[buf_idx++] = packed;
+
+        if (buf_idx == BUFFER_SIZE)
+        {
+            send_datagram();
+        }
+    }
+
+    void send_datagram()
+    {
+    }
+};
+
+using protocol_variant = std::variant<UART_Handler>;
+
+template<typename Type, std::size_t Size>
+class BitProcessor final
+{
+private:
+    protocol_variant handler;
+    TSP::Queue::Reader<Type, Size> queue_reader;
+    TSP::BF::Backoff backoff; // simple for now, can be changed to sem later
+    std::atomic<bool> running{ false };
+    std::thread worker;
+
+public:
+    BitProcessor(const BitProcessor&) = delete;
+    BitProcessor(const protocol_variant& variant, TSP::Queue::Buffer<Type, Size>* buf)
+    : handler(variant)
+    , queue_reader(buf)
+    {
+    }
+
+    ~BitProcessor()
+    {
+        if (running)
+        {
+            running = false;
+
+            if (worker.joinable())
+            {
+                worker.join();
+            }
+        }
+    }
+
+    BitProcessor(BitProcessor&&) = delete;
+    BitProcessor& operator=(const BitProcessor&) = delete;
+    BitProcessor& operator=(BitProcessor&&) = delete;
+
+private:
+    void run()
+    {
+        auto last_time = std::chrono::high_resolution_clock::now();
+
+        while (running)
+        {
+            const auto& [bit, pin] = queue_reader.read(backoff);
+            const auto now = std::chrono::high_resolution_clock::now();
+            const auto delta =
+            static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_time).count());
+            last_time = now;
+            std::visit([bit, delta](auto& handler) -> void { handler.processBit(bit, delta); });
+        }
+    }
 };
 
 class GPIOServer final
@@ -303,7 +515,6 @@ class GPIOConnection final
 {
 private:
     conn_info connection;
-    std::unique_ptr<IProtocolStateMachine> m_sm;
 
     TSP::Queue::Reader<pin_pair, GPIOServer::BUFFER_SIZE> m_queue_reader;
 
@@ -345,46 +556,6 @@ public:
     [[nodiscard]] bool is_running() const
     {
         return m_server_running.load();
-    }
-};
-
-class UARTStateMachine final : public IProtocolStateMachine
-{
-public:
-    static constexpr std::size_t MAX_BUF_SIZE = 16;
-
-private:
-    GPIOConnection& m_conn;
-    UART_P m_params;
-
-    std::size_t buf_idx{ 0 };
-    std::array<std::uint32_t, MAX_BUF_SIZE> buf;
-
-public:
-    UARTStateMachine(GPIOConnection& conn, const UART_P& params)
-    : m_conn(conn)
-    , m_params(params)
-    {
-        std::uint32_t buf_size = params.start_bits;
-        buf_size += params.data_bits;
-        buf_size += params.parity_bits;
-        buf_size += params.stop_bits;
-
-        // do not allow to create buffers above max size
-        if (buf_size > MAX_BUF_SIZE)
-        {
-            throw std::exception{};
-        }
-    }
-
-    void run() final
-    {
-        while (m_conn.is_running())
-        {
-            const auto change = m_conn.read_queue();
-            // TODO: UART logic
-            (void)change;
-        }
     }
 };
 
