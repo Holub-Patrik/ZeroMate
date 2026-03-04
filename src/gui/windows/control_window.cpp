@@ -172,9 +172,6 @@ namespace zero_mate::gui
         {
             // Set the flag to start CPU execution.
             m_start_cpu_thread = true;
-
-            // Perform a single step regardless of any set breakpoints.
-            m_cpu->Step(true);
         }
     }
 
@@ -254,6 +251,8 @@ namespace zero_mate::gui
     void CControl_Window::Run()
     {
         m_logging_system.Info("CPU execution has started");
+        // do one step with breakpoint ignore to unblock
+        m_cpu->Step(true);
 
         // Keep stepping the CPU
         while (!m_stop_cpu_thread)

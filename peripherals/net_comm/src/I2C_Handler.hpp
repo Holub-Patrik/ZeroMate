@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <netinet/in.h>
 #include <vector>
+#include <poll.h>
 
 #include "CircularBufferQueue.hpp"
 #include "zero_mate/external_peripheral.hpp"
@@ -15,7 +16,10 @@ using I2C_P = struct I2C_ProtocolInfo
     // Broadcast address and intent everywhere
     // START signal | 7 bit address | 1 bit intent (0 - Write | 1 - Read)
     std::vector<struct sockaddr_in> slaves;
+    std::vector<int> slave_fds;
+
     struct sockaddr_in master;
+    int master_fd;
 };
 
 class I2C_Handler
@@ -28,14 +32,20 @@ class I2C_Handler
     static constexpr uint32_t MASK_PIN = 1U << 31U;
     static constexpr uint32_t MASK_VALUE = 1U << 30U;
     static constexpr uint32_t MASK_DELTA = 0x3FFFFFFF;
+    static constexpr int BYTE_BIT_COUNT = 8;
 
     static constexpr std::size_t RECV_BUF_SIZE = BUFFER_SIZE;
+    static constexpr std::size_t BACKOFF_CYCLE_COUNT = 1024;
 
     I2C_P config;
-    TSP::Queue::Reader<std::uint8_t, RECV_BUF_SIZE> rx_queue;
+    TSP::Queue::Buffer<std::uint8_t, RECV_BUF_SIZE> queue_buf;
+    TSP::Queue::Writer<std::uint8_t, RECV_BUF_SIZE> queue_writer;
+    TSP::Queue::Reader<std::uint8_t, RECV_BUF_SIZE> queue_reader;
+    TSP::BF::Backoff backoff_fast{ BACKOFF_CYCLE_COUNT };
 
     zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin_func;
     zero_mate::IExternal_Peripheral::Halt_t halt_func;
+    zero_mate::IExternal_Peripheral::Start_t start_func;
 
     // Physical bus state tracking
     bool scl_lvl = true;
@@ -45,6 +55,7 @@ class I2C_Handler
     uint8_t bit_count = 0;
     bool in_transaction = false;
     bool is_read = false;
+
     enum class Phase
     {
         ADDRESS,
@@ -54,15 +65,23 @@ class I2C_Handler
     std::array<uint32_t, BUFFER_SIZE> buf{ 0 };
     size_t buf_idx = 0;
 
+    std::atomic<bool> running{ false };
+    std::thread receiver;
+    // 0 -> Read end
+    // 1 -> Write end
+    std::array<int, 2> close_pipefd{ 0 };
+
 public:
     explicit I2C_Handler(I2C_P config,
                          zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
-                         TSP::Queue::Buffer<std::uint8_t, RECV_BUF_SIZE>* rx_buf,
-                         zero_mate::IExternal_Peripheral::Halt_t halt_func)
+                         zero_mate::IExternal_Peripheral::Halt_t halt_func,
+                         zero_mate::IExternal_Peripheral::Start_t start_func)
     : config(std::move(config))
     , set_pin_func(set_pin)
-    , rx_queue(rx_buf)
+    , queue_writer(&queue_buf)
+    , queue_reader(&queue_buf)
     , halt_func(halt_func)
+    , start_func(start_func)
     {
     }
     ~I2C_Handler() = default;
@@ -70,8 +89,8 @@ public:
     I2C_Handler(const I2C_Handler&) = delete;
     I2C_Handler& operator=(const I2C_Handler&) = delete;
 
-    I2C_Handler(I2C_Handler&&) noexcept = default;
-    I2C_Handler& operator=(I2C_Handler&&) noexcept = default;
+    I2C_Handler(I2C_Handler&&) noexcept = delete;
+    I2C_Handler& operator=(I2C_Handler&&) noexcept = delete;
 
     inline void process_bit(const std::pair<std::uint8_t, std::uint8_t>& pair, uint32_t delta)
     {
@@ -87,6 +106,7 @@ public:
 
     inline void process_bit_slave(const std::pair<std::uint8_t, std::uint8_t>& pair, uint32_t delta)
     {
+        // slave only sends sda information back, scl is driven by the master
     }
 
     inline void process_bit_master(const std::pair<std::uint8_t, std::uint8_t>& pair, uint32_t delta)
@@ -134,18 +154,18 @@ public:
             if (!scl_lvl && is_high && in_transaction) // Rising edge
             {
                 bit_count++;
-                if (bit_count == 8 && phase == Phase::ADDRESS)
+                if (bit_count == BYTE_BIT_COUNT && phase == Phase::ADDRESS)
                 {
                     is_read = sda_lvl;
                 }
             }
             else if (scl_lvl && !is_high && in_transaction) // Falling edge
             {
-                if (bit_count == 8)
+                if (bit_count == BYTE_BIT_COUNT)
                 {
                     sync_point = true;
                 }
-                else if (bit_count == 9)
+                else if (bit_count == BYTE_BIT_COUNT + 1)
                 {
                     bit_count = 0;
                     phase = Phase::DATA;
@@ -153,22 +173,22 @@ public:
 
                 // Determine if slave drives the NEXT bit
                 bool slave_drives_next = false;
-                if (phase == Phase::ADDRESS && bit_count == 8)
+                if (phase == Phase::ADDRESS && bit_count == BYTE_BIT_COUNT)
                 {
                     slave_drives_next = true;
                 }
                 else if (phase == Phase::DATA)
                 {
-                    if ((is_read && bit_count < 8) || (!is_read && bit_count == 8))
+                    if ((is_read && bit_count < BYTE_BIT_COUNT) || (!is_read && bit_count == BYTE_BIT_COUNT))
                     {
                         slave_drives_next = true;
                     }
                 }
 
-                if (slave_drives_next && rx_queue.try_advance())
+                if (slave_drives_next && queue_reader.try_advance())
                 {
-                    set_pin_func(config.sda_pin, rx_queue.peek());
-                    rx_queue.advance();
+                    set_pin_func(config.sda_pin, static_cast<bool>(queue_reader.peek()));
+                    queue_reader.advance();
                 }
             }
             scl_lvl = is_high;
@@ -202,12 +222,127 @@ public:
         }
     }
 
+    void _cleanup()
+    {
+        close(close_pipefd[0]);
+        close(close_pipefd[1]);
+    }
+
     void receiver_thread()
     {
+        running = true;
+        pipe(close_pipefd.data());
+
+        std::vector<struct pollfd> fds;
+        fds.emplace_back(close_pipefd[0], POLLIN, 0);
+
+        if (config.master_mode)
+        {
+            for (const auto& slave : config.slave_fds)
+            {
+                fds.emplace_back(slave, POLLIN);
+            }
+        }
+        else
+        {
+            fds.emplace_back(config.master_fd, POLLIN);
+        }
+
+        while (running)
+        {
+            const int ret_val = poll(fds.data(), fds.size(), -1);
+            if (ret_val < 1)
+            {
+                running = false;
+                _cleanup();
+                break;
+            }
+
+            // I should check for eny errors in revents here, but I think I won't due to performance
+
+            if (POLLIN | fds[0].revents)
+            {
+                running = false;
+            }
+
+            if (!running)
+            {
+                _cleanup();
+                break;
+            }
+
+            if (config.master_mode)
+            {
+                int fd_to_read_from = 0;
+                for (int i = 1; i < fds.size(); i++)
+                {
+                    if (POLLIN | fds[i].revents)
+                    {
+                        fd_to_read_from = fds[i].fd;
+                        break;
+                    }
+                }
+                receive_from_slave(fd_to_read_from);
+            }
+            else
+            {
+                receive_from_master(fds[1].fd);
+            }
+        }
+    }
+
+    void receive_from_master(int socket_fd)
+    {
+        std::array<std::uint32_t, BUFFER_SIZE> buf{ 0 };
+        const auto bytes_received = recv(socket_fd, buf.data(), buf.size(), 0);
+
+        // technically here I should check bytes_received < 0
+        for (int i = 0; i < bytes_received; i++)
+        {
+            const std::uint32_t pin_info = buf[i];
+            const bool is_scl = static_cast<bool>(pin_info | MASK_PIN);
+            const bool value = static_cast<bool>(pin_info | MASK_VALUE);
+            const std::uint32_t delta = pin_info | MASK_DELTA;
+
+            const auto wait_start = std::chrono::high_resolution_clock::now();
+            while (
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - wait_start)
+            .count() > 0)
+            {
+                cpu_relax();
+            }
+
+            set_pin_func((is_scl ? config.scl_pin : config.sda_pin), value);
+        }
+    }
+
+    void receive_from_slave(int socket_fd)
+    {
+        std::array<std::uint8_t, BUFFER_SIZE * sizeof(std::uint32_t)> buf{ 0 };
+        const auto bytes_received = recv(socket_fd, buf.data(), buf.size(), 0);
+
+        // technically here I should check bytes_received < 0
+
+        queue_writer.insert_with_backoff(buf[0], backoff_fast);
+
+        start_func(); // gui should catch this request and startup execution
+        for (int i = 1; i < bytes_received; i++)
+        {
+            queue_writer.insert_with_backoff(buf[i], backoff_fast);
+        }
     }
 
     void receiver_stop()
     {
+        running = false;
+        // shutdown socket
+        bool close_msg = true;
+        write(close_pipefd[1], &close_msg, sizeof(bool));
+
+        if (receiver.joinable())
+        {
+            receiver.join();
+        }
     }
 
 private:
