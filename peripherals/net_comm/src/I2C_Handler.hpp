@@ -3,13 +3,20 @@
 #include <netinet/in.h>
 #include <vector>
 #include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <atomic>
+#include <thread>
+#include <chrono>
 
 #include "CircularBufferQueue.hpp"
 #include "zero_mate/external_peripheral.hpp"
+#include "Util.hpp"
 
 using I2C_P = struct I2C_ProtocolInfo
 {
     bool master_mode;
+    std::uint8_t address{ 0 };
 
     std::uint32_t scl_pin{ UINT32_MAX };
     std::uint32_t sda_pin{ UINT32_MAX };
@@ -55,6 +62,8 @@ class I2C_Handler
     uint8_t bit_count = 0;
     bool in_transaction = false;
     bool is_read = false;
+    uint8_t shift_reg = 0;
+    bool matched_address = false;
 
     enum class Phase
     {
@@ -106,7 +115,86 @@ public:
 
     inline void process_bit_slave(const std::pair<std::uint8_t, std::uint8_t>& pair, uint32_t delta)
     {
-        // slave only sends sda information back, scl is driven by the master
+        const auto& [bit, pin] = pair;
+        bool is_high = (bit != 0);
+        bool is_scl = (pin == config.scl_pin);
+
+        if (is_scl)
+        {
+            if (!scl_lvl && is_high && in_transaction) // Rising edge
+            {
+                bit_count++;
+                if (phase == Phase::ADDRESS && bit_count <= 8)
+                {
+                    shift_reg = (shift_reg << 1) | (sda_lvl ? 1 : 0);
+                }
+            }
+            else if (scl_lvl && !is_high && in_transaction) // Falling edge
+            {
+                if (bit_count == 8 && phase == Phase::ADDRESS)
+                {
+                    is_read = (shift_reg & 0x01);
+                    if ((shift_reg >> 1) == config.address)
+                    {
+                        matched_address = true;
+                    }
+                }
+
+                if (bit_count == 9)
+                {
+                    bit_count = 0;
+                    phase = Phase::DATA;
+                }
+            }
+            scl_lvl = is_high;
+        }
+        else
+        {
+            // Detect START/STOP
+            if (scl_lvl)
+            {
+                if (sda_lvl && !is_high) // START
+                {
+                    in_transaction = true;
+                    bit_count = 0;
+                    phase = Phase::ADDRESS;
+                    shift_reg = 0;
+                    matched_address = false;
+                }
+                else if (!sda_lvl && is_high) // STOP
+                {
+                    in_transaction = false;
+                }
+            }
+            sda_lvl = is_high;
+        }
+
+        // Send bits back to master if we are the addressed slave and we own the bus
+        if (in_transaction && matched_address && !is_scl)
+        {
+            bool slave_drives = false;
+            if (phase == Phase::ADDRESS && bit_count == 8)
+            {
+                slave_drives = true; // ACK
+            }
+            else if (phase == Phase::DATA)
+            {
+                if (is_read && bit_count < 8)
+                {
+                    slave_drives = true; // Data
+                }
+                else if (!is_read && bit_count == 8)
+                {
+                    slave_drives = true; // ACK
+                }
+            }
+
+            if (slave_drives)
+            {
+                uint8_t raw_bit = is_high ? 1 : 0;
+                send(config.master_fd, &raw_bit, sizeof(uint8_t), 0);
+            }
+        }
     }
 
     inline void process_bit_master(const std::pair<std::uint8_t, std::uint8_t>& pair, uint32_t delta)
@@ -258,9 +346,7 @@ public:
                 break;
             }
 
-            // I should check for eny errors in revents here, but I think I won't due to performance
-
-            if (POLLIN | fds[0].revents)
+            if (POLLIN & fds[0].revents)
             {
                 running = false;
             }
@@ -274,15 +360,18 @@ public:
             if (config.master_mode)
             {
                 int fd_to_read_from = 0;
-                for (int i = 1; i < fds.size(); i++)
+                for (std::size_t i = 1; i < fds.size(); i++)
                 {
-                    if (POLLIN | fds[i].revents)
+                    if (POLLIN & fds[i].revents)
                     {
                         fd_to_read_from = fds[i].fd;
                         break;
                     }
                 }
-                receive_from_slave(fd_to_read_from);
+                if (fd_to_read_from != 0)
+                {
+                    receive_from_slave(fd_to_read_from);
+                }
             }
             else
             {
@@ -293,21 +382,24 @@ public:
 
     void receive_from_master(int socket_fd)
     {
-        std::array<std::uint32_t, BUFFER_SIZE> buf{ 0 };
-        const auto bytes_received = recv(socket_fd, buf.data(), buf.size(), 0);
+        std::array<std::uint32_t, BUFFER_SIZE> recv_buf{ 0 };
+        const auto bytes_received = recv(socket_fd, recv_buf.data(), recv_buf.size() * sizeof(uint32_t), 0);
 
-        // technically here I should check bytes_received < 0
-        for (int i = 0; i < bytes_received; i++)
+        if (bytes_received <= 0)
+            return;
+        const auto count = static_cast<std::size_t>(bytes_received) / sizeof(std::uint32_t);
+
+        for (std::size_t i = 0; i < count; i++)
         {
-            const std::uint32_t pin_info = buf[i];
-            const bool is_scl = static_cast<bool>(pin_info | MASK_PIN);
-            const bool value = static_cast<bool>(pin_info | MASK_VALUE);
-            const std::uint32_t delta = pin_info | MASK_DELTA;
+            const std::uint32_t pin_info = recv_buf[i];
+            const bool is_scl = static_cast<bool>(pin_info & MASK_PIN);
+            const bool value = static_cast<bool>(pin_info & MASK_VALUE);
+            const std::uint32_t delta = pin_info & MASK_DELTA;
 
             const auto wait_start = std::chrono::high_resolution_clock::now();
             while (
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - wait_start)
-            .count() > 0)
+            .count() < delta)
             {
                 cpu_relax();
             }
@@ -318,24 +410,24 @@ public:
 
     void receive_from_slave(int socket_fd)
     {
-        std::array<std::uint8_t, BUFFER_SIZE * sizeof(std::uint32_t)> buf{ 0 };
-        const auto bytes_received = recv(socket_fd, buf.data(), buf.size(), 0);
+        std::array<std::uint8_t, BUFFER_SIZE> recv_buf{ 0 };
+        const auto bytes_received = recv(socket_fd, recv_buf.data(), recv_buf.size(), 0);
 
-        // technically here I should check bytes_received < 0
+        if (bytes_received <= 0)
+            return;
 
-        queue_writer.insert_with_backoff(buf[0], backoff_fast);
+        queue_writer.insert_with_backoff(recv_buf[0], backoff_fast);
 
         start_func(); // gui should catch this request and startup execution
         for (int i = 1; i < bytes_received; i++)
         {
-            queue_writer.insert_with_backoff(buf[i], backoff_fast);
+            queue_writer.insert_with_backoff(recv_buf[i], backoff_fast);
         }
     }
 
     void receiver_stop()
     {
         running = false;
-        // shutdown socket
         bool close_msg = true;
         write(close_pipefd[1], &close_msg, sizeof(bool));
 
@@ -348,8 +440,12 @@ public:
 private:
     void send_datagram()
     {
-        for (const auto& other_side : config.slaves)
+        if (buf_idx == 0)
+            return;
+
+        for (int fd : config.slave_fds)
         {
+            send(fd, buf.data(), buf_idx * sizeof(uint32_t), 0);
         }
         buf_idx = 0;
     }
