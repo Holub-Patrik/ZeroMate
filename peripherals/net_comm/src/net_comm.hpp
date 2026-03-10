@@ -23,7 +23,7 @@
 #include "UART_Handler.hpp"
 #include "I2C_Handler.hpp"
 
-using Protocol = std::variant<UART_P, I2C_P>;
+using Protocol = std::variant<UART_P, I2C_Master_P, I2C_Slave_P>;
 
 using conn_info = struct conn_info_struct
 {
@@ -40,7 +40,7 @@ using conn_info = struct conn_info_struct
 using conn_id = std::uint64_t;
 using pin_pair = std::pair<std::uint8_t, std::uint8_t>;
 
-using protocol_variant = std::variant<UART_Handler, I2C_Handler>;
+using protocol_variant = std::variant<UART_Handler, I2C_Master, I2C_Slave>;
 
 template<typename Type, std::size_t Size>
 class BitProcessor final
@@ -197,6 +197,10 @@ public:
     {
         return func_start;
     }
+    [[nodiscard]] zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t get_set_pin() const
+    {
+        return func_set_pin;
+    }
 };
 
 class GPIOConnection final
@@ -214,6 +218,7 @@ private:
     GPIOServer& m_server;
 
     std::atomic<bool>& m_server_running;
+    std::unique_ptr<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE>> m_processor;
 
 public:
     GPIOConnection() = delete;

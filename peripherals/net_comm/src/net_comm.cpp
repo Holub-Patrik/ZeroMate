@@ -86,8 +86,8 @@ namespace
                 break;
 
             case I2C:
-                // hehe, here's an issue >:(
-                prot.info = I2C_P{ .slaves = { other_side_new_port } };
+                // For now assuming it's a master if we are parsing config
+                prot.info = I2C_Master_P{ .slave_fds = { } };
                 break;
 
             case SPI:
@@ -220,9 +220,20 @@ GPIOConnection::GPIOConnection(const conn_info& info,
 , m_server(server)
 , m_server_running(server_running)
 {
-    if (std::holds_alternative<UART_P>(info.protocol.info))
+    if (std::holds_alternative<UART_P>(info.protocol))
     {
-        m_sm = std::make_unique<UARTStateMachine>(*this, std::get<UART_P>(info.protocol.info));
+        m_processor = std::make_unique<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE>>(
+            UART_Handler(std::get<UART_P>(info.protocol)), buffer);
+    }
+    else if (std::holds_alternative<I2C_Master_P>(info.protocol))
+    {
+        m_processor = std::make_unique<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE>>(
+            I2C_Master(std::get<I2C_Master_P>(info.protocol), m_server.get_set_pin(), m_halt, m_start), buffer);
+    }
+    else if (std::holds_alternative<I2C_Slave_P>(info.protocol))
+    {
+        m_processor = std::make_unique<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE>>(
+            I2C_Slave(std::get<I2C_Slave_P>(info.protocol), m_server.get_set_pin(), m_halt, m_start), buffer);
     }
 }
 
@@ -236,9 +247,14 @@ GPIOConnection::~GPIOConnection()
 
 void GPIOConnection::run()
 {
-    if (m_sm)
+    if (m_processor)
     {
-        m_sm->run();
+        m_processor->start();
+        while (m_server_running.load())
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        m_processor->stop();
     }
 }
 

@@ -196,6 +196,7 @@ For I2C from what I understand it will be communication based like this:
 1. Send back to master and pulse the data
 
 States that I have to detect and define
+
 - START Condition
 - Repeated START Condition
 - Address
@@ -205,6 +206,7 @@ States that I have to detect and define
 
 Read/Write sync/stop conditions
 Address
+
 1. Accumulate eight bits
 1. Stop Master
 1. Send to all slaves
@@ -212,13 +214,15 @@ Address
 1. Send ACK/NACK back to master
 
 Writing byte
+
 1. Accumulate eight bits
-2. Stop Master
-3. Emulate 9 clock cycles on slave
-4. Send ACK/NACK back to master
-5. Set bit on master, start master up again
+1. Stop Master
+1. Emulate 9 clock cycles on slave
+1. Send ACK/NACK back to master
+1. Set bit on master, start master up again
 
 Reading byte
+
 1. Clock 8 more times to retrieve data
 1. Stop clock on slave
 1. Start master up again and present data to him
@@ -228,7 +232,15 @@ Reading byte
 1. Clock the ack/nack bit
 1. If ack return to step 1, otherwise await stop condition from master
 
-Reading byte
+### New analyis
+
+Possible states:
+
+- IDLE
+- ADDRESS
+- READ_BYTE
+- WRITE_BYTE
+- RESPONSE
 
 ## SPI
 
