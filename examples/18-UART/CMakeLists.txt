@@ -4,7 +4,7 @@ PROJECT(kiv_os_rpios CXX C ASM)
 
 # specifikujeme linker skript - potrebujeme vlastni definici pametoveho layoutu
 SET(LINKER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernel/link.ld")
-SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -T ${LINKER_SCRIPT}")
+SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -T ${LINKER_SCRIPT} -nostdlib")
 
 INCLUDE_DIRECTORIES("${CMAKE_CURRENT_SOURCE_DIR}/kernel/include/")
 
@@ -17,6 +17,7 @@ FILE(GLOB_RECURSE kernel_src "kernel/*.cpp" "kernel/*.c" "kernel/*.h" "kernel/*.
 
 # pridame cil - sestavujeme jen kernel
 ADD_EXECUTABLE(kernel ${kernel_src})
+TARGET_LINK_LIBRARIES(kernel gcc)
 
 # po dokonceni sestaveni musime jeste zkonvertovat vystupy
 # 1) zkompilovany ELF soubor na surovou binarni mapu pro RPi bootloader (kernel.img)
