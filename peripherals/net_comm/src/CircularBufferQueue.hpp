@@ -271,7 +271,7 @@ namespace TSP
                     return;
                 }
 
-                is_sleeping.store(false, std::memory_order_seq_cst);
+                is_sleeping.store(true, std::memory_order_seq_cst);
                 if (condition())
                 {
                     is_sleeping.store(false, std::memory_order_relaxed);

@@ -3,6 +3,7 @@
 #include <array>
 #include <poll.h>
 #include <chrono>
+#include <functional>
 
 #include "CircularBufferQueue.hpp"
 
@@ -21,12 +22,15 @@ using UART_P = struct UART_ProtocolInfo
 
     // Point-to-point connection
     struct sockaddr_in other_side{};
-    int other_side_fd;
+    int other_side_fd{ -1 };
 };
 
 template<std::size_t QUEUE_SIZE>
 class UART_Handler final
 {
+public:
+    using pin_write_t = std::function<void(std::uint8_t, std::uint8_t)>;
+
 private:
     UART_P config;
     std::size_t bit_count{ 0 };
@@ -37,16 +41,17 @@ private:
 
     std::array<std::uint32_t, MAX_BIT_COUNT> buf{ 0 };
 
-    TSP::Queue::Writer<std::pair<std::uint8_t, std::uint8_t>, QUEUE_SIZE> writer;
+    pin_write_t pin_write;
     TSP::BF::Backoff backoff_fast{ 1024 };
 
     std::atomic<bool> running{ false };
     std::thread receiver;
-    std::array<int, 2> close_pipe{ 0 };
+    std::array<int, 2> close_pipe{ -1, -1 };
 
 public:
-    explicit UART_Handler(const UART_P& config)
+    explicit UART_Handler(const UART_P& config, pin_write_t pin_write)
     : config(config)
+    , pin_write(std::move(pin_write))
     {
     }
 
@@ -71,6 +76,11 @@ public:
             send_datagram();
             bit_count = 0;
         }
+    }
+
+    void start_receiver()
+    {
+        receiver = std::thread(&UART_Handler<QUEUE_SIZE>::receiver_thread, this);
     }
 
     void receiver_thread()
@@ -157,7 +167,7 @@ private:
                 cpu_relax();
             }
 
-            writer.insert_with_backoff({ config.rx_pin, is_high ? 1 : 0 }, backoff_fast);
+            pin_write(config.rx_pin, is_high ? 1 : 0);
         }
     }
 

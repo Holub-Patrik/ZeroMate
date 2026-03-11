@@ -8,13 +8,17 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <functional>
 
 #include "CircularBufferQueue.hpp"
 #include "zero_mate/external_peripheral.hpp"
 #include "Util.hpp"
 
 // Forward declarations
+template<std::size_t Size>
 class I2C_Master;
+
+template<std::size_t Size>
 class I2C_Slave;
 
 enum class I2C_State : uint8_t
@@ -28,6 +32,7 @@ enum class I2C_State : uint8_t
 
 struct I2C_Master_P
 {
+    std::uint32_t id{ 0 };
     std::uint32_t scl_pin{ UINT32_MAX };
     std::uint32_t sda_pin{ UINT32_MAX };
     std::vector<int> slave_fds;
@@ -35,20 +40,26 @@ struct I2C_Master_P
 
 struct I2C_Slave_P
 {
+    std::uint32_t id{ 0 };
     std::uint8_t address{ 0 };
     std::uint32_t scl_pin{ UINT32_MAX };
     std::uint32_t sda_pin{ UINT32_MAX };
-    int master_fd;
+    int master_fd{ -1 };
 };
 
 class I2C_Base
 {
+public:
+    using pin_write_t = std::function<void(std::uint8_t, std::uint8_t)>;
+
 protected:
     static constexpr std::size_t BUFFER_SIZE = 128;
     static constexpr uint32_t MASK_PIN = 1U << 31U;
     static constexpr uint32_t MASK_VALUE = 1U << 30U;
     static constexpr uint32_t MASK_DELTA = 0x3FFFFFFF;
+    static constexpr std::size_t BACKOFF_CYCLES = 1024;
 
+    pin_write_t pin_write;
     bool scl_lvl = true;
     bool sda_lvl = true;
     I2C_State state = I2C_State::IDLE;
@@ -63,14 +74,13 @@ protected:
     std::thread receiver;
     std::array<int, 2> close_pipefd{ -1, -1 };
 
-    zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin_func;
     zero_mate::IExternal_Peripheral::Halt_t halt_func;
     zero_mate::IExternal_Peripheral::Start_t start_func;
 
-    I2C_Base(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
-             zero_mate::IExternal_Peripheral::Halt_t halt_func,
-             zero_mate::IExternal_Peripheral::Start_t start_func)
-    : set_pin_func(set_pin)
+    I2C_Base(zero_mate::IExternal_Peripheral::Halt_t halt_func,
+             zero_mate::IExternal_Peripheral::Start_t start_func,
+             pin_write_t pin_write)
+    : pin_write(std::move(pin_write))
     , halt_func(halt_func)
     , start_func(start_func)
     {
@@ -118,6 +128,7 @@ public:
     }
 };
 
+template<std::size_t Size>
 class I2C_Master final : public I2C_Base
 {
     I2C_Master_P config;
@@ -127,16 +138,16 @@ class I2C_Master final : public I2C_Base
     TSP::Queue::Buffer<std::uint8_t, BUFFER_SIZE> queue_buf;
     TSP::Queue::Writer<std::uint8_t, BUFFER_SIZE> queue_writer;
     TSP::Queue::Reader<std::uint8_t, BUFFER_SIZE> queue_reader;
-    TSP::BF::Backoff backoff_fast{ 1024 };
+    TSP::BF::Backoff backoff_fast{ BACKOFF_CYCLES };
 
     uint8_t shift_reg = 0;
 
 public:
     I2C_Master(I2C_Master_P config,
-               zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
                zero_mate::IExternal_Peripheral::Halt_t halt_func,
-               zero_mate::IExternal_Peripheral::Start_t start_func)
-    : I2C_Base(set_pin, halt_func, start_func)
+               zero_mate::IExternal_Peripheral::Start_t start_func,
+               pin_write_t pin_write)
+    : I2C_Base(halt_func, start_func, std::move(pin_write))
     , config(std::move(config))
     , queue_writer(&queue_buf)
     , queue_reader(&queue_buf)
@@ -157,6 +168,11 @@ public:
         {
             handle_sda_master(is_high, delta);
         }
+    }
+
+    void start_receiver()
+    {
+        receiver = std::thread(&std::remove_reference_t<decltype(*this)>::receiver_thread, this);
     }
 
     void receiver_thread()
@@ -239,7 +255,7 @@ private:
             {
                 if (queue_reader.try_advance())
                 {
-                    set_pin_func(config.sda_pin, queue_reader.peek() != 0);
+                    pin_write(config.sda_pin, queue_reader.peek());
                     queue_reader.advance();
                 }
                 else
@@ -292,7 +308,7 @@ private:
 
     void receive_from_slave(const int fd)
     {
-        std::array<uint8_t, BUFFER_SIZE> rx_buf;
+        std::array<uint8_t, BUFFER_SIZE> rx_buf{ 0 };
         ssize_t n = recv(fd, rx_buf.data(), rx_buf.size(), 0);
         if (n > 0)
         {
@@ -305,19 +321,22 @@ private:
     }
 };
 
+template<std::size_t Size>
 class I2C_Slave final : public I2C_Base
 {
     I2C_Slave_P config;
     bool matched_address = false;
     uint8_t shift_reg = 0;
 
+    TSP::BF::Backoff backoff_fast{ BACKOFF_CYCLES };
+
 public:
     I2C_Slave(I2C_Slave_P config,
-              zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
               zero_mate::IExternal_Peripheral::Halt_t halt_func,
-              zero_mate::IExternal_Peripheral::Start_t start_func)
-    : I2C_Base(set_pin, halt_func, start_func)
-    , config(config)
+              zero_mate::IExternal_Peripheral::Start_t start_func,
+              pin_write_t pin_write)
+    : I2C_Base(halt_func, start_func, std::move(pin_write))
+    , config(std::move(config))
     {
     }
 
@@ -350,6 +369,11 @@ public:
                 }
             }
         }
+    }
+
+    void start_receiver()
+    {
+        receiver = std::thread(&std::remove_reference_t<decltype(*this)>::receiver_thread, this);
     }
 
     void receiver_thread()
@@ -413,7 +437,7 @@ private:
                 handle_sda_slave(value);
             }
 
-            set_pin_func(is_scl ? config.scl_pin : config.sda_pin, value);
+            pin_write(is_scl ? config.scl_pin : config.sda_pin, value);
         }
     }
 

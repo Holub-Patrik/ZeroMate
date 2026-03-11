@@ -40,24 +40,30 @@ using conn_info = struct conn_info_struct
 using conn_id = std::uint64_t;
 using pin_pair = std::pair<std::uint8_t, std::uint8_t>;
 
-using protocol_variant = std::variant<UART_Handler, I2C_Master, I2C_Slave>;
+template<std::size_t QUEUE_SIZE>
+using protocol_variant = std::variant<std::unique_ptr<UART_Handler<QUEUE_SIZE>>,
+                                      std::unique_ptr<I2C_Master<QUEUE_SIZE>>,
+                                      std::unique_ptr<I2C_Slave<QUEUE_SIZE>>>;
 
 template<typename Type, std::size_t Size>
 class BitProcessor final
 {
+public:
+    using pin_write_t = std::function<void(std::uint8_t, std::uint8_t)>;
+
 private:
-    protocol_variant handler;
+    protocol_variant<Size> handler;
     TSP::Queue::Reader<Type, Size> queue_reader;
-    TSP::BF::Backoff backoff; // simple for now, can be changed to sem later
+    TSP::BF::SemBackoff backoff;
 
     std::atomic<bool> running{ false };
     std::thread sender;
-    std::thread receiver;
 
 public:
-    BitProcessor(protocol_variant&& variant, TSP::Queue::Buffer<Type, Size>* buf)
+    BitProcessor(protocol_variant<Size> variant, TSP::Queue::Buffer<Type, Size>* buf)
     : handler(std::move(variant))
     , queue_reader(buf)
+    , backoff(100, 1000)
     {
     }
 
@@ -76,23 +82,20 @@ public:
     {
         running = true;
         sender = std::thread{ &BitProcessor<Type, Size>::run_sender, this };
-        // Is this legal?
-        std::visit(
-        [this](auto& handler) -> void { receiver = std::thread(decltype(handler)::receiver_thread, handler); });
+        std::visit([](auto& h) -> void { h->start_receiver(); }, handler);
     }
 
     void stop()
     {
-        if (running)
+        if (running.exchange(false))
         {
-            running = false;
-
+            backoff.wake();
             if (sender.joinable())
             {
                 sender.join();
             }
 
-            std::visit([](auto& handler) -> void { handler.receiver_stop(); });
+            std::visit([](auto& h) -> void { h->receiver_stop(); }, handler);
         }
     }
 
@@ -103,12 +106,21 @@ private:
 
         while (running)
         {
-            const auto& [bit, pin] = queue_reader.read(backoff);
+            if (!queue_reader.try_advance())
+            {
+                backoff.wait([this]() { return !running || queue_reader.try_advance(); });
+                continue;
+            }
+            backoff.reset();
+
+            const auto pair = queue_reader.peek();
+            queue_reader.advance();
+
             const auto now = std::chrono::high_resolution_clock::now();
             const auto delta =
             static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_time).count());
             last_time = now;
-            std::visit([bit, delta](auto& handler) -> void { handler.process_bit(bit, delta); });
+            std::visit([pair, delta](auto& h) -> void { h->process_bit(pair, delta); }, handler);
         }
     }
 };
@@ -144,6 +156,7 @@ private:
     // abuse std::destroy_at{} and std::construct_at{} to use arrays
     std::array<std::thread, MAX_CONNECTION_COUNT> connection_threads;
     std::array<conn_info, MAX_CONNECTION_COUNT> connection_data;
+    std::array<std::unique_ptr<std::atomic<bool>>, MAX_CONNECTION_COUNT> connection_running;
 
     FastMap pin_to_conn_id;
     FastMap net_id_to_conn_id;
@@ -156,24 +169,14 @@ private:
     std::thread m_pin_write_thread;
 
     void pin_write();
+    void unmap_connection(std::size_t i);
 
 public:
     GPIOServer() = delete;
 
     explicit GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin,
                         zero_mate::IExternal_Peripheral::Halt_t func_halt,
-                        zero_mate::IExternal_Peripheral::Start_t func_start)
-    : pin_write_queue_reader(&pin_write_queue_buf)
-    , pin_write_queue_writer(&pin_write_queue_buf)
-    , func_set_pin(func_set_pin)
-    , func_halt(func_halt)
-    , func_start(func_start)
-    {
-        for (std::size_t i = 0; i < out_queue_buffers.size(); i++)
-        {
-            std::construct_at(&out_queue_writers[i], &out_queue_buffers[i]);
-        }
-    }
+                        zero_mate::IExternal_Peripheral::Start_t func_start);
     ~GPIOServer();
 
     GPIOServer(const GPIOServer& other) = delete;
@@ -185,6 +188,7 @@ public:
     void write_to_pin(const std::uint8_t pin, const std::uint8_t value);
     void route_pin_info(const pin_pair pin_info);
     void construct_connection(const conn_info& info);
+    void remove_connection(std::size_t i);
     void run();
     void stop();
 
@@ -200,6 +204,16 @@ public:
     [[nodiscard]] zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t get_set_pin() const
     {
         return func_set_pin;
+    }
+
+    // UI access
+    [[nodiscard]] const auto& get_connection_bit_map() const
+    {
+        return connection_bit_map;
+    }
+    [[nodiscard]] const auto& get_connection_data() const
+    {
+        return connection_data;
     }
 };
 
@@ -218,6 +232,7 @@ private:
     GPIOServer& m_server;
 
     std::atomic<bool>& m_server_running;
+    std::atomic<bool>& m_connection_running;
     std::unique_ptr<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE>> m_processor;
 
 public:
@@ -227,7 +242,8 @@ public:
                    zero_mate::IExternal_Peripheral::Halt_t halt,
                    zero_mate::IExternal_Peripheral::Start_t start,
                    GPIOServer& server,
-                   std::atomic<bool>& server_running);
+                   std::atomic<bool>& server_running,
+                   std::atomic<bool>& connection_running);
 
     ~GPIOConnection();
 
@@ -248,7 +264,7 @@ public:
     }
     [[nodiscard]] bool is_running() const
     {
-        return m_server_running.load();
+        return m_server_running.load() && m_connection_running.load();
     }
 };
 
@@ -299,9 +315,33 @@ private:
     GPIOServer server;
     std::thread server_thread;
 
-    // UI Helpers
-    int ui_selected_local_pin_idx;
-    int ui_target_net_pin;
-    int ui_selected_net_pin_source;
-    int ui_target_local_pin_idx;
+    // UI State
+    struct AddConnectionState
+    {
+        int protocol_type = 0; // 0: UART, 1: I2C Master, 2: I2C Slave
+
+        // UART
+        int baudrate = 115200;
+        int tx_pin = 0;
+        int rx_pin = 0;
+        int start_bits = 1;
+        int data_bits = 8;
+        int parity_bits = 0;
+        int stop_bits = 1;
+        char ip[64] = "127.0.0.1";
+        int port = 12345;
+
+        // I2C
+        int scl_pin = 0;
+        int sda_pin = 0;
+        int address = 0x50;
+        int i2c_id = 0;
+    } m_ui_add_state;
+
+    int m_ui_view_idx{ -1 };
+
+    int ui_selected_local_pin_idx{ 0 };
+    int ui_target_net_pin{ 0 };
+    int ui_selected_net_pin_source{ 0 };
+    int ui_target_local_pin_idx{ 0 };
 };
