@@ -8,7 +8,6 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
-#include <variant>
 
 #include "CircularBufferQueue.hpp"
 #include "zero_mate/external_peripheral.hpp"
@@ -194,7 +193,7 @@ public:
     }
 
 private:
-    void handle_scl_master(bool is_high, uint32_t delta)
+    void handle_scl_master(const bool is_high, const uint32_t delta)
     {
         bool sync_point = false;
 
@@ -204,9 +203,7 @@ private:
             {
                 bit_count++;
             }
-        }
-        else if (scl_lvl && !is_high) // Falling edge
-        {
+
             if (state == I2C_State::ADDRESS && bit_count == 8)
             {
                 is_read = sda_lvl;
@@ -233,7 +230,9 @@ private:
                 state = is_read ? I2C_State::READ_BYTE : I2C_State::WRITE_BYTE;
                 bit_count = 0;
             }
-
+        }
+        else if (scl_lvl && !is_high) // Falling edge
+        {
             const bool slave_drives_next =
             (state == I2C_State::READ_BYTE && bit_count < 8) || (state == I2C_State::RESPONSE && ack_from_slave);
             if (slave_drives_next)
@@ -245,7 +244,7 @@ private:
                 }
                 else
                 {
-                    sync_point = true;
+                    // this shouldn't ever happen and should be considered an error
                 }
             }
         }
@@ -358,13 +357,13 @@ public:
         running = true;
         pipe(close_pipefd.data());
 
-        struct pollfd fds[2];
-        fds[0] = { close_pipefd[0], POLLIN, 0 };
-        fds[1] = { config.master_fd, POLLIN, 0 };
+        std::array<struct pollfd, 2> fds{ 0 };
+        fds[0] = { .fd = close_pipefd[0], .events = POLLIN, .revents = 0 };
+        fds[1] = { .fd = config.master_fd, .events = POLLIN, .revents = 0 };
 
         while (running)
         {
-            if (poll(fds, 2, -1) <= 0)
+            if (poll(fds.data(), fds.size(), -1) <= 0)
             {
                 break;
             }
@@ -382,20 +381,20 @@ public:
 private:
     void receive_from_master(int fd)
     {
-        std::array<uint32_t, BUFFER_SIZE> recv_buf;
+        std::array<std::uint32_t, BUFFER_SIZE> recv_buf{ 0 };
         const auto received = recv(fd, recv_buf.data(), recv_buf.size() * sizeof(uint32_t), 0);
         if (received <= 0)
         {
             return;
         }
 
-        size_t count = received / sizeof(uint32_t);
-        for (size_t i = 0; i < count; ++i)
+        const std::size_t count = received / sizeof(uint32_t);
+        for (std::size_t i = 0; i < count; ++i)
         {
-            const uint32_t packed = recv_buf[i];
+            const std::uint32_t packed = recv_buf[i];
             const bool is_scl = static_cast<bool>(packed & MASK_PIN);
             const bool value = static_cast<bool>(packed & MASK_VALUE);
-            const uint32_t delta = (packed & MASK_DELTA);
+            const std::uint32_t delta = (packed & MASK_DELTA);
 
             auto start_wait = std::chrono::high_resolution_clock::now();
             while (

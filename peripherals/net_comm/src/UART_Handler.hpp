@@ -1,6 +1,10 @@
 #include <cstdint>
 #include <netinet/in.h>
 #include <array>
+#include <poll.h>
+#include <chrono>
+
+#include "CircularBufferQueue.hpp"
 
 using UART_P = struct UART_ProtocolInfo
 {
@@ -17,23 +21,38 @@ using UART_P = struct UART_ProtocolInfo
 
     // Point-to-point connection
     struct sockaddr_in other_side{};
+    int other_side_fd;
 };
 
+template<std::size_t QUEUE_SIZE>
 class UART_Handler final
 {
 private:
     UART_P config;
     std::size_t bit_count{ 0 };
 
-    static constexpr std::size_t BUFFER_SIZE = 128;
+    static constexpr std::size_t MAX_BIT_COUNT = 64; // 8 bytes
     static constexpr std::uint32_t MASK_TIME = 0x7FFFFFFFU;
     static constexpr std::uint32_t MASK_BIT_VALUE = 1U << 31U;
-    std::array<std::uint32_t, BUFFER_SIZE> buf{ 0 };
+
+    std::array<std::uint32_t, MAX_BIT_COUNT> buf{ 0 };
+
+    TSP::Queue::Writer<std::pair<std::uint8_t, std::uint8_t>, QUEUE_SIZE> writer;
+    TSP::BF::Backoff backoff_fast{ 1024 };
+
+    std::atomic<bool> running{ false };
+    std::thread receiver;
+    std::array<int, 2> close_pipe{ 0 };
 
 public:
     explicit UART_Handler(const UART_P& config)
     : config(config)
     {
+    }
+
+    [[nodiscard]] std::size_t bit_buffer_size() const noexcept
+    {
+        return config.start_bits + config.data_bits + config.parity_bits + config.stop_bits;
     }
 
     inline void process_bit(const std::pair<std::uint8_t, std::uint8_t>& pair, const std::uint32_t& delta)
@@ -47,7 +66,7 @@ public:
 
         buf[bit_count++] = packed;
 
-        if (bit_count == BUFFER_SIZE)
+        if (bit_count == bit_buffer_size() || bit_count >= MAX_BIT_COUNT)
         {
             send_datagram();
             bit_count = 0;
@@ -58,15 +77,92 @@ public:
     {
         // here it is simple, just expose the emulator writer queue
         // receive data, parse out clock for writing bits to pin
+        running = true;
+        pipe(close_pipe.data());
+
+        std::array<struct pollfd, 2> fds{ 0 };
+        fds[0] = { .fd = close_pipe[0], .events = POLLIN, .revents = 0 };
+        fds[1] = { .fd = config.other_side_fd, .events = POLLIN, .revents = 0 };
+
+        while (running)
+        {
+            if (poll(fds.data(), fds.size(), -1) <= 0)
+            {
+                break;
+            }
+            if (fds[0].revents & POLLIN)
+            {
+                break;
+            }
+            if (fds[1].revents & POLLIN)
+            {
+                receive_datagram(fds[1].fd);
+            }
+        }
     }
 
     void receiver_stop()
     {
+        if (running.exchange(false))
+        {
+            bool close_msg = true;
+            if (close_pipe[1] != -1)
+            {
+                write(close_pipe[1], &close_msg, sizeof(bool));
+            }
+            if (receiver.joinable())
+            {
+                receiver.join();
+            }
+        }
+        _cleanup();
         // simple again, force the socket to die and exit
     }
 
 private:
+    void _cleanup()
+    {
+        if (close_pipe[0] != -1)
+        {
+            close(close_pipe[0]);
+        }
+        if (close_pipe[1] != -1)
+        {
+            close(close_pipe[1]);
+        }
+        close_pipe = { -1, -1 };
+    }
+
+    void receive_datagram(int fd)
+    {
+        std::array<std::uint32_t, MAX_BIT_COUNT> recv_buf{ 0 };
+        const auto received = recv(fd, recv_buf.data(), recv_buf.size() * sizeof(uint32_t), 0);
+        if (received <= 0)
+        {
+            return;
+        }
+
+        const std::size_t count = received / sizeof(uint32_t);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const std::uint32_t packed = recv_buf[i];
+            const bool is_high = static_cast<bool>(packed & MASK_BIT_VALUE);
+            const std::uint32_t delta = packed & MASK_TIME;
+
+            auto start_wait = std::chrono::high_resolution_clock::now();
+            while (
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - start_wait)
+            .count() < delta)
+            {
+                cpu_relax();
+            }
+
+            writer.insert_with_backoff({ config.rx_pin, is_high ? 1 : 0 }, backoff_fast);
+        }
+    }
+
     void send_datagram()
     {
+        send(config.other_side_fd, buf.data(), bit_count * sizeof(std::uint32_t), 0);
     }
 };
