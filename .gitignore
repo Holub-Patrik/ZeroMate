@@ -8,6 +8,8 @@
 /build
 /output
 
+examples/**/build/**
+
 # Doxygen
 /docs/doxygen
 doxygen-warnings.log

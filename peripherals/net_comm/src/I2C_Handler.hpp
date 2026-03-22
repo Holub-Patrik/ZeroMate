@@ -223,6 +223,36 @@ private:
             if (state == I2C_State::ADDRESS && bit_count == 8)
             {
                 is_read = sda_lvl;
+            }
+            
+            // Pop bit Slave sent after previous falling edge
+            const bool slave_drives_now =
+            (state == I2C_State::READ_BYTE && bit_count <= 8) || (state == I2C_State::RESPONSE && ack_from_slave);
+            
+            if (slave_drives_now)
+            {
+                int retries = 100000;
+                while (!queue_reader.try_advance() && retries-- > 0)
+                {
+                    cpu_relax();
+                }
+
+                if (queue_reader.try_advance())
+                {
+                    uint8_t val = queue_reader.peek();
+                    pin_write(config.sda_pin, val);
+                    queue_reader.advance();
+                }
+                else
+                {
+                    pin_write(config.sda_pin, 1);
+                }
+            }
+        }
+        else if (scl_lvl && !is_high) // Falling edge
+        {
+            if (state == I2C_State::ADDRESS && bit_count == 8)
+            {
                 state = I2C_State::RESPONSE;
                 bit_count = 0;
                 ack_from_slave = true;
@@ -240,28 +270,20 @@ private:
                 state = I2C_State::RESPONSE;
                 bit_count = 0;
                 ack_from_slave = false;
+                sync_point = false;
             }
             else if (state == I2C_State::RESPONSE)
             {
                 state = is_read ? I2C_State::READ_BYTE : I2C_State::WRITE_BYTE;
                 bit_count = 0;
+                if (is_read && !sda_lvl)
+                {
+                    sync_point = true;
+                }
             }
-        }
-        else if (scl_lvl && !is_high) // Falling edge
-        {
-            const bool slave_drives_next =
-            (state == I2C_State::READ_BYTE && bit_count < 8) || (state == I2C_State::RESPONSE && ack_from_slave);
-            if (slave_drives_next)
+            else if (state == I2C_State::READ_BYTE && bit_count < 8)
             {
-                if (queue_reader.try_advance())
-                {
-                    pin_write(config.sda_pin, queue_reader.peek());
-                    queue_reader.advance();
-                }
-                else
-                {
-                    // this shouldn't ever happen and should be considered an error
-                }
+                sync_point = true;
             }
         }
 
@@ -275,6 +297,10 @@ private:
         {
             if (sda_lvl && !is_high) // START
             {
+                while (queue_reader.try_advance())
+                {
+                    queue_reader.advance();
+                }
                 state = I2C_State::ADDRESS;
                 bit_count = 0;
             }
@@ -292,14 +318,20 @@ private:
         const uint32_t packed = (delta & MASK_DELTA) | (value ? MASK_VALUE : 0) | (is_scl ? MASK_PIN : 0);
         buf[buf_idx++] = packed;
 
-        if (sync_point || buf_idx == BUFFER_SIZE)
+        bool should_flush = sync_point || buf_idx == BUFFER_SIZE;
+        if (is_scl && (state == I2C_State::READ_BYTE || (state == I2C_State::RESPONSE && ack_from_slave)))
+        {
+            should_flush = true;
+        }
+
+        if (should_flush)
         {
             for (int fd : config.slave_fds)
             {
                 send(fd, buf.data(), buf_idx * sizeof(uint32_t), 0);
             }
             buf_idx = 0;
-            if (sync_point)
+            if (sync_point && !queue_reader.try_advance())
             {
                 halt_func();
             }
@@ -353,11 +385,11 @@ public:
                 slave_send_buf[slave_send_idx++] = (bit != 0 ? 1 : 0);
 
                 bool should_flush = false;
-                if (!is_read && state == I2C_State::RESPONSE && ack_from_slave)
+                if (state == I2C_State::RESPONSE && ack_from_slave)
                 {
                     should_flush = true;
                 }
-                if (state == I2C_State::READ_BYTE && bit_count == 8)
+                else if (state == I2C_State::READ_BYTE)
                 {
                     should_flush = true;
                 }
@@ -430,59 +462,80 @@ private:
 
             if (is_scl)
             {
-                handle_scl_slave(value);
+                if (!scl_lvl && value)
+                {
+                    handle_scl_slave_rising(value);
+                }
             }
             else
             {
                 handle_sda_slave(value);
             }
 
-            pin_write(is_scl ? config.scl_pin : config.sda_pin, value);
+            if (is_scl)
+            {
+                if (scl_lvl && !value)
+                {
+                    handle_scl_slave_falling(value);
+                }
+            }
+
+            if (matched_address || state == I2C_State::ADDRESS)
+            {
+                pin_write(is_scl ? config.scl_pin : config.sda_pin, value);
+            }
+
+            if (is_scl)
+            {
+                scl_lvl = value;
+            }
         }
     }
 
-    void handle_scl_slave(bool is_high)
+    void handle_scl_slave_rising([[maybe_unused]] bool is_high)
     {
-        if (!scl_lvl && is_high) // Rising edge
+        if (state != I2C_State::IDLE)
         {
-            if (state != I2C_State::IDLE)
+            bit_count++;
+            if (state == I2C_State::ADDRESS && bit_count <= 8)
             {
-                bit_count++;
-                if (state == I2C_State::ADDRESS && bit_count <= 8)
-                {
-                    shift_reg = (shift_reg << 1U) | (sda_lvl ? 1 : 0);
-                }
+                shift_reg = (shift_reg << 1U) | (sda_lvl ? 1 : 0);
+            }
+            else if (state == I2C_State::WRITE_BYTE && bit_count <= 8)
+            {
+                shift_reg = (shift_reg << 1U) | (sda_lvl ? 1 : 0);
             }
         }
-        else if (scl_lvl && !is_high) // Falling edge
+    }
+
+    void handle_scl_slave_falling([[maybe_unused]] bool is_high)
+    {
+        if (state == I2C_State::ADDRESS && bit_count == 8)
         {
-            if (state == I2C_State::ADDRESS && bit_count == 8)
-            {
-                is_read = static_cast<bool>(shift_reg & 0x01U);
-                matched_address = ((shift_reg >> 1U) == config.address);
-                state = I2C_State::RESPONSE;
-                bit_count = 0;
-                ack_from_slave = true;
-            }
-            else if (state == I2C_State::WRITE_BYTE && bit_count == 8)
-            {
-                state = I2C_State::RESPONSE;
-                bit_count = 0;
-                ack_from_slave = true;
-            }
-            else if (state == I2C_State::READ_BYTE && bit_count == 8)
-            {
-                state = I2C_State::RESPONSE;
-                bit_count = 0;
-                ack_from_slave = false;
-            }
-            else if (state == I2C_State::RESPONSE)
-            {
-                state = is_read ? I2C_State::READ_BYTE : I2C_State::WRITE_BYTE;
-                bit_count = 0;
-            }
+            is_read = static_cast<bool>(shift_reg & 0x01U);
+            matched_address = ((shift_reg >> 1U) == config.address);
+            state = I2C_State::RESPONSE;
+            bit_count = 0;
+            ack_from_slave = matched_address;
         }
-        scl_lvl = is_high;
+        else if (state == I2C_State::WRITE_BYTE && bit_count == 8)
+        {
+            state = I2C_State::RESPONSE;
+            bit_count = 0;
+            ack_from_slave = matched_address;
+        }
+        else if (state == I2C_State::READ_BYTE && bit_count == 8)
+        {
+            state = I2C_State::RESPONSE;
+            bit_count = 0;
+            ack_from_slave = false;
+        }
+        else if (state == I2C_State::RESPONSE)
+        {
+            state = is_read ? I2C_State::READ_BYTE : I2C_State::WRITE_BYTE;
+            bit_count = 0;
+            shift_reg = 0;
+        }
     }
 
     void handle_sda_slave(bool is_high)

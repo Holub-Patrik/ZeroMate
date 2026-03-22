@@ -174,23 +174,23 @@ namespace TSP
             std::uint64_t cycles_relaxed{ 0 };
 
         public:
-            SleepBackoff<TimeUnit>() = delete;
-            ~SleepBackoff<TimeUnit>() final = default;
+            SleepBackoff() = delete;
+            ~SleepBackoff() final = default;
 
-            explicit SleepBackoff<TimeUnit>(const std::uint64_t max_cycles_fast,
-                                            const std::uint64_t max_cycles_relaxed,
-                                            const TimeUnit& wait_time)
+            explicit SleepBackoff(const std::uint64_t max_cycles_fast,
+                                  const std::uint64_t max_cycles_relaxed,
+                                  const TimeUnit& wait_time)
             : max_cycles_fast(max_cycles_fast)
             , max_cycles_relaxed(max_cycles_relaxed)
             , wait_time(wait_time)
             {
             }
 
-            SleepBackoff<TimeUnit>(const SleepBackoff<TimeUnit>& other) = delete;
-            SleepBackoff<TimeUnit>& operator=(const SleepBackoff<TimeUnit>& other) = delete;
+            SleepBackoff(const SleepBackoff& other) = delete;
+            SleepBackoff& operator=(const SleepBackoff& other) = delete;
 
-            SleepBackoff<TimeUnit>(SleepBackoff<TimeUnit>&& other) = delete;
-            SleepBackoff<TimeUnit>& operator=(SleepBackoff<TimeUnit>&& other) = delete;
+            SleepBackoff(SleepBackoff&& other) = delete;
+            SleepBackoff& operator=(SleepBackoff&& other) = delete;
 
             template<typename Predicate>
             void wait_impl(Predicate&& /*pred*/)

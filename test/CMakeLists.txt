@@ -48,6 +48,7 @@ target_link_libraries(unit_tests
         capstone
         demangle
         logging_system
+        tbb
 )
 
 # If we are on Windows, copy logging_system.dll to the location of the executable
