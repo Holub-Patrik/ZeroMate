@@ -86,7 +86,7 @@ protected:
     bool is_read = false;
     bool ack_from_slave = false;
 
-    std::array<uint8_t, 16> slave_send_buf{};
+    std::array<uint8_t, 16> slave_send_buf{ };
     size_t slave_send_idx = 0;
 
     std::atomic<bool> running{ false };
@@ -254,8 +254,8 @@ private:
         }
         else if (scl_lvl && !is_high) // Falling edge
         {
-            const bool slave_drives_next =
-            (state == I2C_State::READ_BYTE && bit_count < 8) || (state == I2C_State::RESPONSE && ack_from_slave && bit_count == 0);
+            const bool slave_drives_next = (state == I2C_State::READ_BYTE && bit_count < 8) ||
+                                           (state == I2C_State::RESPONSE && ack_from_slave && bit_count == 0);
 
             if (slave_drives_next)
             {
@@ -360,7 +360,7 @@ private:
 
     void receive_from_slave(const int fd)
     {
-        I2C_Packet packet{};
+        I2C_Packet packet{ };
         ssize_t n = recv(fd, &packet, sizeof(packet), 0);
         if (n == sizeof(packet))
         {
@@ -469,7 +469,7 @@ public:
 private:
     void receive_from_master(int fd)
     {
-        I2C_Packet packet{};
+        I2C_Packet packet{ };
         const auto received = recv(fd, &packet, sizeof(packet), 0);
         if (received != sizeof(packet))
         {
@@ -488,8 +488,7 @@ private:
                 matched_address = false;
                 break;
 
-            case I2C_Packet_Type::I2C_ADDRESS:
-            {
+            case I2C_Packet_Type::I2C_ADDRESS: {
                 start_local(); // Ensure START if not already
                 bit_bang_byte_local(packet.value);
                 bool ack = read_ack_local();

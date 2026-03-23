@@ -544,10 +544,10 @@ void Remote_GPIO::Render_Settings()
 
         if (ImGui::Button("OK", ImVec2(120, 0)))
         {
-            conn_info info{};
+            conn_info info{ };
             if (m_ui_add_state.protocol_type == 0)
             {
-                UART_P p{};
+                UART_P p{ };
                 p.baudrate = m_ui_add_state.baudrate;
                 p.tx_pin = m_ui_add_state.tx_pin;
                 p.rx_pin = m_ui_add_state.rx_pin;
@@ -562,7 +562,7 @@ void Remote_GPIO::Render_Settings()
             }
             else if (m_ui_add_state.protocol_type == 1)
             {
-                I2C_Master_P p{};
+                I2C_Master_P p{ };
                 p.id = static_cast<uint32_t>(m_ui_add_state.i2c_id);
                 p.scl_pin = m_ui_add_state.scl_pin;
                 p.sda_pin = m_ui_add_state.sda_pin;
@@ -570,7 +570,7 @@ void Remote_GPIO::Render_Settings()
             }
             else if (m_ui_add_state.protocol_type == 2)
             {
-                I2C_Slave_P p{};
+                I2C_Slave_P p{ };
                 p.id = static_cast<uint32_t>(m_ui_add_state.i2c_id);
                 p.address = static_cast<uint8_t>(m_ui_add_state.address);
                 p.scl_pin = m_ui_add_state.scl_pin;
