@@ -290,7 +290,7 @@ GPIOServer::~GPIOServer()
     stop();
 }
 
-GPIOConnection::GPIOConnection(const conn_info& info,
+GPIOConnection::GPIOConnection(conn_info& info,
                                TSP::Queue::Buffer<pin_pair, GPIOServer::BUFFER_SIZE>* buffer,
                                zero_mate::IExternal_Peripheral::Halt_t halt,
                                zero_mate::IExternal_Peripheral::Start_t start,

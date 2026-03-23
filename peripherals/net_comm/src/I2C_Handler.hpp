@@ -251,16 +251,19 @@ private:
             {
                 is_read = static_cast<bool>(shift_reg & 0x01U);
             }
+        }
+        else if (scl_lvl && !is_high) // Falling edge
+        {
+            const bool slave_drives_next =
+            (state == I2C_State::READ_BYTE && bit_count < 8) || (state == I2C_State::RESPONSE && ack_from_slave && bit_count == 0);
 
-            const bool slave_drives_now =
-            (state == I2C_State::READ_BYTE && bit_count <= 8) || (state == I2C_State::RESPONSE && ack_from_slave);
-
-            if (slave_drives_now)
+            if (slave_drives_next)
             {
                 if (queue_reader.try_advance())
                 {
                     uint8_t val = queue_reader.peek();
                     pin_write(config.sda_pin, val);
+                    sda_lvl = (val != 0);
                     queue_reader.advance();
                 }
                 else
@@ -268,9 +271,7 @@ private:
                     pin_write(config.sda_pin, 1);
                 }
             }
-        }
-        else if (scl_lvl && !is_high) // Falling edge
-        {
+
             if (state == I2C_State::ADDRESS && bit_count == 8)
             {
                 send_packet(I2C_Packet_Type::I2C_ADDRESS, shift_reg);
@@ -362,6 +363,18 @@ private:
                 ack_from_slave = (packet.value != 0);
                 // For RESPONSE state, the master expects 1 bit (ACK)
                 queue_writer.insert_with_backoff(ack_from_slave ? 0 : 1, backoff_fast);
+
+                // If we are in the RESPONSE state and waiting for this bit
+                if (state == I2C_State::RESPONSE && bit_count == 0)
+                {
+                    if (queue_reader.try_advance())
+                    {
+                        uint8_t val = queue_reader.peek();
+                        pin_write(config.sda_pin, val);
+                        sda_lvl = (val != 0);
+                        queue_reader.advance();
+                    }
+                }
             }
             else if (packet.type == I2C_Packet_Type::I2C_DATA)
             {
@@ -369,6 +382,18 @@ private:
                 for (int i = 7; i >= 0; --i)
                 {
                     queue_writer.insert_with_backoff((packet.value >> i) & 0x01U, backoff_fast);
+                }
+
+                // If we are already in READ_BYTE and waiting for the first bit, drive it now
+                if (state == I2C_State::READ_BYTE && bit_count == 0)
+                {
+                    if (queue_reader.try_advance())
+                    {
+                        uint8_t val = queue_reader.peek();
+                        pin_write(config.sda_pin, val);
+                        sda_lvl = (val != 0);
+                        queue_reader.advance();
+                    }
                 }
             }
             start_func();
