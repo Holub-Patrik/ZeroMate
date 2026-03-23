@@ -54,6 +54,8 @@ using conn_info = struct conn_info_struct
     // Remote side info
     std::string remote_ip;
     int remote_port;
+
+    std::chrono::time_point<std::chrono::steady_clock> start_time;
 };
 
 namespace handshake
@@ -67,28 +69,45 @@ namespace handshake
         I2C_Slave = 2,
     };
 
+    struct UARTConfig
+    {
+        std::uint32_t baudrate;
+        std::uint8_t data_bits;
+        std::uint8_t start_bits;
+        std::uint8_t parity_bits;
+        std::uint8_t stop_bits;
+    } __attribute__((packed));
+
+    struct I2CConfig
+    {
+        std::uint32_t bus_id;
+        std::uint8_t is_master;
+        std::uint8_t address;
+    } __attribute__((packed));
+
     struct ConfMessage
     {
         std::uint8_t magic = MAGIC_BYTE;
-        std::uint16_t opened_port;
         ProtocolID protocol_id;
-        std::uint32_t protocol_info; // Baudrate for UART, ID for I2C
-        std::uint8_t explicit_clock;
-        std::uint8_t clock_unit;
-        std::uint32_t clock_value;
+        std::uint16_t port;
+        union
+        {
+            UARTConfig uart;
+            I2CConfig i2c;
+        } config;
     } __attribute__((packed));
 
-    struct AcceptDeclineMessage
+    struct ResponseMessage
     {
         std::uint8_t magic = MAGIC_BYTE;
-        std::uint8_t accept;
+        std::uint8_t status; // 1: Accept, 0: Decline
         std::uint16_t port;
     } __attribute__((packed));
 
-    struct AcceptAckMessage
+    struct FinalResponseMessage
     {
         std::uint8_t magic = MAGIC_BYTE;
-        std::uint8_t ack;
+        std::uint8_t status; // 1: Accept, 0: Decline
     } __attribute__((packed));
 }
 
@@ -221,6 +240,7 @@ private:
     zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t func_read_pin;
     zero_mate::IExternal_Peripheral::Halt_t func_halt;
     zero_mate::IExternal_Peripheral::Start_t func_start;
+    zero_mate::utils::CLogging_System* logging_system;
 
     std::atomic<bool> m_running{ true };
     std::thread m_pin_write_thread;
@@ -230,13 +250,20 @@ private:
     void pin_write();
     void unmap_connection(std::size_t i);
 
+    // Handshake helpers
+    void handle_handshake();
+    void handle_conf_msg(const handshake::ConfMessage& msg, const struct sockaddr_in& addr);
+    void handle_response_msg(const handshake::ResponseMessage& msg, const struct sockaddr_in& addr);
+    void handle_final_response_msg(const handshake::FinalResponseMessage& msg, const struct sockaddr_in& addr);
+
 public:
     GPIOServer() = delete;
 
     explicit GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin,
                         zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t func_read_pin,
                         zero_mate::IExternal_Peripheral::Halt_t func_halt,
-                        zero_mate::IExternal_Peripheral::Start_t func_start);
+                        zero_mate::IExternal_Peripheral::Start_t func_start,
+                        zero_mate::utils::CLogging_System* logging_system);
     ~GPIOServer();
 
     GPIOServer(const GPIOServer& other) = delete;
@@ -247,12 +274,14 @@ public:
 
     void write_to_pin(const std::uint8_t pin, const std::uint8_t value);
     void route_pin_info(const pin_pair pin_info);
-    std::size_t create_connection(const conn_info& info);
-    void connect_connection(std::size_t i);
+    void add_connection(const conn_info& info);
     void remove_connection(std::size_t i);
     void construct_connection(const conn_info& info);
     void run();
     void stop();
+
+    // Handshake initiation
+    void initiate_handshake(const conn_info& info);
 
     // used by GPIOConnection
     [[nodiscard]] zero_mate::IExternal_Peripheral::Halt_t get_halt() const

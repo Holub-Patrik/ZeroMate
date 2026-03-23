@@ -157,21 +157,60 @@ void GPIOServer::route_pin_info(const pin_pair pin_info)
     writer_ref.insert(pin_info);
 }
 
+void GPIOServer::add_connection(const conn_info& info)
+{
+    for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; i++)
+    {
+        if (!connection_bit_map[i])
+        {
+            connection_bit_map[i] = true;
+            connection_data[i] = info;
+            connection_data[i].status = ConnectionStatus::Defined;
+            return;
+        }
+    }
+}
+
 GPIOServer::GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin,
                        zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t func_read_pin,
                        zero_mate::IExternal_Peripheral::Halt_t func_halt,
-                       zero_mate::IExternal_Peripheral::Start_t func_start)
+                       zero_mate::IExternal_Peripheral::Start_t func_start,
+                       zero_mate::utils::CLogging_System* logging_system)
 : pin_write_queue_reader(&pin_write_queue_buf)
 , pin_write_queue_writer(&pin_write_queue_buf)
 , func_set_pin(func_set_pin)
 , func_read_pin(func_read_pin)
 , func_halt(func_halt)
 , func_start(func_start)
+, logging_system(logging_system)
 {
     for (std::size_t i = 0; i < out_queue_buffers.size(); i++)
     {
         std::construct_at(&out_queue_writers[i], &out_queue_buffers[i]);
         connection_running[i] = std::make_unique<std::atomic<bool>>(false);
+    }
+
+    m_handshake_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (m_handshake_socket != -1)
+    {
+        struct sockaddr_in addr{ };
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(m_handshake_port);
+        if (bind(m_handshake_socket, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
+        {
+            if (logging_system)
+            {
+                logging_system->Error("Handshake port 12344 is already in use. Failed to start GPIOServer.");
+            }
+            close(m_handshake_socket);
+            m_handshake_socket = -1;
+        }
+        else if (logging_system)
+        {
+            std::string log_msg = "Handshake socket listening on port " + std::to_string(m_handshake_port);
+            logging_system->Info(log_msg.c_str());
+        }
     }
 }
 
@@ -214,10 +253,9 @@ void GPIOServer::construct_connection(const conn_info& info)
 {
     for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; i++)
     {
-        if (!connection_bit_map[i])
+        if (connection_bit_map[i] && connection_data[i].opened_port == info.opened_port &&
+            connection_data[i].status == ConnectionStatus::Connected)
         {
-            connection_bit_map[i] = true;
-            connection_data[i] = info;
             connection_running[i]->store(true);
 
             // Map pins
@@ -252,6 +290,281 @@ void GPIOServer::construct_connection(const conn_info& info)
     }
 }
 
+void GPIOServer::initiate_handshake(const conn_info& info)
+{
+    if (m_handshake_socket == -1)
+    {
+        return;
+    }
+
+    handshake::ConfMessage msg{ };
+    msg.port = 0; // Will be filled by OS when we bind data socket
+
+    // Find a free port for data by opening a temporary socket
+    int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in temp_addr{ };
+    temp_addr.sin_family = AF_INET;
+    temp_addr.sin_addr.s_addr = INADDR_ANY;
+    temp_addr.sin_port = 0;
+    bind(temp_sock, reinterpret_cast<struct sockaddr*>(&temp_addr), sizeof(temp_addr));
+    socklen_t len = sizeof(temp_addr);
+    getsockname(temp_sock, reinterpret_cast<struct sockaddr*>(&temp_addr), &len);
+    msg.port = ntohs(temp_addr.sin_port);
+    close(temp_sock);
+
+    std::visit(
+    [&msg](auto& p) {
+        using T = std::remove_cvref_t<decltype(p)>;
+        if constexpr (std::is_same_v<T, UART_P>)
+        {
+            msg.protocol_id = handshake::ProtocolID::UART;
+            msg.config.uart.baudrate = p.baudrate;
+            msg.config.uart.data_bits = static_cast<uint8_t>(p.data_bits);
+            msg.config.uart.start_bits = static_cast<uint8_t>(p.start_bits);
+            msg.config.uart.parity_bits = static_cast<uint8_t>(p.parity_bits);
+            msg.config.uart.stop_bits = static_cast<uint8_t>(p.stop_bits);
+        }
+        else if constexpr (std::is_same_v<T, I2C_Master_P>)
+        {
+            msg.protocol_id = handshake::ProtocolID::I2C_Master;
+            msg.config.i2c.bus_id = p.id;
+            msg.config.i2c.is_master = 1;
+            msg.config.i2c.address = 0;
+        }
+        else if constexpr (std::is_same_v<T, I2C_Slave_P>)
+        {
+            msg.protocol_id = handshake::ProtocolID::I2C_Slave;
+            msg.config.i2c.bus_id = p.id;
+            msg.config.i2c.is_master = 0;
+            msg.config.i2c.address = p.address;
+        }
+    },
+    info.protocol);
+
+    struct sockaddr_in remote_addr{ };
+    remote_addr.sin_family = AF_INET;
+    remote_addr.sin_port = htons(static_cast<uint16_t>(info.remote_port));
+    inet_pton(AF_INET, info.remote_ip.c_str(), &remote_addr.sin_addr);
+
+    sendto(m_handshake_socket,
+           &msg,
+           sizeof(msg),
+           0,
+           reinterpret_cast<struct sockaddr*>(&remote_addr),
+           sizeof(remote_addr));
+
+    // Update existing connection state
+    for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; i++)
+    {
+        if (connection_bit_map[i] && connection_data[i].remote_ip == info.remote_ip &&
+            connection_data[i].remote_port == info.remote_port)
+        {
+            connection_data[i].status = ConnectionStatus::Connecting;
+            connection_data[i].opened_port = msg.port;
+            connection_data[i].is_responder = false;
+            connection_data[i].start_time = std::chrono::steady_clock::now();
+            return;
+        }
+    }
+}
+
+void GPIOServer::handle_handshake()
+{
+    struct pollfd pfd = { .fd = m_handshake_socket, .events = POLLIN, .revents = 0 };
+    if (poll(&pfd, 1, 10) > 0)
+    {
+        uint8_t buf[512];
+        struct sockaddr_in addr{ };
+        socklen_t addr_len = sizeof(addr);
+        ssize_t n =
+        recvfrom(m_handshake_socket, buf, sizeof(buf), 0, reinterpret_cast<struct sockaddr*>(&addr), &addr_len);
+        if (n > 0 && buf[0] == handshake::MAGIC_BYTE)
+        {
+            if (n == sizeof(handshake::ConfMessage))
+            {
+                handle_conf_msg(*reinterpret_cast<handshake::ConfMessage*>(buf), addr);
+            }
+            else if (n == sizeof(handshake::ResponseMessage))
+            {
+                handle_response_msg(*reinterpret_cast<handshake::ResponseMessage*>(buf), addr);
+            }
+            else if (n == sizeof(handshake::FinalResponseMessage))
+            {
+                handle_final_response_msg(*reinterpret_cast<handshake::FinalResponseMessage*>(buf), addr);
+            }
+        }
+    }
+}
+
+void GPIOServer::handle_conf_msg(const handshake::ConfMessage& msg, const struct sockaddr_in& addr)
+{
+    // Responder side
+    handshake::ResponseMessage resp{ };
+    resp.status = 1; // Accept by default
+
+    // Check for Master-Master conflict
+    // (In a real scenario we might check local capabilities)
+
+    uint16_t data_port = 0;
+    int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in temp_addr{ };
+    temp_addr.sin_family = AF_INET;
+    temp_addr.sin_addr.s_addr = INADDR_ANY;
+    temp_addr.sin_port = 0;
+    bind(temp_sock, reinterpret_cast<struct sockaddr*>(&temp_addr), sizeof(temp_addr));
+    socklen_t len = sizeof(temp_addr);
+    getsockname(temp_sock, reinterpret_cast<struct sockaddr*>(&temp_addr), &len);
+    data_port = ntohs(temp_addr.sin_port);
+    close(temp_sock);
+
+    resp.port = data_port;
+    sendto(m_handshake_socket, &resp, sizeof(resp), 0, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr));
+
+    // Create a pending connection
+    conn_info info{ };
+    info.remote_ip = inet_ntoa(addr.sin_addr);
+    info.remote_port = ntohs(addr.sin_port);
+    info.opened_port = data_port;
+    info.status = ConnectionStatus::Connecting;
+    info.is_responder = true;
+    info.start_time = std::chrono::steady_clock::now();
+
+    if (logging_system)
+    {
+        std::string log_msg = "Accepted connection from " + info.remote_ip + ":" + std::to_string(info.remote_port);
+        log_msg += " (Data port: " + std::to_string(info.opened_port) + ")";
+        logging_system->Info(log_msg.c_str());
+    }
+
+    if (msg.protocol_id == handshake::ProtocolID::UART)
+    {
+        UART_P p{ };
+        p.baudrate = msg.config.uart.baudrate;
+        p.data_bits = msg.config.uart.data_bits;
+        p.start_bits = msg.config.uart.start_bits;
+        p.parity_bits = msg.config.uart.parity_bits;
+        p.stop_bits = msg.config.uart.stop_bits;
+        p.other_side = addr;
+        p.other_side.sin_port = htons(msg.port);
+        info.protocol = p;
+    }
+    else if (msg.protocol_id == handshake::ProtocolID::I2C_Master)
+    {
+        I2C_Slave_P p{ }; // Initiator is master, we are slave
+        p.id = msg.config.i2c.bus_id;
+        p.address = msg.config.i2c.address;
+        info.protocol = p;
+    }
+    else if (msg.protocol_id == handshake::ProtocolID::I2C_Slave)
+    {
+        I2C_Master_P p{ }; // Initiator is slave, we are master
+        p.id = msg.config.i2c.bus_id;
+        info.protocol = p;
+    }
+
+    for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; i++)
+    {
+        if (!connection_bit_map[i])
+        {
+            connection_bit_map[i] = true;
+            connection_data[i] = info;
+            return;
+        }
+    }
+}
+
+void GPIOServer::handle_response_msg(const handshake::ResponseMessage& msg, const struct sockaddr_in& addr)
+{
+    // Initiator side receives Response from Responder
+    for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; i++)
+    {
+        if (connection_bit_map[i] && connection_data[i].status == ConnectionStatus::Connecting &&
+            !connection_data[i].is_responder)
+        {
+            // Verify it's from the same IP
+            if (connection_data[i].remote_ip == inet_ntoa(addr.sin_addr))
+            {
+                handshake::FinalResponseMessage final_resp{ };
+                final_resp.status = msg.status;
+                sendto(m_handshake_socket,
+                       &final_resp,
+                       sizeof(final_resp),
+                       0,
+                       reinterpret_cast<const struct sockaddr*>(&addr),
+                       sizeof(addr));
+
+                if (msg.status == 1)
+                {
+                    // Update remote port for data
+                    std::visit(
+                    [&msg, &addr](auto& p) {
+                        using T = std::remove_cvref_t<decltype(p)>;
+                        if constexpr (std::is_same_v<T, UART_P>)
+                        {
+                            p.other_side = addr;
+                            p.other_side.sin_port = htons(msg.port);
+                        }
+                        // For I2C we might need similar logic if they use sockaddr_in
+                    },
+                    connection_data[i].protocol);
+
+                    connection_data[i].status = ConnectionStatus::Connected;
+
+                    if (logging_system)
+                    {
+                        std::string log_msg = "Connected to " + connection_data[i].remote_ip + ":" +
+                                              std::to_string(connection_data[i].remote_port);
+                        log_msg += " (Remote data port: " + std::to_string(msg.port) + ")";
+                        logging_system->Info(log_msg.c_str());
+                    }
+
+                    construct_connection(connection_data[i]);
+                }
+                else
+                {
+                    connection_data[i].status = ConnectionStatus::Failed;
+                    connection_bit_map[i] = false;
+                }
+                return;
+            }
+        }
+    }
+}
+
+void GPIOServer::handle_final_response_msg(const handshake::FinalResponseMessage& msg, const struct sockaddr_in& addr)
+{
+    // Responder side receives Final Response from Initiator
+    for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; i++)
+    {
+        if (connection_bit_map[i] && connection_data[i].status == ConnectionStatus::Connecting &&
+            connection_data[i].is_responder)
+        {
+            if (connection_data[i].remote_ip == inet_ntoa(addr.sin_addr))
+            {
+                if (msg.status == 1)
+                {
+                    connection_data[i].status = ConnectionStatus::Connected;
+
+                    if (logging_system)
+                    {
+                        std::string log_msg = "Final ACK received from " + connection_data[i].remote_ip + ":" +
+                                              std::to_string(connection_data[i].remote_port);
+                        logging_system->Info(log_msg.c_str());
+                    }
+
+                    construct_connection(connection_data[i]);
+                }
+                else
+                {
+                    connection_data[i].status = ConnectionStatus::Failed;
+                    connection_bit_map[i] = false;
+                }
+                return;
+            }
+        }
+    }
+}
+
 void GPIOServer::run()
 {
     m_pin_write_thread = std::thread([this]() {
@@ -261,10 +574,10 @@ void GPIOServer::run()
         }
     });
 
-    // TODO: Main discovery/config loop (UDP recvfrom)
     while (m_running.load())
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        handle_handshake();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
@@ -309,7 +622,29 @@ GPIOConnection::GPIOConnection(conn_info& info,
 , m_connection_running(connection_running)
 {
     m_socket = socket(AF_INET, SOCK_DGRAM, 0);
-    // TODO: bind if needed, but user said handshake later
+
+    if (m_socket != -1 && info.opened_port != 0)
+    {
+        struct sockaddr_in local_addr{ };
+        local_addr.sin_family = AF_INET;
+        local_addr.sin_addr.s_addr = INADDR_ANY;
+        local_addr.sin_port = htons(info.opened_port);
+        bind(m_socket, reinterpret_cast<struct sockaddr*>(&local_addr), sizeof(local_addr));
+
+        std::visit(
+        [this, &info](auto& p) {
+            using T = std::remove_cvref_t<decltype(p)>;
+            if constexpr (std::is_same_v<T, UART_P>)
+            {
+                if (p.other_side.sin_port != 0)
+                {
+                    connect(m_socket, reinterpret_cast<struct sockaddr*>(&p.other_side), sizeof(p.other_side));
+                    m_other_side = p.other_side;
+                }
+            }
+        },
+        info.protocol);
+    }
 
     auto pin_write_cb = [this](std::uint8_t pin, std::uint8_t val) { this->write_to_pin(pin, val); };
     auto pin_read_cb = [this](std::uint8_t pin) { return static_cast<uint8_t>(m_read_pin(pin)); };
@@ -378,12 +713,7 @@ void GPIOConnection::send_to_network(const std::vector<std::uint8_t>& data)
 {
     if (m_socket != -1)
     {
-        sendto(m_socket,
-               data.data(),
-               data.size(),
-               0,
-               reinterpret_cast<struct sockaddr*>(&m_other_side),
-               sizeof(m_other_side));
+        send(m_socket, data.data(), data.size(), 0);
     }
 }
 
@@ -407,7 +737,7 @@ Remote_GPIO::Remote_GPIO(const std::string& name,
 , start(start)
 , logging_system(logging_system)
 , ImGui_context(nullptr)
-, server(set_pin, read_pin, halt, start)
+, server(set_pin, read_pin, halt, start, logging_system)
 , ui_selected_local_pin_idx(0)
 , ui_target_net_pin(0)
 , ui_selected_net_pin_source(0)
@@ -472,7 +802,7 @@ void Remote_GPIO::Render_Settings()
     ImGui::Text("Active Connections:");
 
     const auto& bit_map = server.get_connection_bit_map();
-    const auto& data = server.get_connection_data();
+    auto& data = const_cast<std::array<conn_info, GPIOServer::MAX_CONNECTION_COUNT>&>(server.get_connection_data());
 
     for (std::size_t i = 0; i < bit_map.size(); ++i)
     {
@@ -497,10 +827,41 @@ void Remote_GPIO::Render_Settings()
             },
             data[i].protocol);
 
-            if (ImGui::Selectable(label.c_str(), false, 0, ImVec2(ImGui::GetWindowWidth() - 50, 0)))
+            if (data[i].status == ConnectionStatus::Connecting)
+            {
+                label += " (Connecting...)";
+            }
+            else if (data[i].status == ConnectionStatus::Defined)
+            {
+                label += " (Not connected)";
+            }
+            else if (data[i].status == ConnectionStatus::Failed)
+            {
+                label += " (Failed)";
+            }
+
+            if (ImGui::Selectable(label.c_str(), false, 0, ImVec2(ImGui::GetWindowWidth() - 100, 0)))
             {
                 m_ui_view_idx = static_cast<int>(i);
                 ImGui::OpenPopup("View Connection");
+            }
+
+            ImGui::SameLine(ImGui::GetWindowWidth() - 95);
+            if (data[i].status == ConnectionStatus::Defined || data[i].status == ConnectionStatus::Failed)
+            {
+                if (ImGui::Button(("Connect##" + std::to_string(i)).c_str()))
+                {
+                    server.initiate_handshake(data[i]);
+                }
+            }
+            else if (data[i].status == ConnectionStatus::Connecting)
+            {
+                if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
+                                                                    data[i].start_time)
+                    .count() > 1)
+                {
+                    data[i].status = ConnectionStatus::Failed;
+                }
             }
 
             ImGui::SameLine(ImGui::GetWindowWidth() - 35);
@@ -533,6 +894,8 @@ void Remote_GPIO::Render_Settings()
             ImGui::InputInt("Bus ID", &m_ui_add_state.i2c_id);
             ImGui::InputInt("SCL Pin", &m_ui_add_state.scl_pin);
             ImGui::InputInt("SDA Pin", &m_ui_add_state.sda_pin);
+            ImGui::InputText("Remote IP", m_ui_add_state.ip, sizeof(m_ui_add_state.ip));
+            ImGui::InputInt("Remote Port", &m_ui_add_state.port);
         }
         else if (m_ui_add_state.protocol_type == 2) // I2C Slave
         {
@@ -540,11 +903,16 @@ void Remote_GPIO::Render_Settings()
             ImGui::InputInt("Address", &m_ui_add_state.address);
             ImGui::InputInt("SCL Pin", &m_ui_add_state.scl_pin);
             ImGui::InputInt("SDA Pin", &m_ui_add_state.sda_pin);
+            ImGui::InputText("Remote IP", m_ui_add_state.ip, sizeof(m_ui_add_state.ip));
+            ImGui::InputInt("Remote Port", &m_ui_add_state.port);
         }
 
         if (ImGui::Button("OK", ImVec2(120, 0)))
         {
             conn_info info{ };
+            info.remote_ip = m_ui_add_state.ip;
+            info.remote_port = m_ui_add_state.port;
+
             if (m_ui_add_state.protocol_type == 0)
             {
                 UART_P p{ };
@@ -555,9 +923,6 @@ void Remote_GPIO::Render_Settings()
                 p.data_bits = m_ui_add_state.data_bits;
                 p.parity_bits = m_ui_add_state.parity_bits;
                 p.stop_bits = m_ui_add_state.stop_bits;
-                p.other_side.sin_family = AF_INET;
-                p.other_side.sin_port = htons(static_cast<uint16_t>(m_ui_add_state.port));
-                inet_pton(AF_INET, m_ui_add_state.ip, &p.other_side.sin_addr);
                 info.protocol = p;
             }
             else if (m_ui_add_state.protocol_type == 1)
@@ -578,9 +943,10 @@ void Remote_GPIO::Render_Settings()
                 info.protocol = p;
             }
 
-            server.construct_connection(info);
+            server.add_connection(info);
             ImGui::CloseCurrentPopup();
         }
+
         ImGui::SetItemDefaultFocus();
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(120, 0)))
@@ -589,6 +955,9 @@ void Remote_GPIO::Render_Settings()
         }
         ImGui::EndPopup();
     }
+    // {
+    //     ImGui::CloseCurrentPopup();
+    // }
 
     // Modal: View Connection
     if (ImGui::BeginPopupModal("View Connection", NULL, ImGuiWindowFlags_AlwaysAutoResize))
@@ -596,6 +965,10 @@ void Remote_GPIO::Render_Settings()
         if (m_ui_view_idx != -1 && bit_map[m_ui_view_idx])
         {
             const auto& conn = data[m_ui_view_idx];
+            ImGui::Text("Remote IP: %s", conn.remote_ip.c_str());
+            ImGui::Text("Handshake Port: %d", conn.remote_port);
+            ImGui::Separator();
+
             std::visit(
             [](auto& p) {
                 using T = std::remove_cvref_t<decltype(p)>;
@@ -609,8 +982,6 @@ void Remote_GPIO::Render_Settings()
                     ImGui::Text("Data Bits: %u", p.data_bits);
                     ImGui::Text("Parity Bits: %u", p.parity_bits);
                     ImGui::Text("Stop Bits: %u", p.stop_bits);
-                    ImGui::Text("Remote IP: %s", inet_ntoa(p.other_side.sin_addr));
-                    ImGui::Text("Remote Port: %u", ntohs(p.other_side.sin_port));
                 }
                 else if constexpr (std::is_same_v<T, I2C_Master_P>)
                 {

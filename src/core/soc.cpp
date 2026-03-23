@@ -89,8 +89,8 @@ namespace zero_mate::soc
 
     // Initialize the collection of all internal peripherals as well as a collection of all external
     // peripherals that are connected to the board via GPIO.
-    std::vector<std::shared_ptr<peripheral::IPeripheral>> g_peripherals{};
-    std::vector<IExternal_Peripheral*> g_external_peripherals{};
+    std::vector<std::shared_ptr<peripheral::IPeripheral>> g_peripherals{ };
+    std::vector<IExternal_Peripheral*> g_external_peripherals{ };
 
     // Anonymous namespace to make its content visible only to this translation unit.
     namespace
@@ -274,7 +274,7 @@ namespace zero_mate::soc
                 g_logging_system.Error(fmt::format("Cannot load {}", config::External_Peripherals_Config_File).c_str());
 
                 // Return an empty JSON object.
-                return {};
+                return { };
             }
 
             try
@@ -290,7 +290,7 @@ namespace zero_mate::soc
                 // clang-format on
 
                 // Return an empty JSON object.
-                return {};
+                return { };
             }
         }
 
@@ -329,7 +329,7 @@ namespace zero_mate::soc
         // -------------------------------------------------------------------------------------------------------------
         [[nodiscard]] inline TPeripheral_Config Get_Peripheral_Config(const nlohmann::json& peripheral)
         {
-            TPeripheral_Config config{};
+            TPeripheral_Config config{ };
 
             // Read data from the config sections.
             config.name = peripheral[config::sections::Name].template get<std::string>();
@@ -434,8 +434,8 @@ namespace zero_mate::soc
             catch ([[maybe_unused]] const std::exception& e)
             {
                 // clang-format off
-                g_logging_system.Error(fmt::format("Failed to load a shared library: path = {}; name = {} ",
-                                                   config.lib_dir, config.lib_name).c_str());
+                g_logging_system.Error(fmt::format("Failed to load a shared library: path = {}; name = {}; error = {} ",
+                                                   config.lib_dir, config.lib_name, e.what()).c_str());
                 // clang-format on
             }
         }
