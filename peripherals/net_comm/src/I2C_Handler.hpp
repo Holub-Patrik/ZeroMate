@@ -269,7 +269,13 @@ private:
                 else
                 {
                     pin_write(config.sda_pin, 1);
+                    sda_lvl = true;
                 }
+            }
+            else
+            {
+                pin_write(config.sda_pin, 1); // Release SDA for Master to drive
+                sda_lvl = true;
             }
 
             if (state == I2C_State::ADDRESS && bit_count == 8)

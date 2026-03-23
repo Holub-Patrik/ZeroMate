@@ -142,10 +142,6 @@ struct Mock_I2C_Peripheral
                         if (matched)
                         {
                             set_pin_func(sda_pin, false); // ACK
-                            if (is_read)
-                            {
-                                prepare_next_data_bit(); // Bit 0
-                            }
                         }
                         m_state = State::ACK;
                     }
@@ -158,6 +154,10 @@ struct Mock_I2C_Peripheral
                                 received_data.push_back(shift_reg);
                                 set_pin_func(sda_pin, false); // ACK
                             }
+                            else
+                            {
+                                set_pin_func(sda_pin, true); // Release SDA so Master can ACK
+                            }
                         }
                         m_state = State::ACK;
                     }
@@ -169,7 +169,11 @@ struct Mock_I2C_Peripheral
                     m_state = State::DATA;
                     if (is_read && matched)
                     {
-                        prepare_next_data_bit(); // Bits 1-7
+                        prepare_next_data_bit(); // Bit 0 of next byte
+                    }
+                    else
+                    {
+                        set_pin_func(sda_pin, true); // Release SDA after ACK pulse
                     }
                 }
                 else if (m_state == State::DATA && is_read && matched)
