@@ -186,61 +186,31 @@ The messages sent can be quite large so I can afford say for example 4 bytes for
 
 ## I2C
 
-Data message or clock message definition (1st byte)
-If data message, data bit needs to be sent and then a clock signal needs to sent
+I2C communication is driven on a high level using requests and responses. The Master tracks the state and sends commands to the Slave.
 
-For I2C from what I understand it will be communication based like this:
+### Packet Format
 
-1. The master sends a byte and clock
-1. My component will pulse data and clock for slave while accumulating data from slave
-1. Send back to master and pulse the data
+I2C packets use a fixed-size structure:
+- Type (1 byte): `I2C_START`, `I2C_STOP`, `I2C_ADDRESS`, `I2C_WRITE_BYTE`, `I2C_READ_BYTE`, `I2C_ACK`, `I2C_DATA`.
+- Value (1 byte): Payload (Address, Data byte, or bool for ACK).
 
-States that I have to detect and define
+### Master -> Slave Commands
 
-- START Condition
-- Repeated START Condition
-- Address
-- RW -> (ACK/NACK Master/Slave mode)
-- Data
-- STOP Condition
+1. **I2C_START**: Sent when a START condition is detected.
+2. **I2C_ADDRESS**: Sent after accumulating 8 bits (Address + R/W). Master halts and waits for `I2C_ACK` from Slave.
+3. **I2C_WRITE_BYTE**: Sent after accumulating 8 bits of data. Master halts and waits for `I2C_ACK`.
+4. **I2C_READ_BYTE**: Sent when Master starts reading a byte. Master halts and waits for `I2C_DATA` (8 bits).
+5. **I2C_ACK**: Sent after Master reads a byte, contains the ACK/NACK bit driven by the Master.
+6. **I2C_STOP**: Sent when a STOP condition is detected.
 
-Read/Write sync/stop conditions
-Address
+### Slave -> Master Responses
 
-1. Accumulate eight bits
-1. Stop Master
-1. Send to all slaves
-1. Simulate 9 clocks
-1. Send ACK/NACK back to master
+1. **I2C_ACK**: Sent by the Slave in response to `I2C_ADDRESS` or `I2C_WRITE_BYTE`.
+2. **I2C_DATA**: Sent by the Slave in response to `I2C_READ_BYTE`, contains the full 8-bit data.
 
-Writing byte
+### Implementation Details
 
-1. Accumulate eight bits
-1. Stop Master
-1. Emulate 9 clock cycles on slave
-1. Send ACK/NACK back to master
-1. Set bit on master, start master up again
-
-Reading byte
-
-1. Clock 8 more times to retrieve data
-1. Stop clock on slave
-1. Start master up again and present data to him
-1. Collect ack/nack
-1. Stop master
-1. Send to slave
-1. Clock the ack/nack bit
-1. If ack return to step 1, otherwise await stop condition from master
-
-### New analyis
-
-Possible states:
-
-- IDLE
-- ADDRESS
-- READ_BYTE
-- WRITE_BYTE
-- RESPONSE
+The Slave acts as a local Master for peripherals on its side, bit-banging the high-level commands locally to SCL/SDA pins and reading back responses (ACKs or data) to send back over the network.
 
 ## SPI
 

@@ -158,11 +158,13 @@ void GPIOServer::route_pin_info(const pin_pair pin_info)
 }
 
 GPIOServer::GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin,
+                       zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t func_read_pin,
                        zero_mate::IExternal_Peripheral::Halt_t func_halt,
                        zero_mate::IExternal_Peripheral::Start_t func_start)
 : pin_write_queue_reader(&pin_write_queue_buf)
 , pin_write_queue_writer(&pin_write_queue_buf)
 , func_set_pin(func_set_pin)
+, func_read_pin(func_read_pin)
 , func_halt(func_halt)
 , func_start(func_start)
 {
@@ -239,6 +241,7 @@ void GPIOServer::construct_connection(const conn_info& info)
                                     &out_queue_buffers[i],
                                     func_halt,
                                     func_start,
+                                    func_read_pin,
                                     *this,
                                     m_running,
                                     *connection_running[i]);
@@ -291,6 +294,7 @@ GPIOConnection::GPIOConnection(const conn_info& info,
                                TSP::Queue::Buffer<pin_pair, GPIOServer::BUFFER_SIZE>* buffer,
                                zero_mate::IExternal_Peripheral::Halt_t halt,
                                zero_mate::IExternal_Peripheral::Start_t start,
+                               zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
                                GPIOServer& server,
                                std::atomic<bool>& server_running,
                                std::atomic<bool>& connection_running)
@@ -299,6 +303,7 @@ GPIOConnection::GPIOConnection(const conn_info& info,
 , m_socket(-1)
 , m_halt(halt)
 , m_start(start)
+, m_read_pin(read_pin)
 , m_server(server)
 , m_server_running(server_running)
 , m_connection_running(connection_running)
@@ -307,6 +312,7 @@ GPIOConnection::GPIOConnection(const conn_info& info,
     // TODO: bind if needed, but user said handshake later
 
     auto pin_write_cb = [this](std::uint8_t pin, std::uint8_t val) { this->write_to_pin(pin, val); };
+    auto pin_read_cb = [this](std::uint8_t pin) { return static_cast<uint8_t>(m_read_pin(pin)); };
 
     auto local_info = info;
 
@@ -327,7 +333,7 @@ GPIOConnection::GPIOConnection(const conn_info& info,
             i2c_m.slave_fds.push_back(m_socket);
         }
         m_processor = std::make_unique<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE>>(
-        std::make_unique<I2C_Master<GPIOServer::BUFFER_SIZE>>(i2c_m, m_halt, m_start, pin_write_cb),
+        std::make_unique<I2C_Master<GPIOServer::BUFFER_SIZE>>(i2c_m, m_halt, m_start, pin_write_cb, pin_read_cb),
         buffer);
     }
     else if (std::holds_alternative<I2C_Slave_P>(local_info.protocol))
@@ -335,7 +341,7 @@ GPIOConnection::GPIOConnection(const conn_info& info,
         auto& i2c_s = std::get<I2C_Slave_P>(local_info.protocol);
         i2c_s.master_fd = m_socket;
         m_processor = std::make_unique<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE>>(
-        std::make_unique<I2C_Slave<GPIOServer::BUFFER_SIZE>>(i2c_s, m_halt, m_start, pin_write_cb),
+        std::make_unique<I2C_Slave<GPIOServer::BUFFER_SIZE>>(i2c_s, m_halt, m_start, pin_write_cb, pin_read_cb),
         buffer);
     }
     connection = local_info;
@@ -401,7 +407,7 @@ Remote_GPIO::Remote_GPIO(const std::string& name,
 , start(start)
 , logging_system(logging_system)
 , ImGui_context(nullptr)
-, server(set_pin, halt, start)
+, server(set_pin, read_pin, halt, start)
 , ui_selected_local_pin_idx(0)
 , ui_target_net_pin(0)
 , ui_selected_net_pin_source(0)

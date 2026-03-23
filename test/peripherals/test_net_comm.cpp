@@ -233,11 +233,16 @@ TEST(net_comm, i2c_combined_interaction)
     s_cfg.master_fd = sv[1];
 
     bool current_sda = true;
+    bool peripheral_sda = true;
+
     I2C_Master<128> master(m_cfg, master_halt, master_start, [&](uint8_t pin, uint8_t val) {
         if (pin == SDA)
         {
             current_sda = (val != 0);
         }
+    }, [&](uint8_t pin) { 
+        if (pin == SDA) return (current_sda && peripheral_sda) ? (uint8_t)1 : (uint8_t)0;
+        return (uint8_t)1;
     });
 
     Mock_I2C_Peripheral peripheral(SLAVE_ADDR, SDA, SCL, nullptr);
@@ -247,9 +252,18 @@ TEST(net_comm, i2c_combined_interaction)
     s_cfg,
     []() { },
     []() { },
-    [&](uint8_t pin, uint8_t val) { peripheral.on_gpio_change(pin, val != 0); });
+    [&](uint8_t pin, uint8_t val) { 
+        if (pin == SDA) current_sda = (val != 0); // Slave proxy driving local bus
+        peripheral.on_gpio_change(pin, val != 0); 
+    },
+    [&](uint8_t pin) { 
+        if (pin == SDA) return (current_sda && peripheral_sda) ? (uint8_t)1 : (uint8_t)0;
+        return (uint8_t)1;
+    });
 
-    peripheral.set_pin_func = [&](uint32_t pin, bool val) { slave.process_bit({ val ? 1 : 0, pin }, 0); };
+    peripheral.set_pin_func = [&](uint32_t pin, bool val) { 
+        if (pin == SDA) peripheral_sda = val;
+    };
 
     master.start_receiver();
     slave.start_receiver();
@@ -371,11 +385,16 @@ TEST(net_comm, i2c_read_interaction)
     s_cfg.master_fd = sv[1];
 
     bool current_sda = true;
+    bool peripheral_sda = true;
+
     I2C_Master<128> master(m_cfg, master_halt, master_start, [&](uint8_t pin, uint8_t val) {
         if (pin == SDA)
         {
             current_sda = (val != 0);
         }
+    }, [&](uint8_t pin) { 
+        if (pin == SDA) return (current_sda && peripheral_sda) ? (uint8_t)1 : (uint8_t)0;
+        return (uint8_t)1;
     });
 
     Mock_I2C_Peripheral peripheral(SLAVE_ADDR, SDA, SCL, nullptr);
@@ -385,9 +404,18 @@ TEST(net_comm, i2c_read_interaction)
     s_cfg,
     []() { },
     []() { },
-    [&](uint8_t pin, uint8_t val) { peripheral.on_gpio_change(pin, val != 0); });
+    [&](uint8_t pin, uint8_t val) { 
+        if (pin == SDA) current_sda = (val != 0); // Slave proxy driving local bus
+        peripheral.on_gpio_change(pin, val != 0); 
+    },
+    [&](uint8_t pin) { 
+        if (pin == SDA) return (current_sda && peripheral_sda) ? (uint8_t)1 : (uint8_t)0;
+        return (uint8_t)1;
+    });
 
-    peripheral.set_pin_func = [&](uint32_t pin, bool val) { slave.process_bit({ val ? 1 : 0, pin }, 0); };
+    peripheral.set_pin_func = [&](uint32_t pin, bool val) { 
+        if (pin == SDA) peripheral_sda = val;
+    };
 
     master.start_receiver();
     slave.start_receiver();

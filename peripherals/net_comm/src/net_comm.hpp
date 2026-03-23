@@ -50,6 +50,7 @@ class BitProcessor final
 {
 public:
     using pin_write_t = std::function<void(std::uint8_t, std::uint8_t)>;
+    using pin_read_t = std::function<std::uint8_t(std::uint8_t)>;
 
 private:
     protocol_variant<Size> handler;
@@ -162,6 +163,7 @@ private:
     FastMap net_id_to_conn_id;
 
     zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin;
+    zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t func_read_pin;
     zero_mate::IExternal_Peripheral::Halt_t func_halt;
     zero_mate::IExternal_Peripheral::Start_t func_start;
 
@@ -175,6 +177,7 @@ public:
     GPIOServer() = delete;
 
     explicit GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin,
+                        zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t func_read_pin,
                         zero_mate::IExternal_Peripheral::Halt_t func_halt,
                         zero_mate::IExternal_Peripheral::Start_t func_start);
     ~GPIOServer();
@@ -205,6 +208,10 @@ public:
     {
         return func_set_pin;
     }
+    [[nodiscard]] zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t get_read_pin() const
+    {
+        return func_read_pin;
+    }
 
     // UI access
     [[nodiscard]] const auto& get_connection_bit_map() const
@@ -229,6 +236,7 @@ private:
 
     zero_mate::IExternal_Peripheral::Halt_t m_halt;
     zero_mate::IExternal_Peripheral::Start_t m_start;
+    zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t m_read_pin;
     GPIOServer& m_server;
 
     std::atomic<bool>& m_server_running;
@@ -241,6 +249,7 @@ public:
                    TSP::Queue::Buffer<pin_pair, GPIOServer::BUFFER_SIZE>* buffer,
                    zero_mate::IExternal_Peripheral::Halt_t halt,
                    zero_mate::IExternal_Peripheral::Start_t start,
+                   zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
                    GPIOServer& server,
                    std::atomic<bool>& server_running,
                    std::atomic<bool>& connection_running);
