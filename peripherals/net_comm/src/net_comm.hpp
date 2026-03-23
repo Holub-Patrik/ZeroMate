@@ -16,7 +16,10 @@
 #include <arpa/inet.h>
 #include <array>
 
-#include "imgui.h"
+#ifndef ZERO_MATE_UNIT_TESTS
+    #include "imgui.h"
+#endif
+
 #include "zero_mate/external_peripheral.hpp"
 #include "CircularBufferQueue.hpp"
 #include "Util.hpp"
@@ -25,17 +28,69 @@
 
 using Protocol = std::variant<UART_P, I2C_Master_P, I2C_Slave_P>;
 
+enum class ConnectionStatus
+{
+    Defined,
+    Connecting,
+    Connected,
+    Failed
+};
+
 using conn_info = struct conn_info_struct
 {
     Protocol protocol;
 
-    bool explicit_clock{};
-    std::int8_t clock_unit{};
-    std::uint32_t clock_value{};
+    bool explicit_clock{ };
+    std::int8_t clock_unit{ };
+    std::uint32_t clock_value{ };
 
-    in_port_t opened_port{}; // receiver port
-    std::uint32_t net_id{};
+    in_port_t opened_port{ }; // receiver port
+    std::uint32_t net_id{ };
+
+    ConnectionStatus status = ConnectionStatus::Defined;
+    std::string error_msg;
+    bool is_responder = false;
+
+    // Remote side info
+    std::string remote_ip;
+    int remote_port;
 };
+
+namespace handshake
+{
+    static constexpr std::uint8_t MAGIC_BYTE = 0x5A;
+
+    enum class ProtocolID : std::uint8_t
+    {
+        UART = 0,
+        I2C_Master = 1,
+        I2C_Slave = 2,
+    };
+
+    struct ConfMessage
+    {
+        std::uint8_t magic = MAGIC_BYTE;
+        std::uint16_t opened_port;
+        ProtocolID protocol_id;
+        std::uint32_t protocol_info; // Baudrate for UART, ID for I2C
+        std::uint8_t explicit_clock;
+        std::uint8_t clock_unit;
+        std::uint32_t clock_value;
+    } __attribute__((packed));
+
+    struct AcceptDeclineMessage
+    {
+        std::uint8_t magic = MAGIC_BYTE;
+        std::uint8_t accept;
+        std::uint16_t port;
+    } __attribute__((packed));
+
+    struct AcceptAckMessage
+    {
+        std::uint8_t magic = MAGIC_BYTE;
+        std::uint8_t ack;
+    } __attribute__((packed));
+}
 
 using conn_id = std::uint64_t;
 using pin_pair = std::pair<std::uint8_t, std::uint8_t>;
@@ -139,7 +194,7 @@ public:
 
 private:
     // Pin write entirely here since there will be multiple writers, so spinlock is added to ensure safety
-    TSP::Queue::Buffer<pin_pair, QUEUE_SIZE> pin_write_queue_buf{};
+    TSP::Queue::Buffer<pin_pair, QUEUE_SIZE> pin_write_queue_buf{ };
     TSP::Queue::Reader<pin_pair, QUEUE_SIZE> pin_write_queue_reader;
     TSP::Queue::Writer<pin_pair, QUEUE_SIZE> pin_write_queue_writer;
     Spinlock pin_write_spinlock;
@@ -152,7 +207,7 @@ private:
     std::array<TSP::Queue::Writer<pin_pair, BUFFER_SIZE>, BUFFER_COUNT> out_queue_writers;
 
     // this could be converted into a bit map, but bit instruction are extra instructions
-    std::array<bool, MAX_CONNECTION_COUNT> connection_bit_map{};
+    std::array<bool, MAX_CONNECTION_COUNT> connection_bit_map{ };
 
     // abuse std::destroy_at{} and std::construct_at{} to use arrays
     std::array<std::thread, MAX_CONNECTION_COUNT> connection_threads;
@@ -169,6 +224,8 @@ private:
 
     std::atomic<bool> m_running{ true };
     std::thread m_pin_write_thread;
+    int m_handshake_socket{ -1 };
+    uint16_t m_handshake_port{ 12344 };
 
     void pin_write();
     void unmap_connection(std::size_t i);
@@ -190,8 +247,10 @@ public:
 
     void write_to_pin(const std::uint8_t pin, const std::uint8_t value);
     void route_pin_info(const pin_pair pin_info);
-    void construct_connection(const conn_info& info);
+    std::size_t create_connection(const conn_info& info);
+    void connect_connection(std::size_t i);
     void remove_connection(std::size_t i);
+    void construct_connection(const conn_info& info);
     void run();
     void stop();
 
@@ -227,7 +286,7 @@ public:
 class GPIOConnection final
 {
 private:
-    conn_info connection;
+    conn_info& connection;
 
     TSP::Queue::Reader<pin_pair, GPIOServer::BUFFER_SIZE> m_queue_reader;
 
@@ -245,7 +304,7 @@ private:
 
 public:
     GPIOConnection() = delete;
-    GPIOConnection(const conn_info& info,
+    GPIOConnection(conn_info& info,
                    TSP::Queue::Buffer<pin_pair, GPIOServer::BUFFER_SIZE>* buffer,
                    zero_mate::IExternal_Peripheral::Halt_t halt,
                    zero_mate::IExternal_Peripheral::Start_t start,
@@ -300,15 +359,20 @@ public:
 
     ~Remote_GPIO() final;
 
+#ifndef ZERO_MATE_UNIT_TESTS
     void Render() final;
     void Set_ImGui_Context(void* context) final;
+#endif
+
     void Increment_Passed_Cycles(std::uint32_t count) final;
     void GPIO_Subscription_Callback(std::uint32_t pin_idx) final;
 
 private:
+#ifndef ZERO_MATE_UNIT_TESTS
     // UI Rendering
     void Render_Settings();
     void Render_Mappings();
+#endif
 
     // IExternal dependencies
     std::string name;
@@ -318,13 +382,17 @@ private:
     zero_mate::IExternal_Peripheral::Halt_t halt;
     zero_mate::IExternal_Peripheral::Start_t start;
     zero_mate::utils::CLogging_System* logging_system;
+
+#ifndef ZERO_MATE_UNIT_TESTS
     ImGuiContext* ImGui_context;
+#endif
 
     std::atomic<bool> m_running{ true };
     GPIOServer server;
     std::thread server_thread;
 
     // UI State
+#ifndef ZERO_MATE_UNIT_TESTS
     struct AddConnectionState
     {
         int protocol_type = 0; // 0: UART, 1: I2C Master, 2: I2C Slave
@@ -353,4 +421,5 @@ private:
     int ui_target_net_pin{ 0 };
     int ui_selected_net_pin_source{ 0 };
     int ui_target_local_pin_idx{ 0 };
+#endif
 };

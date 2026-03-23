@@ -5,8 +5,10 @@
  *
  * "Lockless" Single Produce Single Consumer Queue
  * - Buffer class representing the data backing for the queue
- * - Writer class representing an interface into data allowing to write into a queue
- * - Reader class representing an interface into data allowing to read from the queue
+ * - Writer class representing an interface into data allowing to write into a
+ * queue
+ * - Reader class representing an interface into data allowing to read from the
+ * queue
  *
  * "Exponential" Backoffs
  * - Usefull when spinning while waiting for other primitives
@@ -16,30 +18,26 @@
  *
  * - Sleep Backoff
  *   - Spins the same way as a basic backoff
- *   - When it finishes fast and relaxed spinning, it start spinning with a sleep
+ *   - When it finishes fast and relaxed spinning, it start spinning with a
+ * sleep
  *
  * - Semaphore Backoff
  *   - Spins the same way as basic backoff
- *   - When it finishes fast and relaxed spinning, it puts the thread to sleep on binary semaphore
+ *   - When it finishes fast and relaxed spinning, it puts the thread to sleep
+ * on binary semaphore
  *   - This backoff needs to be waked from the sleeping state
- *   - Usefull when there are bursts of high throughput and then for example wait for network
- *
- * To be implemented:
- * - Spinlocks
- * - Multiple Producer Multiple Consumer
- * - More os specific optimizations to improve performance
- * - Bulk data access (insert N, take as many as possible)
- *
- * Considering:
- * - More data structures possibly
+ *   - Usefull when there are bursts of high throughput and then for example
+ * wait for network
  */
 
 #pragma once
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdint>
+#include <semaphore>
 #include <thread>
 
 #define ALIGNMENT 64
@@ -48,7 +46,7 @@
 consteval std::size_t align_array_size(const std::size_t size)
 {
     const auto left_most_index = (sizeof(size) * 8) - std::countl_zero(size);
-    const auto ret_val = 1U << (left_most_index - 1);
+    const auto ret_val = 1ULL << (left_most_index - (std::has_single_bit(size) ? 1 : 0));
     return ret_val;
 }
 
@@ -78,7 +76,7 @@ namespace TSP
         template<class Derived>
         class IBackoff
         {
-        private:
+        protected:
             IBackoff() = default;
 
         public:
@@ -297,22 +295,21 @@ namespace TSP
                 }
             }
         };
-    }
+    } // namespace BF
 
     namespace Queue
     {
         template<typename Type, std::size_t Size>
         struct Buffer
         {
-            std::array<Type, align_array_size(Size)> data{};
-            // so the atomics don't suffer from false sharing
+            static constexpr std::size_t ALIGNED_SIZE = align_array_size(Size);
+            std::array<Type, ALIGNED_SIZE> data{ };
             alignas(ALIGNMENT) std::atomic<std::uint64_t> read_pos{ 0 };
-            alignas(ALIGNMENT) std::atomic<std::uint64_t> write_pos{ 1 };
+            alignas(ALIGNMENT) std::atomic<std::uint64_t> write_pos{ 0 };
 
-            // doesn't advance position, only returns the position as if it was advanced
             [[nodiscard]] static std::uint64_t advanced_pos(const std::uint64_t cur_pos) noexcept
             {
-                return (cur_pos + 1) & (align_array_size(Size) - 1);
+                return (cur_pos + 1) & (ALIGNED_SIZE - 1);
             }
         };
 
@@ -320,7 +317,7 @@ namespace TSP
         class Reader final
         {
         private:
-            Buffer<Type, align_array_size(Size)>* buffer;
+            Buffer<Type, Size>* buffer;
             std::uint64_t cached_write_pos;
 
         public:
@@ -329,9 +326,9 @@ namespace TSP
             , cached_write_pos(0) { };
             ~Reader() = default;
 
-            explicit Reader(Buffer<Type, align_array_size(Size)>* buf)
+            explicit Reader(Buffer<Type, Size>* buf)
             : buffer(buf)
-            , cached_write_pos(buffer->write_pos.load(std::memory_order_relaxed))
+            , cached_write_pos(buffer ? buffer->write_pos.load(std::memory_order_relaxed) : 0)
             {
             }
 
@@ -340,14 +337,21 @@ namespace TSP
 
             Reader(Reader<Type, Size>&& other) noexcept
             : buffer(other.buffer)
-            , cached_write_pos(other.buffer->write_pos.load(std::memory_order_relaxed))
+            , cached_write_pos(other.cached_write_pos)
             {
+                other.buffer = nullptr;
             }
+
             Reader& operator=(Reader<Type, Size>&& other) noexcept
             {
-                std::swap(buffer, other.buffer);
-                cached_write_pos = buffer->write_pos.load(std::memory_order_relaxed);
-            };
+                if (this != &other)
+                {
+                    buffer = other.buffer;
+                    cached_write_pos = other.cached_write_pos;
+                    other.buffer = nullptr;
+                }
+                return *this;
+            }
 
             [[nodiscard]] const Type& peek() const
             {
@@ -363,10 +367,9 @@ namespace TSP
                 }
                 backoff.reset();
 
-                // advance without extra checks
-                const auto& ret = peek();
                 const auto current_read = buffer->read_pos.load(std::memory_order_relaxed);
-                const auto next_read = Buffer<Type, align_array_size(Size)>::advanced_pos(current_read);
+                const auto& ret = buffer->data[current_read];
+                const auto next_read = Buffer<Type, Size>::advanced_pos(current_read);
                 buffer->read_pos.store(next_read, std::memory_order_release);
 
                 return ret;
@@ -375,12 +378,11 @@ namespace TSP
             bool try_advance() noexcept
             {
                 const auto current_read = buffer->read_pos.load(std::memory_order_relaxed);
-                const auto next_read = Buffer<Type, align_array_size(Size)>::advanced_pos(current_read);
 
-                if (next_read == cached_write_pos)
+                if (current_read == cached_write_pos)
                 {
                     cached_write_pos = buffer->write_pos.load(std::memory_order_acquire);
-                    if (next_read == cached_write_pos)
+                    if (current_read == cached_write_pos)
                     {
                         return false;
                     }
@@ -391,18 +393,13 @@ namespace TSP
 
             bool advance() noexcept
             {
-                const auto current_read = buffer->read_pos.load(std::memory_order_relaxed);
-                const auto next_read = Buffer<Type, align_array_size(Size)>::advanced_pos(current_read);
-
-                if (next_read == cached_write_pos)
+                if (!try_advance())
                 {
-                    cached_write_pos = buffer->write_pos.load(std::memory_order_acquire);
-                    if (next_read == cached_write_pos)
-                    {
-                        return false;
-                    }
+                    return false;
                 }
 
+                const auto current_read = buffer->read_pos.load(std::memory_order_relaxed);
+                const auto next_read = Buffer<Type, Size>::advanced_pos(current_read);
                 buffer->read_pos.store(next_read, std::memory_order_release);
                 return true;
             }
@@ -412,7 +409,7 @@ namespace TSP
         class Writer final
         {
         private:
-            Buffer<Type, align_array_size(Size)>* buffer;
+            Buffer<Type, Size>* buffer;
             std::uint64_t cached_read_pos;
 
         public:
@@ -421,9 +418,9 @@ namespace TSP
             , cached_read_pos(0) { };
             ~Writer() = default;
 
-            explicit Writer(Buffer<Type, align_array_size(Size)>* buf)
+            explicit Writer(Buffer<Type, Size>* buf)
             : buffer(buf)
-            , cached_read_pos(buffer->read_pos.load(std::memory_order_relaxed))
+            , cached_read_pos(buffer ? buffer->read_pos.load(std::memory_order_relaxed) : 0)
             {
             }
 
@@ -432,12 +429,21 @@ namespace TSP
 
             Writer(Writer<Type, Size>&& other) noexcept
             : buffer(other.buffer)
-            , cached_read_pos(other.buffer->read_pos.load(std::memory_order_relaxed)) { };
+            , cached_read_pos(other.cached_read_pos)
+            {
+                other.buffer = nullptr;
+            }
+
             Writer& operator=(Writer<Type, Size>&& other) noexcept
             {
-                std::swap(buffer, other.buffer);
-                cached_read_pos = buffer->read_pos.load(std::memory_order_relaxed);
-            };
+                if (this != &other)
+                {
+                    buffer = other.buffer;
+                    cached_read_pos = other.cached_read_pos;
+                    other.buffer = nullptr;
+                }
+                return *this;
+            }
 
             template<typename Backoff>
             void insert_with_backoff(const Type& item, Backoff& backoff)
@@ -451,25 +457,20 @@ namespace TSP
                 const auto current_write = buffer->write_pos.load(std::memory_order_relaxed);
                 buffer->data[current_write] = item;
 
-                const auto next_write = Buffer<Type, align_array_size(Size)>::advanced_pos(current_write);
+                const auto next_write = Buffer<Type, Size>::advanced_pos(current_write);
                 buffer->write_pos.store(next_write, std::memory_order_release);
             }
 
             bool insert(const Type& item) noexcept
             {
-                const auto current_write = buffer->write_pos.load(std::memory_order_relaxed);
-
-                if (current_write == cached_read_pos)
+                if (!try_insert())
                 {
-                    cached_read_pos = buffer->read_pos.load(std::memory_order_acquire);
-                    if (current_write == cached_read_pos)
-                    {
-                        return false;
-                    }
+                    return false;
                 }
 
+                const auto current_write = buffer->write_pos.load(std::memory_order_relaxed);
                 buffer->data[current_write] = item;
-                const auto next_write = buffer->advanced_pos(current_write);
+                const auto next_write = Buffer<Type, Size>::advanced_pos(current_write);
                 buffer->write_pos.store(next_write, std::memory_order_release);
                 return true;
             }
@@ -477,11 +478,12 @@ namespace TSP
             bool try_insert() noexcept
             {
                 const auto current_write = buffer->write_pos.load(std::memory_order_relaxed);
+                const auto next_write = Buffer<Type, Size>::advanced_pos(current_write);
 
-                if (current_write == cached_read_pos)
+                if (next_write == cached_read_pos)
                 {
                     cached_read_pos = buffer->read_pos.load(std::memory_order_acquire);
-                    if (current_write == cached_read_pos)
+                    if (next_write == cached_read_pos)
                     {
                         return false;
                     }
@@ -490,5 +492,5 @@ namespace TSP
                 return true;
             }
         };
-    }
-}
+    } // namespace Queue
+} // namespace TSP

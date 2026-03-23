@@ -20,6 +20,8 @@ file(GLOB_RECURSE test_source_files
 # Build unit tests
 add_executable(unit_tests)
 
+target_compile_definitions(unit_tests PRIVATE ZERO_MATE_UNIT_TESTS)
+
 target_sources(unit_tests
     PRIVATE
         ${core_source_files}

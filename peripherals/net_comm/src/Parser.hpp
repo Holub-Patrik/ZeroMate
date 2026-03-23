@@ -107,7 +107,7 @@ public:
 
     std::vector<std::uint8_t> get_packet_data(bool implicit_clock) final
     {
-        std::vector<std::uint8_t> packet{};
+        std::vector<std::uint8_t> packet{ };
 
         if (implicit_clock)
         {

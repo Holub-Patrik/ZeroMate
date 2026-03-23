@@ -21,7 +21,7 @@ using UART_P = struct UART_ProtocolInfo
     std::uint32_t stop_bits{ UINT32_MAX };
 
     // Point-to-point connection
-    struct sockaddr_in other_side{};
+    struct sockaddr_in other_side{ };
     int other_side_fd{ -1 };
 };
 
@@ -62,7 +62,7 @@ public:
 
     inline void process_bit(const std::pair<std::uint8_t, std::uint8_t>& pair, const std::uint32_t& delta)
     {
-        const auto& [bit, pin] = pair;
+        const auto& [pin, bit] = pair;
         uint32_t packed = (delta & MASK_TIME);
         if (bit > 0)
         {
