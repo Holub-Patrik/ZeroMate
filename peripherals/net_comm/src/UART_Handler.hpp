@@ -42,6 +42,7 @@ private:
     std::array<std::uint32_t, MAX_BIT_COUNT> buf{ 0 };
 
     pin_write_t pin_write;
+    const std::atomic<std::uint64_t>* m_total_cycles;
     TSP::BF::Backoff backoff_fast{ 1024 };
 
     std::atomic<bool> running{ false };
@@ -49,9 +50,10 @@ private:
     std::array<int, 2> close_pipe{ -1, -1 };
 
 public:
-    explicit UART_Handler(const UART_P& config, pin_write_t pin_write)
+    explicit UART_Handler(const UART_P& config, pin_write_t pin_write, const std::atomic<std::uint64_t>* total_cycles)
     : config(config)
     , pin_write(std::move(pin_write))
+    , m_total_cycles(total_cycles)
     {
     }
 
@@ -106,9 +108,18 @@ public:
             }
             if (fds[1].revents & POLLIN)
             {
-                receive_datagram(fds[1].fd);
+                if (!receive_datagram(fds[1].fd))
+                {
+                    break;
+                }
             }
         }
+        running = false;
+    }
+
+    [[nodiscard]] bool is_alive() const
+    {
+        return running.load();
     }
 
     void receiver_stop()
@@ -143,13 +154,13 @@ private:
         close_pipe = { -1, -1 };
     }
 
-    void receive_datagram(int fd)
+    bool receive_datagram(int fd)
     {
         std::array<std::uint32_t, MAX_BIT_COUNT> recv_buf{ 0 };
         const auto received = recv(fd, recv_buf.data(), recv_buf.size() * sizeof(uint32_t), 0);
         if (received <= 0)
         {
-            return;
+            return false;
         }
 
         const std::size_t count = received / sizeof(uint32_t);
@@ -159,16 +170,15 @@ private:
             const bool is_high = static_cast<bool>(packed & MASK_BIT_VALUE);
             const std::uint32_t delta = packed & MASK_TIME;
 
-            auto start_wait = std::chrono::high_resolution_clock::now();
-            while (
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - start_wait)
-            .count() < delta)
+            const std::uint64_t start_cycles = m_total_cycles->load();
+            while (m_total_cycles->load() - start_cycles < delta)
             {
                 cpu_relax();
             }
 
             pin_write(config.rx_pin, is_high ? 1 : 0);
         }
+        return true;
     }
 
     void send_datagram()

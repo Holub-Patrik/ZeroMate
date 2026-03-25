@@ -95,15 +95,18 @@ protected:
 
     zero_mate::IExternal_Peripheral::Halt_t halt_func;
     zero_mate::IExternal_Peripheral::Start_t start_func;
+    const std::atomic<std::uint64_t>* m_total_cycles;
 
     I2C_Base(zero_mate::IExternal_Peripheral::Halt_t halt_func,
              zero_mate::IExternal_Peripheral::Start_t start_func,
              pin_write_t pin_write,
-             pin_read_t pin_read)
+             pin_read_t pin_read,
+             const std::atomic<std::uint64_t>* total_cycles)
     : pin_write(std::move(pin_write))
     , pin_read(std::move(pin_read))
     , halt_func(halt_func)
     , start_func(start_func)
+    , m_total_cycles(total_cycles)
     {
     }
 
@@ -147,6 +150,11 @@ public:
             _cleanup();
         }
     }
+
+    [[nodiscard]] bool is_alive() const
+    {
+        return running.load();
+    }
 };
 
 template<std::size_t Size>
@@ -168,8 +176,9 @@ public:
                zero_mate::IExternal_Peripheral::Halt_t halt_func,
                zero_mate::IExternal_Peripheral::Start_t start_func,
                pin_write_t pin_write,
-               pin_read_t pin_read)
-    : I2C_Base(halt_func, start_func, std::move(pin_write), std::move(pin_read))
+               pin_read_t pin_read,
+               const std::atomic<std::uint64_t>* total_cycles)
+    : I2C_Base(halt_func, start_func, std::move(pin_write), std::move(pin_read), total_cycles)
     , config(std::move(config))
     , queue_writer(&queue_buf)
     , queue_reader(&queue_buf)
@@ -224,10 +233,15 @@ public:
             {
                 if (fds[i].revents & POLLIN)
                 {
-                    receive_from_slave(fds[i].fd);
+                    if (!receive_from_slave(fds[i].fd))
+                    {
+                        running = false;
+                        break;
+                    }
                 }
             }
         }
+        running = false;
     }
 
 private:
@@ -358,7 +372,7 @@ private:
         }
     }
 
-    void receive_from_slave(const int fd)
+    bool receive_from_slave(const int fd)
     {
         I2C_Packet packet{ };
         ssize_t n = recv(fd, &packet, sizeof(packet), 0);
@@ -403,7 +417,9 @@ private:
                 }
             }
             start_func();
+            return true;
         }
+        return false;
     }
 };
 
@@ -421,8 +437,9 @@ public:
               zero_mate::IExternal_Peripheral::Halt_t halt_func,
               zero_mate::IExternal_Peripheral::Start_t start_func,
               pin_write_t pin_write,
-              pin_read_t pin_read)
-    : I2C_Base(halt_func, start_func, std::move(pin_write), std::move(pin_read))
+              pin_read_t pin_read,
+              const std::atomic<std::uint64_t>* total_cycles)
+    : I2C_Base(halt_func, start_func, std::move(pin_write), std::move(pin_read), total_cycles)
     , config(std::move(config))
     {
     }
@@ -461,19 +478,23 @@ public:
             }
             if (fds[1].revents & POLLIN)
             {
-                receive_from_master(config.master_fd);
+                if (!receive_from_master(config.master_fd))
+                {
+                    break;
+                }
             }
         }
+        running = false;
     }
 
 private:
-    void receive_from_master(int fd)
+    [[nodiscard]] bool receive_from_master(int fd)
     {
         I2C_Packet packet{ };
         const auto received = recv(fd, &packet, sizeof(packet), 0);
         if (received != sizeof(packet))
         {
-            return;
+            return false;
         }
 
         switch (packet.type)
@@ -518,6 +539,7 @@ private:
             default:
                 break;
         }
+        return true;
     }
 
     void send_packet(I2C_Packet_Type type, uint8_t value)
@@ -525,6 +547,14 @@ private:
         I2C_Packet packet{ type, value };
         send(config.master_fd, &packet, sizeof(packet), 0);
     }
+
+    // TODO: All of the following functions have a major misunderstaing of the emulator behaviour
+    // Bits shouldn't be read like this. The emulator under the hood might not respond to bit banging immedietly.
+    // Instead what should be done (and as was done originally), is to send timing, along the clock signals,
+    // And then using those timing, clock signals should be spaced. The bit should be read from a current state
+    // that would be updated by a callback from the emulator. If the emulator doesn't update that variable it's last
+    // state would be read. (For I2C this means that the value should be readable after the rising edge, as the signal
+    // should be stable from rising to falling)
 
     void bit_bang_byte_local(uint8_t value)
     {

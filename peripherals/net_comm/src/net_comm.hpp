@@ -15,6 +15,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <array>
+#include <optional>
+#include <unordered_map>
 
 #ifndef ZERO_MATE_UNIT_TESTS
     #include "imgui.h"
@@ -91,8 +93,7 @@ namespace handshake
         ProtocolID protocol_id;
         std::uint16_t port;
         std::uint32_t net_id;
-        union
-        {
+        union {
             UARTConfig uart;
             I2CConfig i2c;
         } config;
@@ -118,11 +119,9 @@ using conn_id = std::uint64_t;
 using pin_pair = std::pair<std::uint8_t, std::uint8_t>;
 
 template<std::size_t QUEUE_SIZE>
-using protocol_variant = std::variant<std::unique_ptr<UART_Handler<QUEUE_SIZE>>,
-                                      std::unique_ptr<I2C_Master<QUEUE_SIZE>>,
-                                      std::unique_ptr<I2C_Slave<QUEUE_SIZE>>>;
+using protocol_variant = std::variant<UART_Handler<QUEUE_SIZE>, I2C_Master<QUEUE_SIZE>, I2C_Slave<QUEUE_SIZE>>;
 
-template<typename Type, std::size_t Size>
+template<typename Type, std::size_t Size, typename Handler>
 class BitProcessor final
 {
 public:
@@ -130,18 +129,21 @@ public:
     using pin_read_t = std::function<std::uint8_t(std::uint8_t)>;
 
 private:
-    protocol_variant<Size> handler;
+    Handler handler;
     TSP::Queue::Reader<Type, Size> queue_reader;
     TSP::BF::SemBackoff backoff;
+    const std::atomic<std::uint64_t>* m_total_cycles;
 
     std::atomic<bool> running{ false };
     std::thread sender;
 
 public:
-    BitProcessor(protocol_variant<Size> variant, TSP::Queue::Buffer<Type, Size>* buf)
-    : handler(std::move(variant))
+    template<typename... Args>
+    BitProcessor(TSP::Queue::Buffer<Type, Size>* buf, const std::atomic<std::uint64_t>* total_cycles, Args&&... args)
+    : handler(std::forward<Args>(args)...)
     , queue_reader(buf)
     , backoff(100, 1000)
+    , m_total_cycles(total_cycles)
     {
     }
 
@@ -159,8 +161,8 @@ public:
     void start()
     {
         running = true;
-        sender = std::thread{ &BitProcessor<Type, Size>::run_sender, this };
-        std::visit([](auto& h) -> void { h->start_receiver(); }, handler);
+        sender = std::thread{ &BitProcessor<Type, Size, Handler>::run_sender, this };
+        handler.start_receiver();
     }
 
     void stop()
@@ -173,14 +175,19 @@ public:
                 sender.join();
             }
 
-            std::visit([](auto& h) -> void { h->receiver_stop(); }, handler);
+            handler.receiver_stop();
         }
+    }
+
+    [[nodiscard]] bool is_running() const
+    {
+        return running.load() && handler.is_alive();
     }
 
 private:
     void run_sender()
     {
-        auto last_time = std::chrono::high_resolution_clock::now();
+        std::uint64_t last_cycles = m_total_cycles->load();
 
         while (running)
         {
@@ -194,11 +201,10 @@ private:
             const auto pair = queue_reader.peek();
             queue_reader.advance();
 
-            const auto now = std::chrono::high_resolution_clock::now();
-            const auto delta =
-            static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_time).count());
-            last_time = now;
-            std::visit([pair, delta](auto& h) -> void { h->process_bit(pair, delta); }, handler);
+            const std::uint64_t now_cycles = m_total_cycles->load();
+            const auto delta = static_cast<std::uint32_t>(now_cycles - last_cycles);
+            last_cycles = now_cycles;
+            handler.process_bit(pair, delta);
         }
     }
 };
@@ -215,7 +221,6 @@ public:
     static constexpr std::size_t QUEUE_SIZE = 64;
 
 private:
-    // Pin write entirely here since there will be multiple writers, so spinlock is added to ensure safety
     TSP::Queue::Buffer<pin_pair, QUEUE_SIZE> pin_write_queue_buf{ };
     TSP::Queue::Reader<pin_pair, QUEUE_SIZE> pin_write_queue_reader;
     TSP::Queue::Writer<pin_pair, QUEUE_SIZE> pin_write_queue_writer;
@@ -229,44 +234,49 @@ private:
     std::array<TSP::Queue::Writer<pin_pair, BUFFER_SIZE>, BUFFER_COUNT> out_queue_writers;
 
     // this could be converted into a bit map, but bit instruction are extra instructions
-    std::array<bool, MAX_CONNECTION_COUNT> connection_bit_map{ };
+    std::array<bool, MAX_CONNECTION_COUNT> connection_bit_map{ false };
 
-    // abuse std::destroy_at{} and std::construct_at{} to use arrays
     std::array<std::thread, MAX_CONNECTION_COUNT> connection_threads;
     std::array<conn_info, MAX_CONNECTION_COUNT> connection_data;
-    std::array<std::unique_ptr<std::atomic<bool>>, MAX_CONNECTION_COUNT> connection_running;
+    std::array<std::atomic<bool>, MAX_CONNECTION_COUNT> connection_running;
 
     FastMap pin_to_conn_id;
     FastMap net_id_to_conn_id;
+    std::unordered_map<std::uint32_t, std::size_t> m_net_id_to_idx;
 
     zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin;
     zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t func_read_pin;
     zero_mate::IExternal_Peripheral::Halt_t func_halt;
     zero_mate::IExternal_Peripheral::Start_t func_start;
     zero_mate::utils::CLogging_System* logging_system;
+    const std::atomic<std::uint64_t>* m_total_cycles;
 
     std::atomic<bool> m_running{ true };
     std::thread m_pin_write_thread;
     int m_handshake_socket{ -1 };
     uint16_t m_handshake_port{ 0 };
 
+    // Pin write entirely here since there will be multiple writers, so spinlock is added to ensure safety
     void pin_write();
-    void unmap_connection(std::size_t i);
+    void unmap_connection(const std::size_t conn_index);
+    [[nodiscard]] std::uint8_t find_free_index() const noexcept;
 
     // Handshake helpers
     void handle_handshake();
     void handle_conf_msg(const handshake::ConfMessage& msg, const struct sockaddr_in& addr);
     void handle_response_msg(const handshake::ResponseMessage& msg, const struct sockaddr_in& addr);
     void handle_final_response_msg(const handshake::FinalResponseMessage& msg, const struct sockaddr_in& addr);
+    void cleanup_finished_connections();
 
 public:
     GPIOServer() = delete;
 
-    explicit GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin,
-                        zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t func_read_pin,
-                        zero_mate::IExternal_Peripheral::Halt_t func_halt,
-                        zero_mate::IExternal_Peripheral::Start_t func_start,
-                        zero_mate::utils::CLogging_System* logging_system);
+    GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin,
+               zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t func_read_pin,
+               zero_mate::IExternal_Peripheral::Halt_t func_halt,
+               zero_mate::IExternal_Peripheral::Start_t func_start,
+               zero_mate::utils::CLogging_System* logging_system,
+               const std::atomic<std::uint64_t>* total_cycles);
     ~GPIOServer();
 
     GPIOServer(const GPIOServer& other) = delete;
@@ -334,7 +344,14 @@ private:
 
     std::atomic<bool>& m_server_running;
     std::atomic<bool>& m_connection_running;
-    std::unique_ptr<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE>> m_processor;
+    const std::atomic<std::uint64_t>* m_total_cycles;
+
+    using processor_t =
+    std::variant<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE, UART_Handler<GPIOServer::BUFFER_SIZE>>,
+                 BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE, I2C_Master<GPIOServer::BUFFER_SIZE>>,
+                 BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE, I2C_Slave<GPIOServer::BUFFER_SIZE>>>;
+
+    std::optional<processor_t> m_processor;
 
 public:
     GPIOConnection() = delete;
@@ -345,7 +362,8 @@ public:
                    zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
                    GPIOServer& server,
                    std::atomic<bool>& server_running,
-                   std::atomic<bool>& connection_running);
+                   std::atomic<bool>& connection_running,
+                   const std::atomic<std::uint64_t>* total_cycles);
 
     ~GPIOConnection();
 
@@ -422,6 +440,7 @@ private:
 #endif
 
     std::atomic<bool> m_running{ true };
+    std::atomic<std::uint64_t> m_total_cycles{ 0 };
     GPIOServer server;
     std::thread server_thread;
 
