@@ -90,6 +90,7 @@ namespace handshake
         std::uint8_t magic = MAGIC_BYTE;
         ProtocolID protocol_id;
         std::uint16_t port;
+        std::uint32_t net_id;
         union
         {
             UARTConfig uart;
@@ -102,12 +103,14 @@ namespace handshake
         std::uint8_t magic = MAGIC_BYTE;
         std::uint8_t status; // 1: Accept, 0: Decline
         std::uint16_t port;
+        std::uint32_t net_id;
     } __attribute__((packed));
 
     struct FinalResponseMessage
     {
         std::uint8_t magic = MAGIC_BYTE;
         std::uint8_t status; // 1: Accept, 0: Decline
+        std::uint32_t net_id;
     } __attribute__((packed));
 }
 
@@ -245,7 +248,7 @@ private:
     std::atomic<bool> m_running{ true };
     std::thread m_pin_write_thread;
     int m_handshake_socket{ -1 };
-    uint16_t m_handshake_port{ 12344 };
+    uint16_t m_handshake_port{ 0 };
 
     void pin_write();
     void unmap_connection(std::size_t i);
@@ -272,6 +275,8 @@ public:
     GPIOServer(GPIOServer&& other) = delete;
     GPIOServer& operator=(GPIOServer&& other) = delete;
 
+    void Init(uint16_t handshake_port);
+    [[nodiscard]] bool Is_Initialized() const noexcept;
     void write_to_pin(const std::uint8_t pin, const std::uint8_t value);
     void route_pin_info(const pin_pair pin_info);
     void add_connection(const conn_info& info);
@@ -425,6 +430,7 @@ private:
     struct AddConnectionState
     {
         int protocol_type = 0; // 0: UART, 1: I2C Master, 2: I2C Slave
+        int net_id = 1;
 
         // UART
         int baudrate = 115200;
@@ -445,6 +451,7 @@ private:
     } m_ui_add_state;
 
     int m_ui_view_idx{ -1 };
+    int m_ui_handshake_port{ 12344 };
 
     int ui_selected_local_pin_idx{ 0 };
     int ui_target_net_pin{ 0 };

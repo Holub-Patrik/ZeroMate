@@ -189,7 +189,16 @@ GPIOServer::GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_
         std::construct_at(&out_queue_writers[i], &out_queue_buffers[i]);
         connection_running[i] = std::make_unique<std::atomic<bool>>(false);
     }
+}
 
+void GPIOServer::Init(uint16_t handshake_port)
+{
+    if (m_handshake_socket != -1)
+    {
+        return;
+    }
+
+    m_handshake_port = handshake_port;
     m_handshake_socket = socket(AF_INET, SOCK_DGRAM, 0);
     if (m_handshake_socket != -1)
     {
@@ -201,7 +210,9 @@ GPIOServer::GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_
         {
             if (logging_system)
             {
-                logging_system->Error("Handshake port 12344 is already in use. Failed to start GPIOServer.");
+                std::string log_msg = "Handshake port " + std::to_string(m_handshake_port) +
+                                      " is already in use. Failed to start GPIOServer.";
+                logging_system->Error(log_msg.c_str());
             }
             close(m_handshake_socket);
             m_handshake_socket = -1;
@@ -212,6 +223,11 @@ GPIOServer::GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_
             logging_system->Info(log_msg.c_str());
         }
     }
+}
+
+bool GPIOServer::Is_Initialized() const noexcept
+{
+    return m_handshake_socket != -1;
 }
 
 void GPIOServer::unmap_connection(std::size_t i)
@@ -299,6 +315,7 @@ void GPIOServer::initiate_handshake(const conn_info& info)
 
     handshake::ConfMessage msg{ };
     msg.port = 0; // Will be filled by OS when we bind data socket
+    msg.net_id = info.net_id;
 
     // Find a free port for data by opening a temporary socket
     int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -370,6 +387,11 @@ void GPIOServer::initiate_handshake(const conn_info& info)
 
 void GPIOServer::handle_handshake()
 {
+    if (m_handshake_socket == -1)
+    {
+        return;
+    }
+
     struct pollfd pfd = { .fd = m_handshake_socket, .events = POLLIN, .revents = 0 };
     if (poll(&pfd, 1, 10) > 0)
     {
@@ -400,10 +422,33 @@ void GPIOServer::handle_conf_msg(const handshake::ConfMessage& msg, const struct
 {
     // Responder side
     handshake::ResponseMessage resp{ };
-    resp.status = 1; // Accept by default
+    resp.status = 0; // Decline by default
+    resp.net_id = msg.net_id;
 
-    // Check for Master-Master conflict
-    // (In a real scenario we might check local capabilities)
+    // Look for a pre-defined connection with the same net_id
+    int found_idx = -1;
+    for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; i++)
+    {
+        if (connection_bit_map[i] && connection_data[i].status == ConnectionStatus::Defined &&
+            connection_data[i].net_id == msg.net_id)
+        {
+            found_idx = static_cast<int>(i);
+            break;
+        }
+    }
+
+    if (found_idx == -1)
+    {
+        if (logging_system)
+        {
+            std::string log_msg = "Received handshake for unknown Connection ID: " + std::to_string(msg.net_id);
+            logging_system->Warning(log_msg.c_str());
+        }
+        sendto(m_handshake_socket, &resp, sizeof(resp), 0, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr));
+        return;
+    }
+
+    resp.status = 1; // Accept
 
     uint16_t data_port = 0;
     int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -420,8 +465,8 @@ void GPIOServer::handle_conf_msg(const handshake::ConfMessage& msg, const struct
     resp.port = data_port;
     sendto(m_handshake_socket, &resp, sizeof(resp), 0, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr));
 
-    // Create a pending connection
-    conn_info info{ };
+    // Update the found connection
+    auto& info = connection_data[found_idx];
     info.remote_ip = inet_ntoa(addr.sin_addr);
     info.remote_port = ntohs(addr.sin_port);
     info.opened_port = data_port;
@@ -431,46 +476,23 @@ void GPIOServer::handle_conf_msg(const handshake::ConfMessage& msg, const struct
 
     if (logging_system)
     {
-        std::string log_msg = "Accepted connection from " + info.remote_ip + ":" + std::to_string(info.remote_port);
+        std::string log_msg = "Accepted connection " + std::to_string(msg.net_id) + " from " + info.remote_ip + ":" +
+                              std::to_string(info.remote_port);
         log_msg += " (Data port: " + std::to_string(info.opened_port) + ")";
         logging_system->Info(log_msg.c_str());
     }
 
-    if (msg.protocol_id == handshake::ProtocolID::UART)
-    {
-        UART_P p{ };
-        p.baudrate = msg.config.uart.baudrate;
-        p.data_bits = msg.config.uart.data_bits;
-        p.start_bits = msg.config.uart.start_bits;
-        p.parity_bits = msg.config.uart.parity_bits;
-        p.stop_bits = msg.config.uart.stop_bits;
-        p.other_side = addr;
-        p.other_side.sin_port = htons(msg.port);
-        info.protocol = p;
-    }
-    else if (msg.protocol_id == handshake::ProtocolID::I2C_Master)
-    {
-        I2C_Slave_P p{ }; // Initiator is master, we are slave
-        p.id = msg.config.i2c.bus_id;
-        p.address = msg.config.i2c.address;
-        info.protocol = p;
-    }
-    else if (msg.protocol_id == handshake::ProtocolID::I2C_Slave)
-    {
-        I2C_Master_P p{ }; // Initiator is slave, we are master
-        p.id = msg.config.i2c.bus_id;
-        info.protocol = p;
-    }
-
-    for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; i++)
-    {
-        if (!connection_bit_map[i])
+    // Update remote port for data based on initiator's msg.port
+    std::visit(
+    [&msg, &addr](auto& p) {
+        using T = std::remove_cvref_t<decltype(p)>;
+        if constexpr (std::is_same_v<T, UART_P>)
         {
-            connection_bit_map[i] = true;
-            connection_data[i] = info;
-            return;
+            p.other_side = addr;
+            p.other_side.sin_port = htons(msg.port);
         }
-    }
+    },
+    info.protocol);
 }
 
 void GPIOServer::handle_response_msg(const handshake::ResponseMessage& msg, const struct sockaddr_in& addr)
@@ -479,13 +501,15 @@ void GPIOServer::handle_response_msg(const handshake::ResponseMessage& msg, cons
     for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; i++)
     {
         if (connection_bit_map[i] && connection_data[i].status == ConnectionStatus::Connecting &&
-            !connection_data[i].is_responder)
+            !connection_data[i].is_responder && connection_data[i].net_id == msg.net_id)
         {
-            // Verify it's from the same IP
-            if (connection_data[i].remote_ip == inet_ntoa(addr.sin_addr))
+            // Verify it's from the same IP and port
+            if (connection_data[i].remote_ip == inet_ntoa(addr.sin_addr) &&
+                connection_data[i].remote_port == ntohs(addr.sin_port))
             {
                 handshake::FinalResponseMessage final_resp{ };
                 final_resp.status = msg.status;
+                final_resp.net_id = msg.net_id;
                 sendto(m_handshake_socket,
                        &final_resp,
                        sizeof(final_resp),
@@ -537,9 +561,10 @@ void GPIOServer::handle_final_response_msg(const handshake::FinalResponseMessage
     for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; i++)
     {
         if (connection_bit_map[i] && connection_data[i].status == ConnectionStatus::Connecting &&
-            connection_data[i].is_responder)
+            connection_data[i].is_responder && connection_data[i].net_id == msg.net_id)
         {
-            if (connection_data[i].remote_ip == inet_ntoa(addr.sin_addr))
+            if (connection_data[i].remote_ip == inet_ntoa(addr.sin_addr) &&
+                connection_data[i].remote_port == ntohs(addr.sin_port))
             {
                 if (msg.status == 1)
                 {
@@ -793,6 +818,20 @@ void Remote_GPIO::Render()
 
 void Remote_GPIO::Render_Settings()
 {
+    if (!server.Is_Initialized())
+    {
+        ImGui::Text("Server Configuration");
+        ImGui::InputInt("Handshake Port", &m_ui_handshake_port);
+        if (ImGui::Button("Start Server"))
+        {
+            server.Init(static_cast<uint16_t>(m_ui_handshake_port));
+        }
+        return;
+    }
+
+    ImGui::Text("Server listening on port: %d", m_ui_handshake_port);
+    ImGui::Separator();
+
     if (ImGui::Button("Add Connection"))
     {
         ImGui::OpenPopup("Add Connection");
@@ -876,6 +915,7 @@ void Remote_GPIO::Render_Settings()
     if (ImGui::BeginPopupModal("Add Connection", NULL, ImGuiWindowFlags_AlwaysAutoResize))
     {
         ImGui::Combo("Protocol", &m_ui_add_state.protocol_type, "UART\0I2C Master\0I2C Slave\0\0");
+        ImGui::InputInt("Connection ID", &m_ui_add_state.net_id);
 
         if (m_ui_add_state.protocol_type == 0) // UART
         {
@@ -912,6 +952,7 @@ void Remote_GPIO::Render_Settings()
             conn_info info{ };
             info.remote_ip = m_ui_add_state.ip;
             info.remote_port = m_ui_add_state.port;
+            info.net_id = static_cast<uint32_t>(m_ui_add_state.net_id);
 
             if (m_ui_add_state.protocol_type == 0)
             {
@@ -967,6 +1008,7 @@ void Remote_GPIO::Render_Settings()
             const auto& conn = data[m_ui_view_idx];
             ImGui::Text("Remote IP: %s", conn.remote_ip.c_str());
             ImGui::Text("Handshake Port: %d", conn.remote_port);
+            ImGui::Text("Connection ID: %u", conn.net_id);
             ImGui::Separator();
 
             std::visit(
