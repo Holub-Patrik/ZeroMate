@@ -20,27 +20,34 @@ namespace
     };
 }
 
-void GPIOServer::pin_write()
+void GPIOServer::pin_write(const std::stop_token& stop_token)
 {
     // tries to read from the queue
     // if nothing comes for a long enough time, start sleeping on a semaphore
-    while (m_running.load())
+    while (!stop_token.stop_requested())
     {
-        const auto [pin, value] = pin_write_queue_reader.read(backoff_sem);
-        if (!m_running.load())
+        if (!pin_write_queue_reader.try_advance())
         {
-            break;
+            m_pin_write_reader_backoff.wait(
+            [this, &stop_token]() { return stop_token.stop_requested() || pin_write_queue_reader.try_advance(); });
+            continue;
         }
-        func_set_pin(static_cast<std::uint32_t>(pin), value > 0);
+        m_pin_write_reader_backoff.reset();
+
+        const auto pair = pin_write_queue_reader.peek();
+        pin_write_queue_reader.advance();
+        m_pin_write_writer_backoff.wake();
+
+        func_set_pin(static_cast<std::uint32_t>(pair.first), pair.second > 0);
     }
 }
 
 void GPIOServer::write_to_pin(const std::uint8_t pin, const std::uint8_t value)
 {
     pin_write_spinlock.lock();
-    pin_write_queue_writer.insert_with_backoff({ pin, value }, backoff_fast);
+    pin_write_queue_writer.insert_with_backoff({ pin, value }, m_pin_write_writer_backoff);
     // if the time before insertion was too long, wake up the reader
-    backoff_sem.wake();
+    m_pin_write_reader_backoff.wake();
     pin_write_spinlock.unlock();
 }
 
@@ -55,13 +62,10 @@ void GPIOServer::route_pin_info(const pin_pair pin_info)
     }
 
     auto& writer_ref = out_queue_writers[conn_id_idx];
-    while (!writer_ref.try_insert())
-    {
-        backoff_fast.wait();
-    }
-    backoff_fast.reset();
+    auto& backoffs = m_backoffs[conn_id_idx];
 
-    writer_ref.insert(pin_info);
+    writer_ref.insert_with_backoff(pin_info, backoffs.out_queue_writer);
+    backoffs.out_queue_reader.wake();
 }
 
 void GPIOServer::add_connection(const conn_info& info)
@@ -72,6 +76,7 @@ void GPIOServer::add_connection(const conn_info& info)
         connection_bit_map[index] = true;
         connection_data[index] = info;
         connection_data[index].status = ConnectionStatus::Defined;
+        connection_data[index].sockfd = -1;
         m_net_id_to_idx[info.net_id] = index;
     }
 }
@@ -162,9 +167,13 @@ void GPIOServer::remove_connection(std::size_t i)
     }
 
     connection_running[i].store(false);
-    if (connection_threads[i].joinable())
+    connection_threads[i].request_stop();
+    m_backoffs[i].out_queue_reader.wake();
+
+    if (connection_data[i].sockfd != -1)
     {
-        connection_threads[i].join();
+        close(connection_data[i].sockfd);
+        connection_data[i].sockfd = -1;
     }
 
     unmap_connection(i);
@@ -214,17 +223,9 @@ void GPIOServer::construct_connection(const conn_info& info)
         connection_running[idx].store(true);
         std::visit(construct_visitor, connection_data[idx].protocol);
 
-        connection_threads[idx] = std::thread([this, idx]() {
-            GPIOConnection conn(connection_data[idx],
-                                &out_queue_buffers[idx],
-                                func_halt,
-                                func_start,
-                                func_read_pin,
-                                *this,
-                                m_running,
-                                connection_running[idx],
-                                m_total_cycles);
-            conn.run();
+        connection_threads[idx] = std::jthread([this, idx](std::stop_token stop_token) {
+            GPIOConnection conn(idx, *this);
+            conn.run(stop_token);
         });
     }
 }
@@ -250,26 +251,26 @@ void GPIOServer::initiate_handshake(const conn_info& info)
 
     handshake::ConfMessage msg{ };
     msg.net_id = info.net_id;
+    msg.type = handshake::MessageType::Conf;
 
     // Port handling
-    int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in temp_addr{ };
-    temp_addr.sin_family = AF_INET;
-    temp_addr.sin_addr.s_addr = INADDR_ANY;
-    temp_addr.sin_port = 0;
-    bind(temp_sock, reinterpret_cast<struct sockaddr*>(&temp_addr), sizeof(temp_addr));
-    socklen_t len = sizeof(temp_addr);
-    getsockname(temp_sock, reinterpret_cast<struct sockaddr*>(&temp_addr), &len);
-    msg.port = ntohs(temp_addr.sin_port);
-    close(temp_sock);
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in addr{ };
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = 0;
+    bind(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    socklen_t len = sizeof(addr);
+    getsockname(sock, reinterpret_cast<struct sockaddr*>(&addr), &len);
+    msg.port = ntohs(addr.sin_port);
 
-    const auto visitor = overloads{ [&msg](const UART_P& p) {
+    const auto visitor = overloads{ [&msg](const UART_P& protocol) {
                                        msg.protocol_id = handshake::ProtocolID::UART;
-                                       msg.config.uart.baudrate = p.baudrate;
-                                       msg.config.uart.data_bits = static_cast<uint8_t>(p.data_bits);
-                                       msg.config.uart.start_bits = static_cast<uint8_t>(p.start_bits);
-                                       msg.config.uart.parity_bits = static_cast<uint8_t>(p.parity_bits);
-                                       msg.config.uart.stop_bits = static_cast<uint8_t>(p.stop_bits);
+                                       msg.config.uart.baudrate = protocol.baudrate;
+                                       msg.config.uart.data_bits = static_cast<uint8_t>(protocol.data_bits);
+                                       msg.config.uart.start_bits = static_cast<uint8_t>(protocol.start_bits);
+                                       msg.config.uart.parity_bits = static_cast<uint8_t>(protocol.parity_bits);
+                                       msg.config.uart.stop_bits = static_cast<uint8_t>(protocol.stop_bits);
                                    },
                                     [&msg](const I2C_Master_P& p) {
                                         msg.protocol_id = handshake::ProtocolID::I2C_Master;
@@ -304,6 +305,7 @@ void GPIOServer::initiate_handshake(const conn_info& info)
     conn.opened_port = msg.port;
     conn.is_responder = false;
     conn.start_time = std::chrono::steady_clock::now();
+    conn.sockfd = sock;
 }
 
 void GPIOServer::handle_handshake()
@@ -323,19 +325,37 @@ void GPIOServer::handle_handshake()
         recvfrom(m_handshake_socket, buf, sizeof(buf), 0, reinterpret_cast<struct sockaddr*>(&addr), &addr_len);
         if (bytes_received > 0 && buf[0] == handshake::MAGIC_BYTE)
         {
-            // TODO: If all the messages have as 1st member the type of the message, why are we testing the length
-            // here?????
-            if (bytes_received == sizeof(handshake::ConfMessage))
+            const auto* msg = reinterpret_cast<const handshake::ConfMessage*>(buf);
+
+            switch (msg->type)
             {
-                handle_conf_msg(*reinterpret_cast<handshake::ConfMessage*>(buf), addr);
-            }
-            else if (bytes_received == sizeof(handshake::ResponseMessage))
-            {
-                handle_response_msg(*reinterpret_cast<handshake::ResponseMessage*>(buf), addr);
-            }
-            else if (bytes_received == sizeof(handshake::FinalResponseMessage))
-            {
-                handle_final_response_msg(*reinterpret_cast<handshake::FinalResponseMessage*>(buf), addr);
+                case handshake::MessageType::Conf:
+                    if (bytes_received == sizeof(handshake::ConfMessage))
+                    {
+                        handle_conf_msg(*msg, addr);
+                    }
+                    break;
+
+                case handshake::MessageType::Response:
+                    if (bytes_received == sizeof(handshake::ResponseMessage))
+                    {
+                        handle_response_msg(*reinterpret_cast<const handshake::ResponseMessage*>(buf), addr);
+                    }
+                    break;
+
+                case handshake::MessageType::FinalResponse:
+                    if (bytes_received == sizeof(handshake::FinalResponseMessage))
+                    {
+                        handle_final_response_msg(*reinterpret_cast<const handshake::FinalResponseMessage*>(buf), addr);
+                    }
+                    break;
+
+                default:
+                    if (logging_system)
+                    {
+                        logging_system->Warning("Received unknown handshake message type.");
+                    }
+                    break;
             }
         }
     }
@@ -377,17 +397,15 @@ void GPIOServer::handle_conf_msg(const handshake::ConfMessage& msg, const struct
 
     resp.status = 1; // Accept
 
-    uint16_t data_port = 0;
-    int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in temp_addr{ };
     temp_addr.sin_family = AF_INET;
     temp_addr.sin_addr.s_addr = INADDR_ANY;
     temp_addr.sin_port = 0;
-    bind(temp_sock, reinterpret_cast<struct sockaddr*>(&temp_addr), sizeof(temp_addr));
+    bind(sock, reinterpret_cast<struct sockaddr*>(&temp_addr), sizeof(temp_addr));
     socklen_t len = sizeof(temp_addr);
-    getsockname(temp_sock, reinterpret_cast<struct sockaddr*>(&temp_addr), &len);
-    data_port = ntohs(temp_addr.sin_port);
-    close(temp_sock);
+    getsockname(sock, reinterpret_cast<struct sockaddr*>(&temp_addr), &len);
+    const uint16_t data_port = ntohs(temp_addr.sin_port);
 
     resp.port = data_port;
     sendto(m_handshake_socket, &resp, sizeof(resp), 0, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr));
@@ -400,6 +418,7 @@ void GPIOServer::handle_conf_msg(const handshake::ConfMessage& msg, const struct
     info.status = ConnectionStatus::Connecting;
     info.is_responder = true;
     info.start_time = std::chrono::steady_clock::now();
+    info.sockfd = sock;
 
     if (logging_system)
     {
@@ -469,6 +488,11 @@ void GPIOServer::handle_response_msg(const handshake::ResponseMessage& msg, cons
             else
             {
                 conn_data.status = ConnectionStatus::Failed;
+                if (conn_data.sockfd != -1)
+                {
+                    close(conn_data.sockfd);
+                    conn_data.sockfd = -1;
+                }
                 m_net_id_to_idx.erase(conn_data.net_id);
                 connection_bit_map[i] = false;
             }
@@ -505,8 +529,13 @@ void GPIOServer::handle_final_response_msg(const handshake::FinalResponseMessage
             }
             else
             {
+                if (connection_data[i].sockfd != -1)
+                {
+                    close(connection_data[i].sockfd);
+                    connection_data[i].sockfd = -1;
+                }
                 connection_data[i].status = ConnectionStatus::Failed;
-                m_net_id_to_idx.erase(conn_data.net_id);
+                m_net_id_to_idx.erase(connection_data[i].net_id);
                 connection_bit_map[i] = false;
             }
         }
@@ -517,10 +546,8 @@ void GPIOServer::cleanup_finished_connections()
 {
     for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; i++)
     {
-        if (connection_bit_map[i] && !connection_running[i].load() && connection_threads[i].joinable())
+        if (connection_bit_map[i] && !connection_running[i].load())
         {
-            connection_threads[i].join();
-
             // If it was a responder, or it failed, we might want to remove it
             // For now, if it's not running, we set status to Defined if it was Connected
             if (connection_data[i].status == ConnectionStatus::Connected)
@@ -538,41 +565,30 @@ void GPIOServer::cleanup_finished_connections()
     }
 }
 
-void GPIOServer::run()
+void GPIOServer::run(const std::stop_token& stop_token)
 {
-    m_pin_write_thread = std::thread([this]() {
-        while (m_running.load())
-        {
-            pin_write();
-        }
-    });
+    m_pin_write_thread = std::jthread([this](const std::stop_token& stop_token) { pin_write(stop_token); });
 
-    while (m_running.load())
+    while (!stop_token.stop_requested())
     {
         handle_handshake();
         cleanup_finished_connections();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        constexpr std::size_t WAIT_TIME = 10;
+        std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_TIME));
     }
 }
 
 void GPIOServer::stop()
 {
-    m_running.store(false);
-    backoff_sem.wake();
-
-    if (m_pin_write_thread.joinable())
-    {
-        m_pin_write_thread.join();
-    }
+    m_server_thread.request_stop();
+    m_pin_write_thread.request_stop();
+    m_pin_write_reader_backoff.wake();
 
     for (std::size_t i = 0; i < connection_threads.size(); i++)
     {
         connection_running[i].store(false);
-
-        if (connection_threads[i].joinable())
-        {
-            connection_threads[i].join();
-        }
+        connection_threads[i].request_stop();
+        m_backoffs[i].out_queue_reader.wake();
     }
 }
 
@@ -581,38 +597,25 @@ GPIOServer::~GPIOServer()
     stop();
 }
 
-GPIOConnection::GPIOConnection(conn_info& info,
-                               TSP::Queue::Buffer<pin_pair, GPIOServer::BUFFER_SIZE>* buffer,
-                               zero_mate::IExternal_Peripheral::Halt_t halt,
-                               zero_mate::IExternal_Peripheral::Start_t start,
-                               zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
-                               GPIOServer& server,
-                               std::atomic<bool>& server_running,
-                               std::atomic<bool>& connection_running,
-                               const std::atomic<std::uint64_t>* total_cycles)
-: connection(info)
-, m_queue_reader(buffer)
-, m_socket(-1)
-, m_halt(halt)
-, m_start(start)
-, m_read_pin(read_pin)
+GPIOConnection::GPIOConnection(std::size_t idx, GPIOServer& server)
+: connection(server.get_connection_info(idx))
+, m_backoffs(server.get_backoffs(idx))
+, m_queue_reader(server.get_out_queue_buffer(idx))
+, m_socket(connection.sockfd)
+, m_halt(server.get_halt())
+, m_start(server.get_start())
+, m_read_pin(server.get_read_pin())
 , m_server(server)
-, m_server_running(server_running)
-, m_connection_running(connection_running)
-, m_total_cycles(total_cycles)
+, m_server_running(server.is_server_running())
+, m_connection_running(server.is_connection_running(idx))
+, m_total_cycles(server.get_total_cycles())
 {
-    m_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    connection.sockfd = -1; // Take ownership
 
-    if (m_socket != -1 && info.opened_port != 0)
+    if (m_socket != -1 && connection.opened_port != 0)
     {
-        struct sockaddr_in local_addr{ };
-        local_addr.sin_family = AF_INET;
-        local_addr.sin_addr.s_addr = INADDR_ANY;
-        local_addr.sin_port = htons(info.opened_port);
-        bind(m_socket, reinterpret_cast<struct sockaddr*>(&local_addr), sizeof(local_addr));
-
         std::visit(
-        [this, &info](auto& p) {
+        [this](auto& p) {
             using T = std::remove_cvref_t<decltype(p)>;
             if constexpr (std::is_same_v<T, UART_P>)
             {
@@ -623,60 +626,80 @@ GPIOConnection::GPIOConnection(conn_info& info,
                 }
             }
         },
-        info.protocol);
+        connection.protocol);
     }
 
     auto pin_write_cb = [this](std::uint8_t pin, std::uint8_t val) { this->write_to_pin(pin, val); };
     auto pin_read_cb = [this](std::uint8_t pin) { return static_cast<uint8_t>(m_read_pin(pin)); };
 
-    auto local_info = info;
+    const BitProcessorContext<pin_pair, GPIOServer::BUFFER_SIZE> bp_ctx = {
+        .buf = server.get_out_queue_buffer(idx),
+        .total_cycles = m_total_cycles,
+        .reader_backoff = m_backoffs.out_queue_reader,
+        .writer_backoff = m_backoffs.out_queue_writer,
+    };
 
-    if (std::holds_alternative<UART_P>(local_info.protocol))
+    if (std::holds_alternative<UART_P>(connection.protocol))
     {
-        auto& uart_p = std::get<UART_P>(local_info.protocol);
+        auto& uart_p = std::get<UART_P>(connection.protocol);
         uart_p.other_side_fd = m_socket;
+
+        const UART_HandlerContext handler_ctx = {
+            .pin_write = pin_write_cb,
+            .total_cycles = m_total_cycles,
+        };
+
         m_processor.emplace(
         std::in_place_type<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE, UART_Handler<GPIOServer::BUFFER_SIZE>>>,
-        buffer,
-        m_total_cycles,
+        bp_ctx,
         uart_p,
-        pin_write_cb,
-        m_total_cycles);
+        handler_ctx);
     }
-    else if (std::holds_alternative<I2C_Master_P>(local_info.protocol))
+    else if (std::holds_alternative<I2C_Master_P>(connection.protocol))
     {
-        auto& i2c_m = std::get<I2C_Master_P>(local_info.protocol);
+        auto& i2c_m = std::get<I2C_Master_P>(connection.protocol);
         if (i2c_m.slave_fds.empty() && m_socket != -1)
         {
             i2c_m.slave_fds.push_back(m_socket);
         }
+
+        const I2C_HandlerContext handler_ctx = {
+            .halt = m_halt,
+            .start = m_start,
+            .pin_write = pin_write_cb,
+            .pin_read = pin_read_cb,
+            .total_cycles = m_total_cycles,
+            .reader_backoff = m_backoffs.handler_queue_reader,
+            .writer_backoff = m_backoffs.handler_queue_writer,
+        };
+
         m_processor.emplace(
         std::in_place_type<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE, I2C_Master<GPIOServer::BUFFER_SIZE>>>,
-        buffer,
-        m_total_cycles,
+        bp_ctx,
         i2c_m,
-        m_halt,
-        m_start,
-        pin_write_cb,
-        pin_read_cb,
-        m_total_cycles);
+        handler_ctx);
     }
-    else if (std::holds_alternative<I2C_Slave_P>(local_info.protocol))
+    else if (std::holds_alternative<I2C_Slave_P>(connection.protocol))
     {
-        auto& i2c_s = std::get<I2C_Slave_P>(local_info.protocol);
+        auto& i2c_s = std::get<I2C_Slave_P>(connection.protocol);
         i2c_s.master_fd = m_socket;
+
+        const I2C_HandlerContext handler_ctx = {
+            .halt = m_halt,
+            .start = m_start,
+            .pin_write = pin_write_cb,
+            .pin_read = pin_read_cb,
+            .total_cycles = m_total_cycles,
+            .reader_backoff = m_backoffs.out_queue_reader,
+            .writer_backoff = m_backoffs.out_queue_writer,
+        };
+
         m_processor.emplace(
         std::in_place_type<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE, I2C_Slave<GPIOServer::BUFFER_SIZE>>>,
-        buffer,
-        m_total_cycles,
+        bp_ctx,
         i2c_s,
-        m_halt,
-        m_start,
-        pin_write_cb,
-        pin_read_cb,
-        m_total_cycles);
+        handler_ctx);
     }
-    connection = local_info;
 }
 
 GPIOConnection::~GPIOConnection()
@@ -687,14 +710,14 @@ GPIOConnection::~GPIOConnection()
     }
 }
 
-void GPIOConnection::run()
+void GPIOConnection::run(std::stop_token stop_token)
 {
     if (m_processor.has_value())
     {
         std::visit(
-        [this](auto& p) {
+        [this, &stop_token](auto& p) {
             p.start();
-            while (m_server_running.load() && m_connection_running.load() && p.is_running())
+            while (!stop_token.stop_requested() && m_connection_running.load() && p.is_running())
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
@@ -707,7 +730,8 @@ void GPIOConnection::run()
 
 pin_pair GPIOConnection::read_queue()
 {
-    TSP::BF::Backoff backoff(100);
+    constexpr std::size_t wait_cycles = 100;
+    TSP::BF::SemBackoff backoff{ wait_cycles, wait_cycles };
     return m_queue_reader.read(backoff);
 }
 
@@ -751,14 +775,13 @@ Remote_GPIO::Remote_GPIO(const std::string& name,
         m_gpio_subscription.insert(pin);
     }
 
-    server_thread = std::thread(&GPIOServer::run, &server);
+    server_thread = std::jthread([this](std::stop_token stop_token) { server.run(stop_token); });
 }
 
 Remote_GPIO::~Remote_GPIO()
 {
     m_running.store(false);
     server.stop();
-    server_thread.join();
 }
 
 void Remote_GPIO::Set_ImGui_Context(void* context)

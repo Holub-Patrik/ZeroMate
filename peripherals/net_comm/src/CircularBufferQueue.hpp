@@ -37,7 +37,9 @@
 #include <bit>
 #include <chrono>
 #include <cstdint>
-#include <semaphore>
+#include <iostream>
+#include <mutex>
+#include <condition_variable>
 #include <thread>
 
 #define ALIGNMENT 64
@@ -191,7 +193,7 @@ namespace TSP
             SleepBackoff& operator=(SleepBackoff&& other) = delete;
 
             template<typename Predicate>
-            void wait_impl(Predicate&& /*pred*/)
+            void wait_impl(Predicate&& /*pred*/) noexcept
             {
                 wait_impl();
             }
@@ -234,8 +236,9 @@ namespace TSP
             std::uint64_t cycles_fast{ 0 };
             std::uint64_t cycles_relaxed{ 0 };
 
-            std::binary_semaphore sem{ 0 };
-            std::atomic<bool> is_sleeping{ false };
+            std::atomic<std::uint32_t> m_notification_count{ 0 };
+            std::atomic<bool> m_is_sleeping{ false };
+            std::string name;
 
         public:
             SemBackoff() = delete;
@@ -247,9 +250,12 @@ namespace TSP
             SemBackoff(SemBackoff&&) = delete;
             SemBackoff& operator=(SemBackoff&&) = delete;
 
-            explicit SemBackoff(const std::uint64_t max_cycles_fast, const std::uint64_t max_cycles_relaxed)
+            explicit SemBackoff(const std::uint64_t max_cycles_fast,
+                                const std::uint64_t max_cycles_relaxed,
+                                std::string name = "unknown")
             : max_cycles_fast(max_cycles_fast)
             , max_cycles_relaxed(max_cycles_relaxed)
+            , name(std::move(name))
             {
             }
 
@@ -269,29 +275,33 @@ namespace TSP
                     return;
                 }
 
-                is_sleeping.store(true, std::memory_order_seq_cst);
-                if (condition())
+                std::uint32_t last_count = m_notification_count.load(std::memory_order_acquire);
+
+                m_is_sleeping.store(true, std::memory_order_seq_cst);
+
+                while (!condition())
                 {
-                    is_sleeping.store(false, std::memory_order_relaxed);
-                    return;
+                    m_notification_count.wait(last_count, std::memory_order_acquire);
+                    last_count = m_notification_count.load(std::memory_order_acquire);
                 }
 
-                sem.acquire();
-                is_sleeping.store(false, std::memory_order_relaxed);
+                m_is_sleeping.store(false, std::memory_order_relaxed);
             }
 
             void reset_impl() noexcept
             {
                 cycles_fast = 0;
                 cycles_relaxed = 0;
-                is_sleeping.store(false, std::memory_order_relaxed);
+                m_is_sleeping.store(false, std::memory_order_relaxed);
             }
 
             void wake_impl() noexcept
             {
-                if (is_sleeping.load(std::memory_order_seq_cst))
+                m_notification_count.fetch_add(1, std::memory_order_release);
+
+                if (m_is_sleeping.load(std::memory_order_seq_cst))
                 {
-                    sem.release();
+                    m_notification_count.notify_one();
                 }
             }
         };

@@ -217,6 +217,19 @@ struct Mock_I2C_Peripheral
 TEST(net_comm, i2c_combined_interaction)
 {
     g_master_cpu.reset();
+    std::atomic<uint64_t> total_cycles{ 0 };
+    TSP::BF::SemBackoff m_reader_backoff{ 100, 100, "m_reader" };
+    TSP::BF::SemBackoff m_writer_backoff{ 100, 100, "m_writer" };
+    TSP::BF::SemBackoff s_reader_backoff{ 100, 100, "s_reader" };
+    TSP::BF::SemBackoff s_writer_backoff{ 100, 100, "s_writer" };
+
+    std::jthread cycle_advancer([&total_cycles](std::stop_token stop_token) {
+        while (!stop_token.stop_requested())
+        {
+            total_cycles.fetch_add(100);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
 
     int sv[2];
     ASSERT_GE(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv), 0);
@@ -239,39 +252,55 @@ TEST(net_comm, i2c_combined_interaction)
     bool current_sda = true;
     bool peripheral_sda = true;
 
-    I2C_Master<128> master(
-    m_cfg,
-    master_halt,
-    master_start,
-    [&](uint8_t pin, uint8_t val) {
-        if (pin == SDA)
-        {
-            current_sda = (val != 0);
-        }
-    },
-    [&](uint8_t pin) {
-        if (pin == SDA)
-            return (current_sda && peripheral_sda) ? (uint8_t)1 : (uint8_t)0;
-        return (uint8_t)1;
-    });
+    const I2C_HandlerContext h_ctx = { .halt = master_halt,
+                                       .start = master_start,
+                                       .pin_write =
+                                       [&](uint8_t pin, uint8_t val) {
+                                           if (pin == SDA)
+                                           {
+                                               current_sda = (val != 0);
+                                           }
+                                       },
+                                       .pin_read =
+                                       [&](uint8_t pin) {
+                                           if (pin == SDA)
+                                           {
+                                               return (current_sda && peripheral_sda) ? (uint8_t)1 : (uint8_t)0;
+                                           }
+                                           return (uint8_t)1;
+                                       },
+                                       .total_cycles = &total_cycles,
+                                       .reader_backoff = m_reader_backoff,
+                                       .writer_backoff = m_writer_backoff };
+
+    I2C_Master<128> master(m_cfg, h_ctx);
 
     Mock_I2C_Peripheral peripheral(SLAVE_ADDR, SDA, SCL, nullptr);
     peripheral.data_to_send = { 0x55 };
 
-    I2C_Slave<128> slave(
-    s_cfg,
-    []() { },
-    []() { },
-    [&](uint8_t pin, uint8_t val) {
-        if (pin == SDA)
-            current_sda = (val != 0); // Slave proxy driving local bus
-        peripheral.on_gpio_change(pin, val != 0);
-    },
-    [&](uint8_t pin) {
-        if (pin == SDA)
-            return (current_sda && peripheral_sda) ? (uint8_t)1 : (uint8_t)0;
-        return (uint8_t)1;
-    });
+    const I2C_HandlerContext s_h_ctx = { .halt = []() { },
+                                         .start = []() { },
+                                         .pin_write =
+                                         [&](uint8_t pin, uint8_t val) {
+                                             if (pin == SDA)
+                                             {
+                                                 current_sda = (val != 0); // Slave proxy driving local bus
+                                             }
+                                             peripheral.on_gpio_change(pin, val != 0);
+                                         },
+                                         .pin_read =
+                                         [&](uint8_t pin) {
+                                             if (pin == SDA)
+                                             {
+                                                 return (current_sda && peripheral_sda) ? (uint8_t)1 : (uint8_t)0;
+                                             }
+                                             return (uint8_t)1;
+                                         },
+                                         .total_cycles = &total_cycles,
+                                         .reader_backoff = s_reader_backoff,
+                                         .writer_backoff = s_writer_backoff };
+
+    I2C_Slave<128> slave(s_cfg, s_h_ctx);
 
     peripheral.set_pin_func = [&](uint32_t pin, bool val) {
         if (pin == SDA)
@@ -280,6 +309,21 @@ TEST(net_comm, i2c_combined_interaction)
 
     master.start_receiver();
     slave.start_receiver();
+
+    std::jthread watchdog([&master, &slave](std::stop_token stop_token) {
+        auto start = std::chrono::steady_clock::now();
+        while (!stop_token.stop_requested())
+        {
+            if (std::chrono::steady_clock::now() - start > std::chrono::seconds(10))
+            {
+                std::cerr << "Watchdog timeout in I2C test! Forcing shutdown." << std::endl;
+                master.receiver_stop();
+                slave.receiver_stop();
+                std::terminate();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
 
     auto emit_master_bit = [&](bool val, bool is_scl) {
         master.process_bit({ val ? 1 : 0, is_scl ? SCL : SDA }, 1000);
@@ -371,6 +415,8 @@ TEST(net_comm, i2c_combined_interaction)
 
     master.receiver_stop();
     slave.receiver_stop();
+    cycle_advancer.request_stop();
+    watchdog.request_stop();
     close(sv[0]);
     close(sv[1]);
 }
@@ -378,6 +424,19 @@ TEST(net_comm, i2c_combined_interaction)
 TEST(net_comm, i2c_read_interaction)
 {
     g_master_cpu.reset();
+    std::atomic<uint64_t> total_cycles{ 0 };
+    TSP::BF::SemBackoff m_reader_backoff{ 100, 100, "m_reader" };
+    TSP::BF::SemBackoff m_writer_backoff{ 100, 100, "m_writer" };
+    TSP::BF::SemBackoff s_reader_backoff{ 100, 100, "s_reader" };
+    TSP::BF::SemBackoff s_writer_backoff{ 100, 100, "s_writer" };
+
+    std::jthread cycle_advancer([&total_cycles](std::stop_token stop_token) {
+        while (!stop_token.stop_requested())
+        {
+            total_cycles.fetch_add(100);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
 
     int sv[2];
     ASSERT_GE(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv), 0);
@@ -400,39 +459,55 @@ TEST(net_comm, i2c_read_interaction)
     bool current_sda = true;
     bool peripheral_sda = true;
 
-    I2C_Master<128> master(
-    m_cfg,
-    master_halt,
-    master_start,
-    [&](uint8_t pin, uint8_t val) {
-        if (pin == SDA)
-        {
-            current_sda = (val != 0);
-        }
-    },
-    [&](uint8_t pin) {
-        if (pin == SDA)
-            return (current_sda && peripheral_sda) ? (uint8_t)1 : (uint8_t)0;
-        return (uint8_t)1;
-    });
+    const I2C_HandlerContext h_ctx = { .halt = master_halt,
+                                       .start = master_start,
+                                       .pin_write =
+                                       [&](uint8_t pin, uint8_t val) {
+                                           if (pin == SDA)
+                                           {
+                                               current_sda = (val != 0);
+                                           }
+                                       },
+                                       .pin_read =
+                                       [&](uint8_t pin) {
+                                           if (pin == SDA)
+                                           {
+                                               return (current_sda && peripheral_sda) ? (uint8_t)1 : (uint8_t)0;
+                                           }
+                                           return (uint8_t)1;
+                                       },
+                                       .total_cycles = &total_cycles,
+                                       .reader_backoff = m_reader_backoff,
+                                       .writer_backoff = m_writer_backoff };
+
+    I2C_Master<128> master(m_cfg, h_ctx);
 
     Mock_I2C_Peripheral peripheral(SLAVE_ADDR, SDA, SCL, nullptr);
     peripheral.data_to_send = { 0x55 };
 
-    I2C_Slave<128> slave(
-    s_cfg,
-    []() { },
-    []() { },
-    [&](uint8_t pin, uint8_t val) {
-        if (pin == SDA)
-            current_sda = (val != 0); // Slave proxy driving local bus
-        peripheral.on_gpio_change(pin, val != 0);
-    },
-    [&](uint8_t pin) {
-        if (pin == SDA)
-            return (current_sda && peripheral_sda) ? (uint8_t)1 : (uint8_t)0;
-        return (uint8_t)1;
-    });
+    const I2C_HandlerContext s_h_ctx = { .halt = []() { },
+                                         .start = []() { },
+                                         .pin_write =
+                                         [&](uint8_t pin, uint8_t val) {
+                                             if (pin == SDA)
+                                             {
+                                                 current_sda = (val != 0); // Slave proxy driving local bus
+                                             }
+                                             peripheral.on_gpio_change(pin, val != 0);
+                                         },
+                                         .pin_read =
+                                         [&](uint8_t pin) {
+                                             if (pin == SDA)
+                                             {
+                                                 return (current_sda && peripheral_sda) ? (uint8_t)1 : (uint8_t)0;
+                                             }
+                                             return (uint8_t)1;
+                                         },
+                                         .total_cycles = &total_cycles,
+                                         .reader_backoff = s_reader_backoff,
+                                         .writer_backoff = s_writer_backoff };
+
+    I2C_Slave<128> slave(s_cfg, s_h_ctx);
 
     peripheral.set_pin_func = [&](uint32_t pin, bool val) {
         if (pin == SDA)
@@ -441,6 +516,21 @@ TEST(net_comm, i2c_read_interaction)
 
     master.start_receiver();
     slave.start_receiver();
+
+    std::jthread watchdog([&master, &slave](std::stop_token stop_token) {
+        auto start = std::chrono::steady_clock::now();
+        while (!stop_token.stop_requested())
+        {
+            if (std::chrono::steady_clock::now() - start > std::chrono::seconds(10))
+            {
+                std::cerr << "Watchdog timeout in I2C test! Forcing shutdown." << std::endl;
+                master.receiver_stop();
+                slave.receiver_stop();
+                std::terminate();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
 
     auto emit_master_bit = [&](bool val, bool is_scl) {
         master.process_bit({ val ? 1 : 0, is_scl ? SCL : SDA }, 1000);
@@ -492,12 +582,17 @@ TEST(net_comm, i2c_read_interaction)
 
     master.receiver_stop();
     slave.receiver_stop();
+    cycle_advancer.request_stop();
+    watchdog.request_stop();
     close(sv[0]);
     close(sv[1]);
 }
 
 TEST(net_comm, uart_basic)
 {
+    std::atomic<uint64_t> total_cycles{ 0 };
+    TSP::BF::SemBackoff reader_backoff{ 100, 100 };
+    TSP::BF::SemBackoff writer_backoff{ 100, 100 };
     int sv[2];
     ASSERT_GE(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv), 0);
 
@@ -511,9 +606,17 @@ TEST(net_comm, uart_basic)
     config.stop_bits = 1;
     config.other_side_fd = sv[0];
 
-    auto pin_write_mock = [](uint8_t, uint8_t) { };
-    UART_Handler<64> uart(config, pin_write_mock);
+    const UART_HandlerContext u_h_ctx = { .pin_write = [](uint8_t, uint8_t) { }, .total_cycles = &total_cycles };
+    UART_Handler<64> uart(config, u_h_ctx);
     uart.start_receiver();
+
+    std::jthread cycle_advancer([&total_cycles](std::stop_token stop_token) {
+        while (!stop_token.stop_requested())
+        {
+            total_cycles.fetch_add(100);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
 
     std::vector<bool> bits = { 0, 1, 0, 1, 0, 1, 0, 1, 0, 1 };
     for (bool b : bits)
@@ -537,9 +640,25 @@ TEST(net_comm, uart_basic)
     }
     send(sv[1], packed_rx.data(), packed_rx.size() * sizeof(uint32_t), 0);
 
+    std::jthread watchdog([&uart](std::stop_token stop_token) {
+        auto start = std::chrono::steady_clock::now();
+        while (!stop_token.stop_requested())
+        {
+            if (std::chrono::steady_clock::now() - start > std::chrono::seconds(5))
+            {
+                std::cerr << "Watchdog timeout in uart_basic! Forcing shutdown." << std::endl;
+                uart.receiver_stop();
+                std::terminate();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
+
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     uart.receiver_stop();
+    cycle_advancer.request_stop();
+    watchdog.request_stop();
     close(sv[0]);
     close(sv[1]);
 }

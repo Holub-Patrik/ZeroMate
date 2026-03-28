@@ -64,6 +64,17 @@ struct I2C_Slave_P
     int master_fd{ -1 };
 };
 
+struct I2C_HandlerContext
+{
+    zero_mate::IExternal_Peripheral::Halt_t halt;
+    zero_mate::IExternal_Peripheral::Start_t start;
+    std::function<void(std::uint8_t, std::uint8_t)> pin_write;
+    std::function<std::uint8_t(std::uint8_t)> pin_read;
+    const std::atomic<std::uint64_t>* total_cycles;
+    TSP::BF::SemBackoff& reader_backoff;
+    TSP::BF::SemBackoff& writer_backoff;
+};
+
 class I2C_Base
 {
 public:
@@ -89,24 +100,20 @@ protected:
     std::array<uint8_t, 16> slave_send_buf{ };
     size_t slave_send_idx = 0;
 
+    std::jthread receiver;
     std::atomic<bool> running{ false };
-    std::thread receiver;
     std::array<int, 2> close_pipefd{ -1, -1 };
 
     zero_mate::IExternal_Peripheral::Halt_t halt_func;
     zero_mate::IExternal_Peripheral::Start_t start_func;
     const std::atomic<std::uint64_t>* m_total_cycles;
 
-    I2C_Base(zero_mate::IExternal_Peripheral::Halt_t halt_func,
-             zero_mate::IExternal_Peripheral::Start_t start_func,
-             pin_write_t pin_write,
-             pin_read_t pin_read,
-             const std::atomic<std::uint64_t>* total_cycles)
-    : pin_write(std::move(pin_write))
-    , pin_read(std::move(pin_read))
-    , halt_func(halt_func)
-    , start_func(start_func)
-    , m_total_cycles(total_cycles)
+    I2C_Base(const I2C_HandlerContext& ctx)
+    : pin_write(std::move(ctx.pin_write))
+    , pin_read(std::move(ctx.pin_read))
+    , halt_func(ctx.halt)
+    , start_func(ctx.start)
+    , m_total_cycles(ctx.total_cycles)
     {
     }
 
@@ -138,6 +145,7 @@ public:
     {
         if (running.exchange(false))
         {
+            receiver.request_stop();
             bool close_msg = true;
             if (close_pipefd[1] != -1)
             {
@@ -167,21 +175,20 @@ class I2C_Master final : public I2C_Base
     TSP::Queue::Buffer<std::uint8_t, BUFFER_SIZE> queue_buf;
     TSP::Queue::Writer<std::uint8_t, BUFFER_SIZE> queue_writer;
     TSP::Queue::Reader<std::uint8_t, BUFFER_SIZE> queue_reader;
-    TSP::BF::Backoff backoff_fast{ BACKOFF_CYCLES };
+
+    TSP::BF::SemBackoff& m_reader_backoff;
+    TSP::BF::SemBackoff& m_writer_backoff;
 
     uint8_t shift_reg = 0;
 
 public:
-    I2C_Master(I2C_Master_P config,
-               zero_mate::IExternal_Peripheral::Halt_t halt_func,
-               zero_mate::IExternal_Peripheral::Start_t start_func,
-               pin_write_t pin_write,
-               pin_read_t pin_read,
-               const std::atomic<std::uint64_t>* total_cycles)
-    : I2C_Base(halt_func, start_func, std::move(pin_write), std::move(pin_read), total_cycles)
-    , config(std::move(config))
+    I2C_Master(const I2C_Master_P& config, const I2C_HandlerContext& ctx)
+    : I2C_Base(ctx)
+    , config(config)
     , queue_writer(&queue_buf)
     , queue_reader(&queue_buf)
+    , m_reader_backoff(ctx.reader_backoff)
+    , m_writer_backoff(ctx.writer_backoff)
     {
     }
 
@@ -203,10 +210,10 @@ public:
 
     void start_receiver()
     {
-        receiver = std::thread(&std::remove_reference_t<decltype(*this)>::receiver_thread, this);
+        this->receiver = std::jthread([this](std::stop_token stop_token) { this->receiver_thread(stop_token); });
     }
 
-    void receiver_thread()
+    void receiver_thread(std::stop_token stop_token)
     {
         running = true;
         pipe(close_pipefd.data());
@@ -218,7 +225,7 @@ public:
             fds.emplace_back(fd, POLLIN, 0);
         }
 
-        while (running)
+        while (!stop_token.stop_requested() && running)
         {
             if (poll(fds.data(), fds.size(), -1) <= 0)
             {
@@ -236,7 +243,7 @@ public:
                     if (!receive_from_slave(fds[i].fd))
                     {
                         running = false;
-                        break;
+                        return;
                     }
                 }
             }
@@ -279,6 +286,7 @@ private:
                     pin_write(config.sda_pin, val);
                     sda_lvl = (val != 0);
                     queue_reader.advance();
+                    m_writer_backoff.wake();
                 }
                 else
                 {
@@ -348,6 +356,7 @@ private:
                 while (queue_reader.try_advance())
                 {
                     queue_reader.advance();
+                    m_writer_backoff.wake();
                 }
                 send_packet(I2C_Packet_Type::I2C_START, 0);
                 state = I2C_State::ADDRESS;
@@ -382,7 +391,8 @@ private:
             {
                 ack_from_slave = (packet.value != 0);
                 // For RESPONSE state, the master expects 1 bit (ACK)
-                queue_writer.insert_with_backoff(ack_from_slave ? 0 : 1, backoff_fast);
+                queue_writer.insert_with_backoff(ack_from_slave ? 0 : 1, m_writer_backoff);
+                m_reader_backoff.wake();
 
                 // If we are in the RESPONSE state and waiting for this bit
                 if (state == I2C_State::RESPONSE && bit_count == 0)
@@ -393,6 +403,7 @@ private:
                         pin_write(config.sda_pin, val);
                         sda_lvl = (val != 0);
                         queue_reader.advance();
+                        m_writer_backoff.wake();
                     }
                 }
             }
@@ -401,7 +412,8 @@ private:
                 // Push 8 bits into the queue
                 for (int i = 7; i >= 0; --i)
                 {
-                    queue_writer.insert_with_backoff((packet.value >> i) & 0x01U, backoff_fast);
+                    queue_writer.insert_with_backoff((packet.value >> i) & 0x01U, m_writer_backoff);
+                    m_reader_backoff.wake();
                 }
 
                 // If we are already in READ_BYTE and waiting for the first bit, drive it now
@@ -413,6 +425,7 @@ private:
                         pin_write(config.sda_pin, val);
                         sda_lvl = (val != 0);
                         queue_reader.advance();
+                        m_writer_backoff.wake();
                     }
                 }
             }
@@ -430,17 +443,21 @@ class I2C_Slave final : public I2C_Base
     bool matched_address = false;
     uint8_t shift_reg = 0;
 
-    TSP::BF::Backoff backoff_fast{ BACKOFF_CYCLES };
+    TSP::Queue::Buffer<std::uint8_t, BUFFER_SIZE> queue_buf;
+    TSP::Queue::Writer<std::uint8_t, BUFFER_SIZE> queue_writer;
+    TSP::Queue::Reader<std::uint8_t, BUFFER_SIZE> queue_reader;
+
+    TSP::BF::SemBackoff& m_reader_backoff;
+    TSP::BF::SemBackoff& m_writer_backoff;
 
 public:
-    I2C_Slave(I2C_Slave_P config,
-              zero_mate::IExternal_Peripheral::Halt_t halt_func,
-              zero_mate::IExternal_Peripheral::Start_t start_func,
-              pin_write_t pin_write,
-              pin_read_t pin_read,
-              const std::atomic<std::uint64_t>* total_cycles)
-    : I2C_Base(halt_func, start_func, std::move(pin_write), std::move(pin_read), total_cycles)
-    , config(std::move(config))
+    I2C_Slave(const I2C_Slave_P& config, const I2C_HandlerContext& ctx)
+    : I2C_Base(ctx)
+    , config(config)
+    , queue_writer(&queue_buf)
+    , queue_reader(&queue_buf)
+    , m_reader_backoff(ctx.reader_backoff)
+    , m_writer_backoff(ctx.writer_backoff)
     {
     }
 
@@ -454,10 +471,10 @@ public:
 
     void start_receiver()
     {
-        receiver = std::thread(&std::remove_reference_t<decltype(*this)>::receiver_thread, this);
+        this->receiver = std::jthread([this](std::stop_token stop_token) { this->receiver_thread(stop_token); });
     }
 
-    void receiver_thread()
+    void receiver_thread(std::stop_token stop_token)
     {
         running = true;
         pipe(close_pipefd.data());
@@ -466,7 +483,7 @@ public:
         fds[0] = { .fd = close_pipefd[0], .events = POLLIN, .revents = 0 };
         fds[1] = { .fd = config.master_fd, .events = POLLIN, .revents = 0 };
 
-        while (running)
+        while (!stop_token.stop_requested() && running)
         {
             if (poll(fds.data(), fds.size(), -1) <= 0)
             {
@@ -544,17 +561,9 @@ private:
 
     void send_packet(I2C_Packet_Type type, uint8_t value)
     {
-        I2C_Packet packet{ type, value };
+        I2C_Packet packet{ .type = type, .value = value };
         send(config.master_fd, &packet, sizeof(packet), 0);
     }
-
-    // TODO: All of the following functions have a major misunderstaing of the emulator behaviour
-    // Bits shouldn't be read like this. The emulator under the hood might not respond to bit banging immedietly.
-    // Instead what should be done (and as was done originally), is to send timing, along the clock signals,
-    // And then using those timing, clock signals should be spaced. The bit should be read from a current state
-    // that would be updated by a callback from the emulator. If the emulator doesn't update that variable it's last
-    // state would be read. (For I2C this means that the value should be readable after the rising edge, as the signal
-    // should be stable from rising to falling)
 
     void bit_bang_byte_local(uint8_t value)
     {

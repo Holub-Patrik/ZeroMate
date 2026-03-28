@@ -57,12 +57,21 @@ using conn_info = struct conn_info_struct
     std::string remote_ip;
     int remote_port;
 
+    int sockfd{ -1 };
+
     std::chrono::time_point<std::chrono::steady_clock> start_time;
 };
 
 namespace handshake
 {
     static constexpr std::uint8_t MAGIC_BYTE = 0x5A;
+
+    enum class MessageType : std::uint8_t
+    {
+        Conf = 0,
+        Response = 1,
+        FinalResponse = 2,
+    };
 
     enum class ProtocolID : std::uint8_t
     {
@@ -90,6 +99,7 @@ namespace handshake
     struct ConfMessage
     {
         std::uint8_t magic = MAGIC_BYTE;
+        MessageType type = MessageType::Conf;
         ProtocolID protocol_id;
         std::uint16_t port;
         std::uint32_t net_id;
@@ -102,6 +112,7 @@ namespace handshake
     struct ResponseMessage
     {
         std::uint8_t magic = MAGIC_BYTE;
+        MessageType type = MessageType::Response;
         std::uint8_t status; // 1: Accept, 0: Decline
         std::uint16_t port;
         std::uint32_t net_id;
@@ -110,6 +121,7 @@ namespace handshake
     struct FinalResponseMessage
     {
         std::uint8_t magic = MAGIC_BYTE;
+        MessageType type = MessageType::FinalResponse;
         std::uint8_t status; // 1: Accept, 0: Decline
         std::uint32_t net_id;
     } __attribute__((packed));
@@ -121,6 +133,15 @@ using pin_pair = std::pair<std::uint8_t, std::uint8_t>;
 template<std::size_t QUEUE_SIZE>
 using protocol_variant = std::variant<UART_Handler<QUEUE_SIZE>, I2C_Master<QUEUE_SIZE>, I2C_Slave<QUEUE_SIZE>>;
 
+template<typename Type, std::size_t Size>
+struct BitProcessorContext
+{
+    TSP::Queue::Buffer<Type, Size>* buf;
+    const std::atomic<std::uint64_t>* total_cycles;
+    TSP::BF::SemBackoff& reader_backoff;
+    TSP::BF::SemBackoff& writer_backoff;
+};
+
 template<typename Type, std::size_t Size, typename Handler>
 class BitProcessor final
 {
@@ -131,19 +152,20 @@ public:
 private:
     Handler handler;
     TSP::Queue::Reader<Type, Size> queue_reader;
-    TSP::BF::SemBackoff backoff;
+    TSP::BF::SemBackoff& m_reader_backoff;
+    TSP::BF::SemBackoff& m_writer_backoff;
     const std::atomic<std::uint64_t>* m_total_cycles;
 
-    std::atomic<bool> running{ false };
-    std::thread sender;
+    std::jthread sender;
 
 public:
     template<typename... Args>
-    BitProcessor(TSP::Queue::Buffer<Type, Size>* buf, const std::atomic<std::uint64_t>* total_cycles, Args&&... args)
+    BitProcessor(BitProcessorContext<Type, Size> ctx, Args&&... args)
     : handler(std::forward<Args>(args)...)
-    , queue_reader(buf)
-    , backoff(100, 1000)
-    , m_total_cycles(total_cycles)
+    , queue_reader(ctx.buf)
+    , m_reader_backoff(ctx.reader_backoff)
+    , m_writer_backoff(ctx.writer_backoff)
+    , m_total_cycles(ctx.total_cycles)
     {
     }
 
@@ -160,46 +182,40 @@ public:
 
     void start()
     {
-        running = true;
-        sender = std::thread{ &BitProcessor<Type, Size, Handler>::run_sender, this };
+        sender = std::jthread{ [this](std::stop_token stop_token) { this->run_sender(stop_token); } };
         handler.start_receiver();
     }
 
     void stop()
     {
-        if (running.exchange(false))
-        {
-            backoff.wake();
-            if (sender.joinable())
-            {
-                sender.join();
-            }
-
-            handler.receiver_stop();
-        }
+        sender.request_stop();
+        m_reader_backoff.wake();
+        handler.receiver_stop();
     }
 
     [[nodiscard]] bool is_running() const
     {
-        return running.load() && handler.is_alive();
+        return !sender.get_stop_token().stop_requested() && handler.is_alive();
     }
 
 private:
-    void run_sender()
+    void run_sender(std::stop_token stop_token)
     {
         std::uint64_t last_cycles = m_total_cycles->load();
 
-        while (running)
+        while (!stop_token.stop_requested())
         {
             if (!queue_reader.try_advance())
             {
-                backoff.wait([this]() { return !running || queue_reader.try_advance(); });
+                m_reader_backoff.wait(
+                [this, &stop_token]() { return stop_token.stop_requested() || queue_reader.try_advance(); });
                 continue;
             }
-            backoff.reset();
+            m_reader_backoff.reset();
 
             const auto pair = queue_reader.peek();
             queue_reader.advance();
+            m_writer_backoff.wake();
 
             const std::uint64_t now_cycles = m_total_cycles->load();
             const auto delta = static_cast<std::uint32_t>(now_cycles - last_cycles);
@@ -220,14 +236,35 @@ public:
     static constexpr std::size_t BUFFER_SIZE = 512;
     static constexpr std::size_t QUEUE_SIZE = 64;
 
+    struct ConnectionBackoffs
+    {
+        TSP::BF::SemBackoff out_queue_writer;
+        TSP::BF::SemBackoff out_queue_reader;
+        TSP::BF::SemBackoff handler_queue_writer;
+        TSP::BF::SemBackoff handler_queue_reader;
+
+        ConnectionBackoffs()
+        : out_queue_writer(BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED, "out_queue_writer")
+        , out_queue_reader(BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED, "out_queue_reader")
+        , handler_queue_writer(BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED, "handler_queue_writer")
+        , handler_queue_reader(BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED, "handler_queue_reader")
+        {
+        }
+
+        ConnectionBackoffs(const ConnectionBackoffs&) = delete;
+        ConnectionBackoffs& operator=(const ConnectionBackoffs&) = delete;
+        ConnectionBackoffs(ConnectionBackoffs&&) = delete;
+        ConnectionBackoffs& operator=(ConnectionBackoffs&&) = delete;
+    };
+
 private:
     TSP::Queue::Buffer<pin_pair, QUEUE_SIZE> pin_write_queue_buf{ };
     TSP::Queue::Reader<pin_pair, QUEUE_SIZE> pin_write_queue_reader;
     TSP::Queue::Writer<pin_pair, QUEUE_SIZE> pin_write_queue_writer;
     Spinlock pin_write_spinlock;
 
-    TSP::BF::Backoff backoff_fast{ BACKOFF_CYCLES };
-    TSP::BF::SemBackoff backoff_sem{ BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED };
+    TSP::BF::SemBackoff m_pin_write_writer_backoff{ BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED, "pin_write_writer" };
+    TSP::BF::SemBackoff m_pin_write_reader_backoff{ BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED, "pin_write_reader" };
 
     // a bit map lookup might be best to assign new threads
     std::array<TSP::Queue::Buffer<pin_pair, BUFFER_SIZE>, BUFFER_COUNT> out_queue_buffers;
@@ -236,7 +273,9 @@ private:
     // this could be converted into a bit map, but bit instruction are extra instructions
     std::array<bool, MAX_CONNECTION_COUNT> connection_bit_map{ false };
 
-    std::array<std::thread, MAX_CONNECTION_COUNT> connection_threads;
+    std::array<ConnectionBackoffs, MAX_CONNECTION_COUNT> m_backoffs;
+
+    std::array<std::jthread, MAX_CONNECTION_COUNT> connection_threads;
     std::array<conn_info, MAX_CONNECTION_COUNT> connection_data;
     std::array<std::atomic<bool>, MAX_CONNECTION_COUNT> connection_running;
 
@@ -252,12 +291,13 @@ private:
     const std::atomic<std::uint64_t>* m_total_cycles;
 
     std::atomic<bool> m_running{ true };
-    std::thread m_pin_write_thread;
+    std::jthread m_pin_write_thread;
+    std::jthread m_server_thread;
     int m_handshake_socket{ -1 };
     uint16_t m_handshake_port{ 0 };
 
     // Pin write entirely here since there will be multiple writers, so spinlock is added to ensure safety
-    void pin_write();
+    void pin_write(const std::stop_token& stop_token);
     void unmap_connection(const std::size_t conn_index);
     [[nodiscard]] std::uint8_t find_free_index() const noexcept;
 
@@ -292,7 +332,7 @@ public:
     void add_connection(const conn_info& info);
     void remove_connection(std::size_t i);
     void construct_connection(const conn_info& info);
-    void run();
+    void run(const std::stop_token& stop_token);
     void stop();
 
     // Handshake initiation
@@ -315,6 +355,30 @@ public:
     {
         return func_read_pin;
     }
+    [[nodiscard]] conn_info& get_connection_info(std::size_t idx)
+    {
+        return connection_data[idx];
+    }
+    [[nodiscard]] TSP::Queue::Buffer<pin_pair, BUFFER_SIZE>* get_out_queue_buffer(std::size_t idx)
+    {
+        return &out_queue_buffers[idx];
+    }
+    [[nodiscard]] ConnectionBackoffs& get_backoffs(std::size_t idx)
+    {
+        return m_backoffs[idx];
+    }
+    [[nodiscard]] std::atomic<bool>& is_server_running()
+    {
+        return m_running;
+    }
+    [[nodiscard]] std::atomic<bool>& is_connection_running(std::size_t idx)
+    {
+        return connection_running[idx];
+    }
+    [[nodiscard]] const std::atomic<std::uint64_t>* get_total_cycles() const
+    {
+        return m_total_cycles;
+    }
 
     // UI access
     [[nodiscard]] const auto& get_connection_bit_map() const
@@ -331,6 +395,7 @@ class GPIOConnection final
 {
 private:
     conn_info& connection;
+    GPIOServer::ConnectionBackoffs& m_backoffs;
 
     TSP::Queue::Reader<pin_pair, GPIOServer::BUFFER_SIZE> m_queue_reader;
 
@@ -355,20 +420,12 @@ private:
 
 public:
     GPIOConnection() = delete;
-    GPIOConnection(conn_info& info,
-                   TSP::Queue::Buffer<pin_pair, GPIOServer::BUFFER_SIZE>* buffer,
-                   zero_mate::IExternal_Peripheral::Halt_t halt,
-                   zero_mate::IExternal_Peripheral::Start_t start,
-                   zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
-                   GPIOServer& server,
-                   std::atomic<bool>& server_running,
-                   std::atomic<bool>& connection_running,
-                   const std::atomic<std::uint64_t>* total_cycles);
+    GPIOConnection(std::size_t idx, GPIOServer& server);
 
     ~GPIOConnection();
 
     GPIOConnection(const GPIOConnection& other) = delete;
-    void run();
+    void run(std::stop_token stop_token);
 
     // Helper for SM
     pin_pair read_queue();
@@ -440,9 +497,9 @@ private:
 #endif
 
     std::atomic<bool> m_running{ true };
-    std::atomic<std::uint64_t> m_total_cycles{ 0 };
+    std::atomic<uint64_t> m_total_cycles{ 0 };
     GPIOServer server;
-    std::thread server_thread;
+    std::jthread server_thread;
 
     // UI State
 #ifndef ZERO_MATE_UNIT_TESTS
