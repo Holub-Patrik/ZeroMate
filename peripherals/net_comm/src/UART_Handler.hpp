@@ -87,6 +87,7 @@ public:
 
     void start_receiver()
     {
+        running = true;
         receiver = std::jthread([this](std::stop_token stop_token) { this->receiver_thread(stop_token); });
     }
 
@@ -94,7 +95,6 @@ public:
     {
         // here it is simple, just expose the emulator writer queue
         // receive data, parse out clock for writing bits to pin
-        running = true;
         pipe(close_pipe.data());
 
         std::array<struct pollfd, 2> fds{ 0 };

@@ -210,12 +210,12 @@ public:
 
     void start_receiver()
     {
+        running = true;
         this->receiver = std::jthread([this](std::stop_token stop_token) { this->receiver_thread(stop_token); });
     }
 
     void receiver_thread(std::stop_token stop_token)
     {
-        running = true;
         pipe(close_pipefd.data());
 
         std::vector<struct pollfd> fds;
@@ -471,12 +471,12 @@ public:
 
     void start_receiver()
     {
+        running = true;
         this->receiver = std::jthread([this](std::stop_token stop_token) { this->receiver_thread(stop_token); });
     }
 
     void receiver_thread(std::stop_token stop_token)
     {
-        running = true;
         pipe(close_pipefd.data());
 
         std::array<struct pollfd, 2> fds{ 0 };
