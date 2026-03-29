@@ -56,6 +56,7 @@ using conn_info = struct conn_info_struct
     // Remote side info
     std::string remote_ip;
     int remote_port;
+    in_port_t remote_data_port{ 0 };
 
     int sockfd{ -1 };
 
@@ -71,6 +72,7 @@ namespace handshake
         Conf = 0,
         Response = 1,
         FinalResponse = 2,
+        Disconnect = 3,
     };
 
     enum class ProtocolID : std::uint8_t
@@ -123,6 +125,13 @@ namespace handshake
         std::uint8_t magic = MAGIC_BYTE;
         MessageType type = MessageType::FinalResponse;
         std::uint8_t status; // 1: Accept, 0: Decline
+        std::uint32_t net_id;
+    } __attribute__((packed));
+
+    struct DisconnectMessage
+    {
+        std::uint8_t magic = MAGIC_BYTE;
+        MessageType type = MessageType::Disconnect;
         std::uint32_t net_id;
     } __attribute__((packed));
 }
@@ -198,6 +207,21 @@ public:
         return !sender.get_stop_token().stop_requested() && handler.is_alive();
     }
 
+    void add_slave(int fd, in_port_t handshake_port)
+    {
+        handler.add_slave(fd, handshake_port);
+    }
+
+    void remove_slave(in_port_t port)
+    {
+        handler.remove_slave(port);
+    }
+
+    [[nodiscard]] std::size_t get_slave_count() const
+    {
+        return handler.get_slave_count();
+    }
+
 private:
     void run_sender(std::stop_token stop_token)
     {
@@ -224,6 +248,8 @@ private:
         }
     }
 };
+
+class GPIOConnection;
 
 class GPIOServer final
 {
@@ -276,12 +302,14 @@ private:
     std::array<ConnectionBackoffs, MAX_CONNECTION_COUNT> m_backoffs;
 
     std::array<std::jthread, MAX_CONNECTION_COUNT> connection_threads;
+    std::array<std::unique_ptr<GPIOConnection>, MAX_CONNECTION_COUNT> active_connections;
     std::array<conn_info, MAX_CONNECTION_COUNT> connection_data;
     std::array<std::atomic<bool>, MAX_CONNECTION_COUNT> connection_running;
 
     FastMap pin_to_conn_id;
     FastMap net_id_to_conn_id;
     std::unordered_map<std::uint32_t, std::size_t> m_net_id_to_idx;
+    std::unordered_map<std::uint32_t, std::size_t> m_bus_id_to_idx;
 
     zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin;
     zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t func_read_pin;
@@ -306,6 +334,7 @@ private:
     void handle_conf_msg(const handshake::ConfMessage& msg, const struct sockaddr_in& addr);
     void handle_response_msg(const handshake::ResponseMessage& msg, const struct sockaddr_in& addr);
     void handle_final_response_msg(const handshake::FinalResponseMessage& msg, const struct sockaddr_in& addr);
+    void handle_disconnect_msg(const handshake::DisconnectMessage& msg, const struct sockaddr_in& addr);
     void cleanup_finished_connections();
 
 public:
@@ -332,11 +361,13 @@ public:
     void add_connection(const conn_info& info);
     void remove_connection(std::size_t i);
     void construct_connection(const conn_info& info);
+    void add_slave_to_master(std::uint32_t bus_id, int fd, in_port_t handshake_port);
+    void remove_slave_from_master(in_port_t port);
     void run(const std::stop_token& stop_token);
     void stop();
 
     // Handshake initiation
-    void initiate_handshake(const conn_info& info);
+    void initiate_handshake(std::size_t idx);
 
     // used by GPIOConnection
     [[nodiscard]] zero_mate::IExternal_Peripheral::Halt_t get_halt() const
@@ -389,6 +420,7 @@ public:
     {
         return connection_data;
     }
+    [[nodiscard]] std::size_t get_slave_count(std::size_t idx) const;
 };
 
 class GPIOConnection final
@@ -442,6 +474,31 @@ public:
     [[nodiscard]] bool is_running() const
     {
         return m_server_running.load() && m_connection_running.load();
+    }
+
+    void add_slave(int fd, in_port_t handshake_port)
+    {
+        if (m_processor.has_value())
+        {
+            std::visit([fd, handshake_port](auto& p) { p.add_slave(fd, handshake_port); }, *m_processor);
+        }
+    }
+
+    void remove_slave(in_port_t port)
+    {
+        if (m_processor.has_value())
+        {
+            std::visit([port](auto& p) { p.remove_slave(port); }, *m_processor);
+        }
+    }
+
+    [[nodiscard]] std::size_t get_slave_count() const
+    {
+        if (m_processor.has_value())
+        {
+            return std::visit([](auto& p) { return p.get_slave_count(); }, *m_processor);
+        }
+        return 0;
     }
 };
 

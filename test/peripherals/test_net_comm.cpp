@@ -241,7 +241,6 @@ TEST(net_comm, i2c_combined_interaction)
     I2C_Master_P m_cfg;
     m_cfg.scl_pin = SCL;
     m_cfg.sda_pin = SDA;
-    m_cfg.slave_fds.push_back(sv[0]);
 
     I2C_Slave_P s_cfg;
     s_cfg.address = SLAVE_ADDR;
@@ -274,6 +273,7 @@ TEST(net_comm, i2c_combined_interaction)
                                        .writer_backoff = m_writer_backoff };
 
     I2C_Master<128> master(m_cfg, h_ctx);
+    master.add_slave(sv[0], 0);
 
     Mock_I2C_Peripheral peripheral(SLAVE_ADDR, SDA, SCL, nullptr);
     peripheral.data_to_send = { 0x55 };
@@ -448,7 +448,6 @@ TEST(net_comm, i2c_read_interaction)
     I2C_Master_P m_cfg;
     m_cfg.scl_pin = SCL;
     m_cfg.sda_pin = SDA;
-    m_cfg.slave_fds.push_back(sv[0]);
 
     I2C_Slave_P s_cfg;
     s_cfg.address = SLAVE_ADDR;
@@ -481,6 +480,7 @@ TEST(net_comm, i2c_read_interaction)
                                        .writer_backoff = m_writer_backoff };
 
     I2C_Master<128> master(m_cfg, h_ctx);
+    master.add_slave(sv[0], 0);
 
     Mock_I2C_Peripheral peripheral(SLAVE_ADDR, SDA, SCL, nullptr);
     peripheral.data_to_send = { 0x55 };

@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <netinet/in.h>
 #include <vector>
+#include <unordered_map>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -9,6 +10,7 @@
 #include <thread>
 #include <chrono>
 #include <functional>
+#include <mutex>
 
 #include "CircularBufferQueue.hpp"
 #include "zero_mate/external_peripheral.hpp"
@@ -49,15 +51,14 @@ struct I2C_Packet
 
 struct I2C_Master_P
 {
-    std::uint32_t id{ 0 };
+    std::uint32_t bus_id{ 0 };
     std::uint32_t scl_pin{ UINT32_MAX };
     std::uint32_t sda_pin{ UINT32_MAX };
-    std::vector<int> slave_fds;
 };
 
 struct I2C_Slave_P
 {
-    std::uint32_t id{ 0 };
+    std::uint32_t bus_id{ 0 };
     std::uint8_t address{ 0 };
     std::uint32_t scl_pin{ UINT32_MAX };
     std::uint32_t sda_pin{ UINT32_MAX };
@@ -87,6 +88,7 @@ protected:
     static constexpr uint32_t MASK_VALUE = 1U << 30U;
     static constexpr uint32_t MASK_DELTA = 0x3FFFFFFF;
     static constexpr std::size_t BACKOFF_CYCLES = 1024;
+    static constexpr std::uint8_t HANDSHAKE_MAGIC_BYTE = 0x5A;
 
     pin_write_t pin_write;
     pin_read_t pin_read;
@@ -141,6 +143,22 @@ public:
         receiver_stop();
     }
 
+    virtual void add_slave(int fd, in_port_t handshake_port)
+    {
+        (void)fd;
+        (void)handshake_port;
+    }
+
+    virtual void remove_slave(in_port_t handshake_port)
+    {
+        (void)handshake_port;
+    }
+
+    virtual std::size_t get_slave_count() const
+    {
+        return 0;
+    }
+
     void receiver_stop()
     {
         if (running.exchange(false))
@@ -168,6 +186,8 @@ public:
 template<std::size_t Size>
 class I2C_Master final : public I2C_Base
 {
+    static constexpr std::size_t MAX_SLAVES = 16;
+
     I2C_Master_P config;
     std::array<uint32_t, BUFFER_SIZE> buf{ 0 };
     size_t buf_idx = 0;
@@ -178,6 +198,15 @@ class I2C_Master final : public I2C_Base
 
     TSP::BF::SemBackoff& m_reader_backoff;
     TSP::BF::SemBackoff& m_writer_backoff;
+
+    std::array<int, 2> wake_pipefd{ -1, -1 };
+    mutable std::mutex slave_fds_mutex;
+
+    std::array<int, MAX_SLAVES> m_slave_fds{ };
+    std::array<in_port_t, MAX_SLAVES> m_slave_handshake_ports{ };
+    std::size_t m_slave_count = 0;
+    std::unordered_map<int, std::size_t> m_fd_to_idx;
+    std::unordered_map<in_port_t, int> m_handshake_port_to_fd;
 
     uint8_t shift_reg = 0;
 
@@ -190,8 +219,123 @@ public:
     , m_reader_backoff(ctx.reader_backoff)
     , m_writer_backoff(ctx.writer_backoff)
     {
+        m_slave_fds.fill(-1);
     }
 
+    ~I2C_Master() override
+    {
+        I2C_Base::receiver_stop();
+
+        {
+            std::lock_guard<std::mutex> lock(slave_fds_mutex);
+            for (std::size_t i = 0; i < m_slave_count; ++i)
+            {
+                send_disconnect(m_slave_fds[i]);
+                close(m_slave_fds[i]);
+            }
+        }
+
+        if (wake_pipefd[0] != -1)
+        {
+            close(wake_pipefd[0]);
+        }
+        if (wake_pipefd[1] != -1)
+        {
+            close(wake_pipefd[1]);
+        }
+    }
+
+    void add_slave(int fd, in_port_t handshake_port) override
+    {
+        {
+            std::lock_guard<std::mutex> lock(slave_fds_mutex);
+            if (m_slave_count < MAX_SLAVES)
+            {
+                m_slave_fds[m_slave_count] = fd;
+                m_slave_handshake_ports[m_slave_count] = handshake_port;
+                m_fd_to_idx[fd] = m_slave_count;
+                m_handshake_port_to_fd[handshake_port] = fd;
+                m_slave_count++;
+            }
+        }
+        wake_thread();
+    }
+
+    void remove_slave(in_port_t handshake_port) override
+    {
+        {
+            std::lock_guard<std::mutex> lock(slave_fds_mutex);
+            if (m_handshake_port_to_fd.contains(handshake_port))
+            {
+                _remove_slave_at(m_fd_to_idx.at(m_handshake_port_to_fd.at(handshake_port)));
+            }
+        }
+        this->start_func();
+        wake_thread();
+    }
+
+    std::size_t get_slave_count() const override
+    {
+        std::lock_guard<std::mutex> lock(slave_fds_mutex);
+        return m_slave_count;
+    }
+
+private:
+    void _remove_slave_at(std::size_t idx)
+    {
+        send_disconnect(m_slave_fds[idx]);
+        close(m_slave_fds[idx]);
+        m_handshake_port_to_fd.erase(m_slave_handshake_ports[idx]);
+        m_fd_to_idx.erase(m_slave_fds[idx]);
+
+        if (idx < m_slave_count - 1)
+        {
+            m_slave_fds[idx] = m_slave_fds[m_slave_count - 1];
+            m_slave_handshake_ports[idx] = m_slave_handshake_ports[m_slave_count - 1];
+            m_fd_to_idx[m_slave_fds[idx]] = idx;
+            m_handshake_port_to_fd[m_slave_handshake_ports[idx]] = m_slave_fds[idx];
+        }
+
+        m_slave_count--;
+        m_slave_fds[m_slave_count] = -1;
+    }
+
+    void send_disconnect(int fd)
+    {
+        struct
+        {
+            uint8_t magic = HANDSHAKE_MAGIC_BYTE;
+            uint8_t type = 3; // Disconnect
+            uint32_t bus_id;
+        } __attribute__((packed)) msg;
+        msg.bus_id = config.bus_id;
+
+        send(fd, &msg, sizeof(msg), 0);
+    }
+
+    void wake_thread()
+    {
+        if (wake_pipefd[1] != -1)
+        {
+            bool msg = true;
+            write(wake_pipefd[1], &msg, sizeof(bool));
+        }
+    }
+
+    void remove_slave_by_fd(int fd)
+    {
+        {
+            std::lock_guard<std::mutex> lock(slave_fds_mutex);
+            if (m_fd_to_idx.contains(fd))
+            {
+                _remove_slave_at(m_fd_to_idx[fd]);
+            }
+        }
+        this->start_func();
+        wake_thread();
+    }
+
+public:
     void process_bit(const std::pair<std::uint8_t, std::uint8_t>& pair, const uint32_t delta)
     {
         const auto& [bit, pin] = pair;
@@ -211,6 +355,7 @@ public:
     void start_receiver()
     {
         running = true;
+        pipe(wake_pipefd.data());
         this->receiver = std::jthread([this](std::stop_token stop_token) { this->receiver_thread(stop_token); });
     }
 
@@ -218,34 +363,64 @@ public:
     {
         pipe(close_pipefd.data());
 
-        std::vector<struct pollfd> fds;
-        fds.emplace_back(close_pipefd[0], POLLIN, 0);
-        for (int fd : config.slave_fds)
-        {
-            fds.emplace_back(fd, POLLIN, 0);
-        }
-
         while (!stop_token.stop_requested() && running)
         {
+            std::vector<struct pollfd> fds;
+            fds.emplace_back(close_pipefd[0], POLLIN, 0);
+            fds.emplace_back(wake_pipefd[0], POLLIN, 0);
+
+            {
+                std::lock_guard<std::mutex> lock(slave_fds_mutex);
+                for (std::size_t i = 0; i < m_slave_count; ++i)
+                {
+                    fds.emplace_back(m_slave_fds[i], POLLIN, 0);
+                }
+            }
+
             if (poll(fds.data(), fds.size(), -1) <= 0)
             {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
                 break;
             }
+
             if (fds[0].revents & POLLIN)
             {
                 break;
             }
 
-            for (size_t i = 1; i < fds.size(); ++i)
+            if (fds[1].revents & POLLIN)
             {
-                if (fds[i].revents & POLLIN)
+                bool msg;
+                read(wake_pipefd[0], &msg, sizeof(bool));
+                continue; // Rebuild fds
+            }
+
+            bool rebuild = false;
+            for (size_t i = 2; i < fds.size(); ++i)
+            {
+                if (fds[i].revents & (POLLIN | POLLERR | POLLHUP))
                 {
-                    if (!receive_from_slave(fds[i].fd))
+                    if (fds[i].revents & POLLIN)
                     {
-                        running = false;
-                        return;
+                        if (!receive_from_slave(fds[i].fd))
+                        {
+                            remove_slave_by_fd(fds[i].fd);
+                            rebuild = true;
+                        }
+                    }
+                    else
+                    {
+                        remove_slave_by_fd(fds[i].fd);
+                        rebuild = true;
                     }
                 }
+            }
+            if (rebuild)
+            {
+                continue;
             }
         }
         running = false;
@@ -341,9 +516,13 @@ private:
         }
 
         scl_lvl = is_high;
-        if (wait_for_response)
+
         {
-            halt_func();
+            std::lock_guard<std::mutex> lock(slave_fds_mutex);
+            if (wait_for_response && m_slave_count > 0)
+            {
+                halt_func();
+            }
         }
     }
 
@@ -375,64 +554,79 @@ private:
     void send_packet(I2C_Packet_Type type, uint8_t value)
     {
         I2C_Packet packet{ type, value };
-        for (int fd : config.slave_fds)
+        std::lock_guard<std::mutex> lock(slave_fds_mutex);
+        for (std::size_t i = 0; i < m_slave_count; ++i)
         {
-            send(fd, &packet, sizeof(packet), 0);
+            send(m_slave_fds[i], &packet, sizeof(packet), 0);
         }
     }
 
     bool receive_from_slave(const int fd)
     {
-        I2C_Packet packet{ };
-        ssize_t n = recv(fd, &packet, sizeof(packet), 0);
-        if (n == sizeof(packet))
+        uint8_t buffer[16];
+        ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+        if (n <= 0)
         {
-            if (packet.type == I2C_Packet_Type::I2C_ACK)
-            {
-                ack_from_slave = (packet.value != 0);
-                // For RESPONSE state, the master expects 1 bit (ACK)
-                queue_writer.insert_with_backoff(ack_from_slave ? 0 : 1, m_writer_backoff);
-                m_reader_backoff.wake();
-
-                // If we are in the RESPONSE state and waiting for this bit
-                if (state == I2C_State::RESPONSE && bit_count == 0)
-                {
-                    if (queue_reader.try_advance())
-                    {
-                        uint8_t val = queue_reader.peek();
-                        pin_write(config.sda_pin, val);
-                        sda_lvl = (val != 0);
-                        queue_reader.advance();
-                        m_writer_backoff.wake();
-                    }
-                }
-            }
-            else if (packet.type == I2C_Packet_Type::I2C_DATA)
-            {
-                // Push 8 bits into the queue
-                for (int i = 7; i >= 0; --i)
-                {
-                    queue_writer.insert_with_backoff((packet.value >> i) & 0x01U, m_writer_backoff);
-                    m_reader_backoff.wake();
-                }
-
-                // If we are already in READ_BYTE and waiting for the first bit, drive it now
-                if (state == I2C_State::READ_BYTE && bit_count == 0)
-                {
-                    if (queue_reader.try_advance())
-                    {
-                        uint8_t val = queue_reader.peek();
-                        pin_write(config.sda_pin, val);
-                        sda_lvl = (val != 0);
-                        queue_reader.advance();
-                        m_writer_backoff.wake();
-                    }
-                }
-            }
-            start_func();
-            return true;
+            return false;
         }
-        return false;
+
+        if (buffer[0] == HANDSHAKE_MAGIC_BYTE)
+        {
+            // It's likely a DisconnectMessage
+            return false;
+        }
+
+        if (n != sizeof(I2C_Packet))
+        {
+            return false;
+        }
+
+        const auto* packet = reinterpret_cast<const I2C_Packet*>(buffer);
+
+        if (packet->type == I2C_Packet_Type::I2C_ACK)
+        {
+            ack_from_slave = (packet->value != 0);
+            // For RESPONSE state, the master expects 1 bit (ACK)
+            queue_writer.insert_with_backoff(ack_from_slave ? 0 : 1, m_writer_backoff);
+            m_reader_backoff.wake();
+
+            // If we are in the RESPONSE state and waiting for this bit
+            if (state == I2C_State::RESPONSE && bit_count == 0)
+            {
+                if (queue_reader.try_advance())
+                {
+                    uint8_t val = queue_reader.peek();
+                    pin_write(config.sda_pin, val);
+                    sda_lvl = (val != 0);
+                    queue_reader.advance();
+                    m_writer_backoff.wake();
+                }
+            }
+        }
+        else if (packet->type == I2C_Packet_Type::I2C_DATA)
+        {
+            // Push 8 bits into the queue
+            for (int i = 7; i >= 0; --i)
+            {
+                queue_writer.insert_with_backoff((packet->value >> i) & 0x01U, m_writer_backoff);
+                m_reader_backoff.wake();
+            }
+
+            // If we are already in READ_BYTE and waiting for the first bit, drive it now
+            if (state == I2C_State::READ_BYTE && bit_count == 0)
+            {
+                if (queue_reader.try_advance())
+                {
+                    uint8_t val = queue_reader.peek();
+                    pin_write(config.sda_pin, val);
+                    sda_lvl = (val != 0);
+                    queue_reader.advance();
+                    m_writer_backoff.wake();
+                }
+            }
+        }
+        start_func();
+        return true;
     }
 };
 
@@ -507,14 +701,26 @@ public:
 private:
     [[nodiscard]] bool receive_from_master(int fd)
     {
-        I2C_Packet packet{ };
-        const auto received = recv(fd, &packet, sizeof(packet), 0);
-        if (received != sizeof(packet))
+        uint8_t buffer[16];
+        const auto received = recv(fd, buffer, sizeof(buffer), 0);
+        if (received <= 0)
         {
             return false;
         }
 
-        switch (packet.type)
+        if (buffer[0] == HANDSHAKE_MAGIC_BYTE)
+        {
+            return false; // Disconnect
+        }
+
+        if (received != sizeof(I2C_Packet))
+        {
+            return false;
+        }
+
+        const auto* packet = reinterpret_cast<const I2C_Packet*>(buffer);
+
+        switch (packet->type)
         {
             case I2C_Packet_Type::I2C_START:
                 start_local();
@@ -528,9 +734,9 @@ private:
 
             case I2C_Packet_Type::I2C_ADDRESS: {
                 start_local(); // Ensure START if not already
-                bit_bang_byte_local(packet.value);
+                bit_bang_byte_local(packet->value);
                 bool ack = read_ack_local();
-                matched_address = (packet.value >> 1U) == config.address;
+                matched_address = (packet->value >> 1U) == config.address;
                 // If matched, we must ACK back to Master
                 if (matched_address)
                 {
@@ -541,7 +747,7 @@ private:
             }
 
             case I2C_Packet_Type::I2C_WRITE_BYTE:
-                bit_bang_byte_local(packet.value);
+                bit_bang_byte_local(packet->value);
                 send_packet(I2C_Packet_Type::I2C_ACK, read_ack_local() ? 1 : 0);
                 break;
 
@@ -550,7 +756,7 @@ private:
                 break;
 
             case I2C_Packet_Type::I2C_ACK:
-                write_ack_local(packet.value != 0);
+                write_ack_local(packet->value != 0);
                 break;
 
             default:
