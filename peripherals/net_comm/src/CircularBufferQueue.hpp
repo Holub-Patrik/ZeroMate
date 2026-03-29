@@ -238,7 +238,6 @@ namespace TSP
 
             std::atomic<std::uint32_t> m_notification_count{ 0 };
             std::atomic<bool> m_is_sleeping{ false };
-            std::string name;
 
         public:
             SemBackoff() = delete;
@@ -250,12 +249,9 @@ namespace TSP
             SemBackoff(SemBackoff&&) = delete;
             SemBackoff& operator=(SemBackoff&&) = delete;
 
-            explicit SemBackoff(const std::uint64_t max_cycles_fast,
-                                const std::uint64_t max_cycles_relaxed,
-                                std::string name = "unknown")
+            explicit SemBackoff(const std::uint64_t max_cycles_fast, const std::uint64_t max_cycles_relaxed)
             : max_cycles_fast(max_cycles_fast)
             , max_cycles_relaxed(max_cycles_relaxed)
-            , name(std::move(name))
             {
             }
 

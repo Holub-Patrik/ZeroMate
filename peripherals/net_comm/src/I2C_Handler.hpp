@@ -8,13 +8,12 @@
 #include <unistd.h>
 #include <atomic>
 #include <thread>
-#include <chrono>
 #include <functional>
 #include <mutex>
 
+#include "Protocol.hpp"
 #include "CircularBufferQueue.hpp"
 #include "zero_mate/external_peripheral.hpp"
-#include "Util.hpp"
 
 // Forward declarations
 template<std::size_t Size>
@@ -143,15 +142,15 @@ public:
         receiver_stop();
     }
 
-    virtual void add_slave(int fd, in_port_t handshake_port)
+    virtual void add_slave(int fd, std::uint32_t slave_id)
     {
         (void)fd;
-        (void)handshake_port;
+        (void)slave_id;
     }
 
-    virtual void remove_slave(in_port_t handshake_port)
+    virtual void remove_slave(std::uint32_t slave_id)
     {
-        (void)handshake_port;
+        (void)slave_id;
     }
 
     virtual std::size_t get_slave_count() const
@@ -203,10 +202,10 @@ class I2C_Master final : public I2C_Base
     mutable std::mutex slave_fds_mutex;
 
     std::array<int, MAX_SLAVES> m_slave_fds{ };
-    std::array<in_port_t, MAX_SLAVES> m_slave_handshake_ports{ };
+    std::array<std::uint32_t, MAX_SLAVES> m_slave_ids{ };
     std::size_t m_slave_count = 0;
     std::unordered_map<int, std::size_t> m_fd_to_idx;
-    std::unordered_map<in_port_t, int> m_handshake_port_to_fd;
+    std::unordered_map<std::uint32_t, int> m_slave_id_to_fd;
 
     uint8_t shift_reg = 0;
 
@@ -245,29 +244,29 @@ public:
         }
     }
 
-    void add_slave(int fd, in_port_t handshake_port) override
+    void add_slave(int fd, std::uint32_t slave_id) override
     {
         {
             std::lock_guard<std::mutex> lock(slave_fds_mutex);
             if (m_slave_count < MAX_SLAVES)
             {
                 m_slave_fds[m_slave_count] = fd;
-                m_slave_handshake_ports[m_slave_count] = handshake_port;
+                m_slave_ids[m_slave_count] = slave_id;
                 m_fd_to_idx[fd] = m_slave_count;
-                m_handshake_port_to_fd[handshake_port] = fd;
+                m_slave_id_to_fd[slave_id] = fd;
                 m_slave_count++;
             }
         }
         wake_thread();
     }
 
-    void remove_slave(in_port_t handshake_port) override
+    void remove_slave(std::uint32_t slave_id) override
     {
         {
             std::lock_guard<std::mutex> lock(slave_fds_mutex);
-            if (m_handshake_port_to_fd.contains(handshake_port))
+            if (m_slave_id_to_fd.contains(slave_id))
             {
-                _remove_slave_at(m_fd_to_idx.at(m_handshake_port_to_fd.at(handshake_port)));
+                _remove_slave_at(m_fd_to_idx.at(m_slave_id_to_fd.at(slave_id)));
             }
         }
         this->start_func();
@@ -285,15 +284,15 @@ private:
     {
         send_disconnect(m_slave_fds[idx]);
         close(m_slave_fds[idx]);
-        m_handshake_port_to_fd.erase(m_slave_handshake_ports[idx]);
+        m_slave_id_to_fd.erase(m_slave_ids[idx]);
         m_fd_to_idx.erase(m_slave_fds[idx]);
 
         if (idx < m_slave_count - 1)
         {
             m_slave_fds[idx] = m_slave_fds[m_slave_count - 1];
-            m_slave_handshake_ports[idx] = m_slave_handshake_ports[m_slave_count - 1];
+            m_slave_ids[idx] = m_slave_ids[m_slave_count - 1];
             m_fd_to_idx[m_slave_fds[idx]] = idx;
-            m_handshake_port_to_fd[m_slave_handshake_ports[idx]] = m_slave_fds[idx];
+            m_slave_id_to_fd[m_slave_ids[idx]] = m_slave_fds[idx];
         }
 
         m_slave_count--;
@@ -302,13 +301,10 @@ private:
 
     void send_disconnect(int fd)
     {
-        struct
-        {
-            uint8_t magic = HANDSHAKE_MAGIC_BYTE;
-            uint8_t type = 3; // Disconnect
-            uint32_t bus_id;
-        } __attribute__((packed)) msg;
-        msg.bus_id = config.bus_id;
+        handshake::DisconnectMessage msg{ };
+        msg.config.protocol_id = handshake::ProtocolID::I2C;
+        msg.config.config.i2c.bus_id = config.bus_id;
+        msg.config.config.i2c.is_master = 1;
 
         send(fd, &msg, sizeof(msg), 0);
     }

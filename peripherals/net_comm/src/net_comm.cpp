@@ -4,13 +4,12 @@
 /// \brief Implementation of the Remote GPIO peripheral.
 // ---------------------------------------------------------------------------------------------------------------------
 
-#include "CircularBufferQueue.hpp"
-#include "net_comm.hpp"
-
 #include <cstring>
 #include <unistd.h>
 #include <sys/socket.h>
-#include <mutex>
+
+#include "CircularBufferQueue.hpp"
+#include "net_comm.hpp"
 
 namespace
 {
@@ -29,15 +28,15 @@ void GPIOServer::pin_write(const std::stop_token& stop_token)
     {
         if (!pin_write_queue_reader.try_advance())
         {
-            m_pin_write_reader_backoff.wait(
+            pin_write_reader_backoff.wait(
             [this, &stop_token]() { return stop_token.stop_requested() || pin_write_queue_reader.try_advance(); });
             continue;
         }
-        m_pin_write_reader_backoff.reset();
+        pin_write_reader_backoff.reset();
 
         const auto pair = pin_write_queue_reader.peek();
         pin_write_queue_reader.advance();
-        m_pin_write_writer_backoff.wake();
+        pin_write_writer_backoff.wake();
 
         func_set_pin(static_cast<std::uint32_t>(pair.first), pair.second > 0);
     }
@@ -46,9 +45,9 @@ void GPIOServer::pin_write(const std::stop_token& stop_token)
 void GPIOServer::write_to_pin(const std::uint8_t pin, const std::uint8_t value)
 {
     pin_write_spinlock.lock();
-    pin_write_queue_writer.insert_with_backoff({ pin, value }, m_pin_write_writer_backoff);
+    pin_write_queue_writer.insert_with_backoff({ pin, value }, pin_write_writer_backoff);
     // if the time before insertion was too long, wake up the reader
-    m_pin_write_reader_backoff.wake();
+    pin_write_reader_backoff.wake();
     pin_write_spinlock.unlock();
 }
 
@@ -178,8 +177,35 @@ void GPIOServer::remove_connection(std::size_t i)
 
     if (connection_data[i].status == ConnectionStatus::Connected)
     {
-        handshake::DisconnectMessage dmsg{ };
-        dmsg.net_id = connection_data[i].net_id;
+        handshake::DisconnectMessage d_msg{ };
+        const auto& info = connection_data[i];
+
+        d_msg.config.net_id = info.net_id;
+        d_msg.config.type = handshake::MessageType::Conf;
+        d_msg.config.port = info.opened_port;
+
+        const auto visitor =
+        overloads{ [&d_msg](const UART_P& protocol) {
+                      d_msg.config.protocol_id = handshake::ProtocolID::UART;
+                      d_msg.config.config.uart.baudrate = protocol.baudrate;
+                      d_msg.config.config.uart.data_bits = static_cast<uint8_t>(protocol.data_bits);
+                      d_msg.config.config.uart.start_bits = static_cast<uint8_t>(protocol.start_bits);
+                      d_msg.config.config.uart.parity_bits = static_cast<uint8_t>(protocol.parity_bits);
+                      d_msg.config.config.uart.stop_bits = static_cast<uint8_t>(protocol.stop_bits);
+                  },
+                   [&d_msg](const I2C_Master_P& p) {
+                       d_msg.config.protocol_id = handshake::ProtocolID::I2C;
+                       d_msg.config.config.i2c.bus_id = p.bus_id;
+                       d_msg.config.config.i2c.is_master = 1;
+                       d_msg.config.config.i2c.address = 0;
+                   },
+                   [&d_msg](const I2C_Slave_P& p) {
+                       d_msg.config.protocol_id = handshake::ProtocolID::I2C;
+                       d_msg.config.config.i2c.bus_id = p.bus_id;
+                       d_msg.config.config.i2c.is_master = 0;
+                       d_msg.config.config.i2c.address = p.address;
+                   } };
+        std::visit(visitor, info.protocol);
 
         struct sockaddr_in remote_addr{ };
         remote_addr.sin_family = AF_INET;
@@ -187,8 +213,8 @@ void GPIOServer::remove_connection(std::size_t i)
         inet_pton(AF_INET, connection_data[i].remote_ip.c_str(), &remote_addr.sin_addr);
 
         sendto(m_handshake_socket,
-               &dmsg,
-               sizeof(dmsg),
+               &d_msg,
+               sizeof(d_msg),
                0,
                reinterpret_cast<const struct sockaddr*>(&remote_addr),
                sizeof(remote_addr));
@@ -264,19 +290,19 @@ void GPIOServer::construct_connection(const conn_info& info)
     }
 }
 
-void GPIOServer::add_slave_to_master(std::uint32_t bus_id, int fd, in_port_t handshake_port)
+void GPIOServer::add_slave_to_master(std::uint32_t bus_id, int fd, std::uint32_t slave_id)
 {
     if (m_bus_id_to_idx.contains(bus_id))
     {
         const auto idx = m_bus_id_to_idx.at(bus_id);
         if (active_connections[idx])
         {
-            active_connections[idx]->add_slave(fd, handshake_port);
+            active_connections[idx]->add_slave(fd, slave_id);
         }
     }
 }
 
-void GPIOServer::remove_slave_from_master(in_port_t port)
+void GPIOServer::remove_slave_from_master(std::uint32_t slave_id)
 {
     for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; ++i)
     {
@@ -284,7 +310,7 @@ void GPIOServer::remove_slave_from_master(in_port_t port)
         {
             if (active_connections[i])
             {
-                active_connections[i]->remove_slave(port);
+                active_connections[i]->remove_slave(slave_id);
             }
         }
     }
@@ -330,19 +356,19 @@ void GPIOServer::initiate_handshake(std::size_t idx)
                                        msg.config.uart.parity_bits = static_cast<uint8_t>(protocol.parity_bits);
                                        msg.config.uart.stop_bits = static_cast<uint8_t>(protocol.stop_bits);
                                    },
-                                    [&msg](const I2C_Master_P& p) {
-                                        msg.protocol_id = handshake::ProtocolID::I2C_Master;
+                                    [&msg, &info](const I2C_Master_P& p) {
+                                        msg.protocol_id = handshake::ProtocolID::I2C;
                                         msg.config.i2c.bus_id = p.bus_id;
                                         msg.config.i2c.is_master = 1;
                                         msg.config.i2c.address = 0;
-                                        msg.net_id = p.bus_id;
+                                        msg.net_id = info.net_id;
                                     },
-                                    [&msg](const I2C_Slave_P& p) {
-                                        msg.protocol_id = handshake::ProtocolID::I2C_Slave;
+                                    [&msg, &info](const I2C_Slave_P& p) {
+                                        msg.protocol_id = handshake::ProtocolID::I2C;
                                         msg.config.i2c.bus_id = p.bus_id;
                                         msg.config.i2c.is_master = 0;
                                         msg.config.i2c.address = p.address;
-                                        msg.net_id = p.bus_id;
+                                        msg.net_id = info.net_id;
                                     } };
 
     std::visit(visitor, info.protocol);
@@ -437,25 +463,13 @@ void GPIOServer::handle_conf_msg(const handshake::ConfMessage& msg, const struct
 
     int found_idx = -1;
 
-    // Special handling for I2C Slave connecting to our Master
-    if (msg.protocol_id == handshake::ProtocolID::I2C_Slave)
+    if (msg.protocol_id == handshake::ProtocolID::I2C)
     {
-        if (m_bus_id_to_idx.contains(msg.config.i2c.bus_id))
-        {
-            const auto idx = m_bus_id_to_idx.at(msg.config.i2c.bus_id);
-            if (connection_bit_map[idx] && std::holds_alternative<I2C_Master_P>(connection_data[idx].protocol))
-            {
-                found_idx = static_cast<int>(idx);
-            }
-        }
-
-        if (found_idx == -1)
+        if (msg.config.i2c.is_master)
         {
             if (logging_system)
             {
-                std::string log_msg =
-                "Received I2C Slave handshake for unknown Bus ID: " + std::to_string(msg.config.i2c.bus_id);
-                logging_system->Warning(log_msg.c_str());
+                logging_system->Warning("Received I2C Master handshake. Master-to-Master not supported.");
             }
             sendto(m_handshake_socket,
                    &resp,
@@ -466,68 +480,24 @@ void GPIOServer::handle_conf_msg(const handshake::ConfMessage& msg, const struct
             return;
         }
 
-        resp.status = 1; // Accept
-
-        int sock = socket(AF_INET, SOCK_DGRAM, 0);
-        struct sockaddr_in temp_addr{ };
-        temp_addr.sin_family = AF_INET;
-        temp_addr.sin_addr.s_addr = INADDR_ANY;
-        temp_addr.sin_port = 0;
-        bind(sock, reinterpret_cast<struct sockaddr*>(&temp_addr), sizeof(temp_addr));
-        socklen_t len = sizeof(temp_addr);
-        getsockname(sock, reinterpret_cast<struct sockaddr*>(&temp_addr), &len);
-        const uint16_t data_port = ntohs(temp_addr.sin_port);
-
-        // Connect the socket to the remote data port
-        struct sockaddr_in remote_data_addr = addr;
-        remote_data_addr.sin_port = htons(msg.port);
-        connect(sock, reinterpret_cast<const struct sockaddr*>(&remote_data_addr), sizeof(remote_data_addr));
-
-        resp.port = data_port;
-        sendto(m_handshake_socket,
-               &resp,
-               sizeof(resp),
-               0,
-               reinterpret_cast<const struct sockaddr*>(&addr),
-               sizeof(addr));
-
-        add_slave_to_master(msg.config.i2c.bus_id, sock, ntohs(addr.sin_port));
-
-        if (logging_system)
+        if (m_bus_id_to_idx.contains(msg.config.i2c.bus_id))
         {
-            std::string log_msg = "Added remote I2C Slave (Port " + std::to_string(msg.port) +
-                                  ") to Bus ID: " + std::to_string(msg.config.i2c.bus_id);
-            logging_system->Info(log_msg.c_str());
-        }
-        return;
-    }
-
-    // Standard lookup for other protocols (UART, I2C Master as Slave)
-    for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; ++i)
-    {
-        if (connection_bit_map[i])
-        {
-            auto& conn = connection_data[i];
-
-            if (msg.protocol_id == handshake::ProtocolID::I2C_Master)
+            const auto idx = m_bus_id_to_idx.at(msg.config.i2c.bus_id);
+            if (connection_bit_map[idx] && std::holds_alternative<I2C_Master_P>(connection_data[idx].protocol))
             {
-                if (std::holds_alternative<I2C_Slave_P>(conn.protocol))
-                {
-                    const auto& p = std::get<I2C_Slave_P>(conn.protocol);
-                    if (p.bus_id == msg.config.i2c.bus_id)
-                    {
-                        found_idx = static_cast<int>(i);
-                        break;
-                    }
-                }
+                found_idx = static_cast<int>(idx);
             }
-            else if (msg.protocol_id == handshake::ProtocolID::UART)
+        }
+    }
+    else if (msg.protocol_id == handshake::ProtocolID::UART)
+    {
+        for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; ++i)
+        {
+            if (connection_bit_map[i] && connection_data[i].net_id == msg.net_id &&
+                std::holds_alternative<UART_P>(connection_data[i].protocol))
             {
-                if (conn.net_id == msg.net_id && std::holds_alternative<UART_P>(conn.protocol))
-                {
-                    found_idx = static_cast<int>(i);
-                    break;
-                }
+                found_idx = static_cast<int>(i);
+                break;
             }
         }
     }
@@ -568,15 +538,30 @@ void GPIOServer::handle_conf_msg(const handshake::ConfMessage& msg, const struct
     resp.port = data_port;
     sendto(m_handshake_socket, &resp, sizeof(resp), 0, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr));
 
-    // Update connection state
-    auto& conn = connection_data[found_idx];
-    conn.status = ConnectionStatus::Connecting;
-    conn.opened_port = data_port;
-    conn.is_responder = true;
-    conn.remote_ip = inet_ntoa(addr.sin_addr);
-    conn.remote_port = ntohs(addr.sin_port);
-    conn.remote_data_port = msg.port;
-    conn.sockfd = sock;
+    if (msg.protocol_id == handshake::ProtocolID::I2C)
+    {
+        add_slave_to_master(msg.config.i2c.bus_id, sock, msg.net_id);
+
+        if (logging_system)
+        {
+            std::string log_msg = "Added remote I2C Slave (Port " + std::to_string(msg.port) + ", Address: 0x" +
+                                  std::to_string(msg.config.i2c.address) + ", Slave ID: " + std::to_string(msg.net_id) +
+                                  ") to Bus ID: " + std::to_string(msg.config.i2c.bus_id);
+            logging_system->Info(log_msg.c_str());
+        }
+    }
+    else
+    {
+        // Update connection state for UART
+        auto& conn = connection_data[found_idx];
+        conn.status = ConnectionStatus::Connecting;
+        conn.opened_port = data_port;
+        conn.is_responder = true;
+        conn.remote_ip = inet_ntoa(addr.sin_addr);
+        conn.remote_port = ntohs(addr.sin_port);
+        conn.remote_data_port = msg.port;
+        conn.sockfd = sock;
+    }
 }
 
 void GPIOServer::handle_response_msg(const handshake::ResponseMessage& msg, const struct sockaddr_in& addr)
@@ -677,14 +662,17 @@ void GPIOServer::handle_final_response_msg(const handshake::FinalResponseMessage
 
 void GPIOServer::handle_disconnect_msg(const handshake::DisconnectMessage& msg, const struct sockaddr_in& addr)
 {
-    remove_slave_from_master(ntohs(addr.sin_port));
+    if (msg.config.protocol_id == handshake::ProtocolID::I2C && !msg.config.config.i2c.is_master)
+    {
+        remove_slave_from_master(msg.config.net_id);
+    }
 
-    if (!m_net_id_to_idx.contains(msg.net_id))
+    if (!m_net_id_to_idx.contains(msg.config.net_id))
     {
         return;
     }
 
-    const auto idx = m_net_id_to_idx.at(msg.net_id);
+    const auto idx = m_net_id_to_idx.at(msg.config.net_id);
     auto& conn = connection_data[idx];
 
     if (connection_bit_map[idx] && conn.status == ConnectionStatus::Connected)
@@ -693,7 +681,7 @@ void GPIOServer::handle_disconnect_msg(const handshake::DisconnectMessage& msg, 
         {
             if (logging_system)
             {
-                std::string log_msg = "Remote disconnected Connection ID: " + std::to_string(msg.net_id);
+                std::string log_msg = "Remote disconnected Connection ID: " + std::to_string(msg.config.net_id);
                 logging_system->Info(log_msg.c_str());
             }
 
@@ -739,7 +727,7 @@ void GPIOServer::stop()
 {
     m_server_thread.request_stop();
     m_pin_write_thread.request_stop();
-    m_pin_write_reader_backoff.wake();
+    pin_write_reader_backoff.wake();
 
     for (std::size_t i = 0; i < connection_threads.size(); i++)
     {
@@ -830,7 +818,7 @@ GPIOConnection::GPIOConnection(std::size_t idx, GPIOServer& server)
 
         if (m_socket != -1)
         {
-            this->add_slave(m_socket, connection.remote_port);
+            this->add_slave(m_socket, static_cast<uint32_t>(connection.remote_port));
         }
     }
     else if (std::holds_alternative<I2C_Slave_P>(connection.protocol))
@@ -1097,6 +1085,7 @@ void Remote_GPIO::Render_Settings()
         }
         else if (m_ui_add_state.protocol_type == 2) // I2C Slave
         {
+            ImGui::InputInt("Slave ID", &m_ui_add_state.net_id);
             ImGui::InputInt("Bus ID", &m_ui_add_state.i2c_id);
             ImGui::InputInt("Address", &m_ui_add_state.address);
             ImGui::InputInt("SCL Pin", &m_ui_add_state.scl_pin);
@@ -1111,7 +1100,7 @@ void Remote_GPIO::Render_Settings()
             info.remote_ip = m_ui_add_state.ip;
             info.remote_port = m_ui_add_state.port;
 
-            if (m_ui_add_state.protocol_type == 0)
+            if (m_ui_add_state.protocol_type == 0) // UART
             {
                 info.net_id = static_cast<uint32_t>(m_ui_add_state.net_id);
                 UART_P p{ };
@@ -1124,7 +1113,7 @@ void Remote_GPIO::Render_Settings()
                 p.stop_bits = m_ui_add_state.stop_bits;
                 info.protocol = p;
             }
-            else if (m_ui_add_state.protocol_type == 1)
+            else if (m_ui_add_state.protocol_type == 1) // I2C Master
             {
                 info.net_id = static_cast<uint32_t>(m_ui_add_state.i2c_id);
                 I2C_Master_P p{ };
@@ -1135,9 +1124,9 @@ void Remote_GPIO::Render_Settings()
                 info.remote_ip = "";
                 info.remote_port = 0;
             }
-            else if (m_ui_add_state.protocol_type == 2)
+            else if (m_ui_add_state.protocol_type == 2) // I2C Slave
             {
-                info.net_id = static_cast<uint32_t>(m_ui_add_state.i2c_id);
+                info.net_id = static_cast<uint32_t>(m_ui_add_state.net_id);
                 I2C_Slave_P p{ };
                 p.bus_id = static_cast<uint32_t>(m_ui_add_state.i2c_id);
                 p.address = static_cast<uint8_t>(m_ui_add_state.address);
@@ -1158,9 +1147,6 @@ void Remote_GPIO::Render_Settings()
         }
         ImGui::EndPopup();
     }
-    // {
-    //     ImGui::CloseCurrentPopup();
-    // }
 
     // Modal: View Connection
     if (ImGui::BeginPopupModal("View Connection", NULL, ImGuiWindowFlags_AlwaysAutoResize))
@@ -1180,7 +1166,7 @@ void Remote_GPIO::Render_Settings()
             ImGui::Separator();
 
             std::visit(
-            [](auto& p) {
+            [conn](auto& p) {
                 using T = std::remove_cvref_t<decltype(p)>;
                 if constexpr (std::is_same_v<T, UART_P>)
                 {
@@ -1197,13 +1183,15 @@ void Remote_GPIO::Render_Settings()
                 {
                     ImGui::Text("Protocol: I2C Master");
                     ImGui::Text("Bus ID: %u", p.bus_id);
+                    ImGui::Text("Connection ID: %u", conn.net_id);
                     ImGui::Text("SCL Pin: %u", p.scl_pin);
                     ImGui::Text("SDA Pin: %u", p.sda_pin);
                 }
                 else if constexpr (std::is_same_v<T, I2C_Slave_P>)
                 {
                     ImGui::Text("Protocol: I2C Slave");
-                    ImGui::Text("Bus ID: %u", p.bus_id);
+                    ImGui::Text("Target Bus ID: %u", p.bus_id);
+                    ImGui::Text("Slave ID: %u", conn.net_id);
                     ImGui::Text("Address: 0x%02X", p.address);
                     ImGui::Text("SCL Pin: %u", p.scl_pin);
                     ImGui::Text("SDA Pin: %u", p.sda_pin);

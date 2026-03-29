@@ -25,6 +25,7 @@
 #include "zero_mate/external_peripheral.hpp"
 #include "CircularBufferQueue.hpp"
 #include "Util.hpp"
+#include "Protocol.hpp"
 #include "UART_Handler.hpp"
 #include "I2C_Handler.hpp"
 
@@ -62,79 +63,6 @@ using conn_info = struct conn_info_struct
 
     std::chrono::time_point<std::chrono::steady_clock> start_time;
 };
-
-namespace handshake
-{
-    static constexpr std::uint8_t MAGIC_BYTE = 0x5A;
-
-    enum class MessageType : std::uint8_t
-    {
-        Conf = 0,
-        Response = 1,
-        FinalResponse = 2,
-        Disconnect = 3,
-    };
-
-    enum class ProtocolID : std::uint8_t
-    {
-        UART = 0,
-        I2C_Master = 1,
-        I2C_Slave = 2,
-    };
-
-    struct UARTConfig
-    {
-        std::uint32_t baudrate;
-        std::uint8_t data_bits;
-        std::uint8_t start_bits;
-        std::uint8_t parity_bits;
-        std::uint8_t stop_bits;
-    } __attribute__((packed));
-
-    struct I2CConfig
-    {
-        std::uint32_t bus_id;
-        std::uint8_t is_master;
-        std::uint8_t address;
-    } __attribute__((packed));
-
-    struct ConfMessage
-    {
-        std::uint8_t magic = MAGIC_BYTE;
-        MessageType type = MessageType::Conf;
-        ProtocolID protocol_id;
-        std::uint16_t port;
-        std::uint32_t net_id;
-        union {
-            UARTConfig uart;
-            I2CConfig i2c;
-        } config;
-    } __attribute__((packed));
-
-    struct ResponseMessage
-    {
-        std::uint8_t magic = MAGIC_BYTE;
-        MessageType type = MessageType::Response;
-        std::uint8_t status; // 1: Accept, 0: Decline
-        std::uint16_t port;
-        std::uint32_t net_id;
-    } __attribute__((packed));
-
-    struct FinalResponseMessage
-    {
-        std::uint8_t magic = MAGIC_BYTE;
-        MessageType type = MessageType::FinalResponse;
-        std::uint8_t status; // 1: Accept, 0: Decline
-        std::uint32_t net_id;
-    } __attribute__((packed));
-
-    struct DisconnectMessage
-    {
-        std::uint8_t magic = MAGIC_BYTE;
-        MessageType type = MessageType::Disconnect;
-        std::uint32_t net_id;
-    } __attribute__((packed));
-}
 
 using conn_id = std::uint64_t;
 using pin_pair = std::pair<std::uint8_t, std::uint8_t>;
@@ -207,14 +135,14 @@ public:
         return !sender.get_stop_token().stop_requested() && handler.is_alive();
     }
 
-    void add_slave(int fd, in_port_t handshake_port)
+    void add_slave(int fd, std::uint32_t net_id)
     {
-        handler.add_slave(fd, handshake_port);
+        handler.add_slave(fd, net_id);
     }
 
-    void remove_slave(in_port_t port)
+    void remove_slave(std::uint32_t net_id)
     {
-        handler.remove_slave(port);
+        handler.remove_slave(net_id);
     }
 
     [[nodiscard]] std::size_t get_slave_count() const
@@ -254,7 +182,7 @@ class GPIOConnection;
 class GPIOServer final
 {
 public:
-    static constexpr std::uint64_t BACKOFF_CYCLES = 1000;
+    static constexpr std::uint64_t BACKOFF_CYCLES_FAST = 1000;
     static constexpr std::uint64_t BACKOFF_CYCLES_RELAXED = 20'000;
     static constexpr auto NET_WAIT_TIME = std::chrono::microseconds{ 100 };
     static constexpr std::size_t MAX_CONNECTION_COUNT = 16;
@@ -270,10 +198,10 @@ public:
         TSP::BF::SemBackoff handler_queue_reader;
 
         ConnectionBackoffs()
-        : out_queue_writer(BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED, "out_queue_writer")
-        , out_queue_reader(BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED, "out_queue_reader")
-        , handler_queue_writer(BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED, "handler_queue_writer")
-        , handler_queue_reader(BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED, "handler_queue_reader")
+        : out_queue_writer(BACKOFF_CYCLES_FAST, BACKOFF_CYCLES_RELAXED)
+        , out_queue_reader(BACKOFF_CYCLES_FAST, BACKOFF_CYCLES_RELAXED)
+        , handler_queue_writer(BACKOFF_CYCLES_FAST, BACKOFF_CYCLES_RELAXED)
+        , handler_queue_reader(BACKOFF_CYCLES_FAST, BACKOFF_CYCLES_RELAXED)
         {
         }
 
@@ -287,24 +215,22 @@ private:
     TSP::Queue::Buffer<pin_pair, QUEUE_SIZE> pin_write_queue_buf{ };
     TSP::Queue::Reader<pin_pair, QUEUE_SIZE> pin_write_queue_reader;
     TSP::Queue::Writer<pin_pair, QUEUE_SIZE> pin_write_queue_writer;
+
     Spinlock pin_write_spinlock;
+    TSP::BF::SemBackoff pin_write_writer_backoff{ BACKOFF_CYCLES_FAST, BACKOFF_CYCLES_RELAXED };
+    TSP::BF::SemBackoff pin_write_reader_backoff{ BACKOFF_CYCLES_FAST, BACKOFF_CYCLES_RELAXED };
 
-    TSP::BF::SemBackoff m_pin_write_writer_backoff{ BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED, "pin_write_writer" };
-    TSP::BF::SemBackoff m_pin_write_reader_backoff{ BACKOFF_CYCLES, BACKOFF_CYCLES_RELAXED, "pin_write_reader" };
-
-    // a bit map lookup might be best to assign new threads
     std::array<TSP::Queue::Buffer<pin_pair, BUFFER_SIZE>, BUFFER_COUNT> out_queue_buffers;
     std::array<TSP::Queue::Writer<pin_pair, BUFFER_SIZE>, BUFFER_COUNT> out_queue_writers;
-
-    // this could be converted into a bit map, but bit instruction are extra instructions
-    std::array<bool, MAX_CONNECTION_COUNT> connection_bit_map{ false };
-
     std::array<ConnectionBackoffs, MAX_CONNECTION_COUNT> m_backoffs;
 
+    std::array<bool, MAX_CONNECTION_COUNT> connection_bit_map{ false };
+
     std::array<std::jthread, MAX_CONNECTION_COUNT> connection_threads;
+    std::array<std::atomic<bool>, MAX_CONNECTION_COUNT> connection_running;
+
     std::array<std::unique_ptr<GPIOConnection>, MAX_CONNECTION_COUNT> active_connections;
     std::array<conn_info, MAX_CONNECTION_COUNT> connection_data;
-    std::array<std::atomic<bool>, MAX_CONNECTION_COUNT> connection_running;
 
     FastMap pin_to_conn_id;
     FastMap net_id_to_conn_id;
@@ -361,8 +287,8 @@ public:
     void add_connection(const conn_info& info);
     void remove_connection(std::size_t i);
     void construct_connection(const conn_info& info);
-    void add_slave_to_master(std::uint32_t bus_id, int fd, in_port_t handshake_port);
-    void remove_slave_from_master(in_port_t port);
+    void add_slave_to_master(std::uint32_t bus_id, int fd, std::uint32_t slave_id);
+    void remove_slave_from_master(std::uint32_t slave_id);
     void run(const std::stop_token& stop_token);
     void stop();
 
@@ -476,19 +402,19 @@ public:
         return m_server_running.load() && m_connection_running.load();
     }
 
-    void add_slave(int fd, in_port_t handshake_port)
+    void add_slave(int fd, std::uint32_t slave_id)
     {
         if (m_processor.has_value())
         {
-            std::visit([fd, handshake_port](auto& p) { p.add_slave(fd, handshake_port); }, *m_processor);
+            std::visit([fd, slave_id](auto& p) { p.add_slave(fd, slave_id); }, *m_processor);
         }
     }
 
-    void remove_slave(in_port_t port)
+    void remove_slave(std::uint32_t slave_id)
     {
         if (m_processor.has_value())
         {
-            std::visit([port](auto& p) { p.remove_slave(port); }, *m_processor);
+            std::visit([slave_id](auto& p) { p.remove_slave(slave_id); }, *m_processor);
         }
     }
 

@@ -91,15 +91,15 @@ public:
         receiver = std::jthread([this](std::stop_token stop_token) { this->receiver_thread(stop_token); });
     }
 
-    void add_slave(int fd, in_port_t handshake_port)
+    void add_slave(int fd, std::uint32_t net_id)
     {
         (void)fd;
-        (void)handshake_port;
+        (void)net_id;
     }
 
-    void remove_slave(in_port_t handshake_port)
+    void remove_slave(std::uint32_t net_id)
     {
-        (void)handshake_port;
+        (void)net_id;
     }
 
     [[nodiscard]] std::size_t get_slave_count() const

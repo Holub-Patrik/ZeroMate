@@ -218,10 +218,10 @@ TEST(net_comm, i2c_combined_interaction)
 {
     g_master_cpu.reset();
     std::atomic<uint64_t> total_cycles{ 0 };
-    TSP::BF::SemBackoff m_reader_backoff{ 100, 100, "m_reader" };
-    TSP::BF::SemBackoff m_writer_backoff{ 100, 100, "m_writer" };
-    TSP::BF::SemBackoff s_reader_backoff{ 100, 100, "s_reader" };
-    TSP::BF::SemBackoff s_writer_backoff{ 100, 100, "s_writer" };
+    TSP::BF::SemBackoff m_reader_backoff{ 100, 100 };
+    TSP::BF::SemBackoff m_writer_backoff{ 100, 100 };
+    TSP::BF::SemBackoff s_reader_backoff{ 100, 100 };
+    TSP::BF::SemBackoff s_writer_backoff{ 100, 100 };
 
     std::jthread cycle_advancer([&total_cycles](std::stop_token stop_token) {
         while (!stop_token.stop_requested())
@@ -273,7 +273,7 @@ TEST(net_comm, i2c_combined_interaction)
                                        .writer_backoff = m_writer_backoff };
 
     I2C_Master<128> master(m_cfg, h_ctx);
-    master.add_slave(sv[0], 0);
+    master.add_slave(sv[0], 100);
 
     Mock_I2C_Peripheral peripheral(SLAVE_ADDR, SDA, SCL, nullptr);
     peripheral.data_to_send = { 0x55 };
@@ -425,10 +425,10 @@ TEST(net_comm, i2c_read_interaction)
 {
     g_master_cpu.reset();
     std::atomic<uint64_t> total_cycles{ 0 };
-    TSP::BF::SemBackoff m_reader_backoff{ 100, 100, "m_reader" };
-    TSP::BF::SemBackoff m_writer_backoff{ 100, 100, "m_writer" };
-    TSP::BF::SemBackoff s_reader_backoff{ 100, 100, "s_reader" };
-    TSP::BF::SemBackoff s_writer_backoff{ 100, 100, "s_writer" };
+    TSP::BF::SemBackoff m_reader_backoff{ 100, 100 };
+    TSP::BF::SemBackoff m_writer_backoff{ 100, 100 };
+    TSP::BF::SemBackoff s_reader_backoff{ 100, 100 };
+    TSP::BF::SemBackoff s_writer_backoff{ 100, 100 };
 
     std::jthread cycle_advancer([&total_cycles](std::stop_token stop_token) {
         while (!stop_token.stop_requested())
@@ -480,7 +480,7 @@ TEST(net_comm, i2c_read_interaction)
                                        .writer_backoff = m_writer_backoff };
 
     I2C_Master<128> master(m_cfg, h_ctx);
-    master.add_slave(sv[0], 0);
+    master.add_slave(sv[0], 100);
 
     Mock_I2C_Peripheral peripheral(SLAVE_ADDR, SDA, SCL, nullptr);
     peripheral.data_to_send = { 0x55 };
