@@ -70,112 +70,37 @@ using pin_pair = std::pair<std::uint8_t, std::uint8_t>;
 template<std::size_t QUEUE_SIZE>
 using protocol_variant = std::variant<UART_Handler<QUEUE_SIZE>, I2C_Master<QUEUE_SIZE>, I2C_Slave<QUEUE_SIZE>>;
 
-template<typename Type, std::size_t Size>
-struct BitProcessorContext
+namespace command
 {
-    TSP::Queue::Buffer<Type, Size>* buf;
-    const std::atomic<std::uint64_t>* total_cycles;
-    TSP::BF::SemBackoff& reader_backoff;
-    TSP::BF::SemBackoff& writer_backoff;
-};
-
-template<typename Type, std::size_t Size, typename Handler>
-class BitProcessor final
-{
-public:
-    using pin_write_t = std::function<void(std::uint8_t, std::uint8_t)>;
-    using pin_read_t = std::function<std::uint8_t(std::uint8_t)>;
-
-private:
-    Handler handler;
-    TSP::Queue::Reader<Type, Size> queue_reader;
-    TSP::BF::SemBackoff& m_reader_backoff;
-    TSP::BF::SemBackoff& m_writer_backoff;
-    const std::atomic<std::uint64_t>* m_total_cycles;
-
-    std::jthread sender;
-
-public:
-    template<typename... Args>
-    BitProcessor(BitProcessorContext<Type, Size> ctx, Args&&... args)
-    : handler(std::forward<Args>(args)...)
-    , queue_reader(ctx.buf)
-    , m_reader_backoff(ctx.reader_backoff)
-    , m_writer_backoff(ctx.writer_backoff)
-    , m_total_cycles(ctx.total_cycles)
+    struct AddSlave
     {
-    }
+        int fd;
+        std::uint32_t slave_id;
+    };
 
-    ~BitProcessor()
+    struct RemoveSlave
     {
-        stop();
-    }
+        std::uint32_t slave_id;
+    };
 
-    BitProcessor(const BitProcessor&) = delete;
-    BitProcessor& operator=(const BitProcessor&) = delete;
-
-    BitProcessor(BitProcessor&&) = delete;
-    BitProcessor& operator=(BitProcessor&&) = delete;
-
-    void start()
+    struct GetSlaveCount
     {
-        sender = std::jthread{ [this](std::stop_token stop_token) { this->run_sender(stop_token); } };
-        handler.start_receiver();
-    }
+    };
 
-    void stop()
+    using Command = std::variant<AddSlave, RemoveSlave, GetSlaveCount>;
+
+    enum class ResponseStatus
     {
-        sender.request_stop();
-        m_reader_backoff.wake();
-        handler.receiver_stop();
-    }
+        Success,
+        Fail
+    };
 
-    [[nodiscard]] bool is_running() const
+    struct Response
     {
-        return !sender.get_stop_token().stop_requested() && handler.is_alive();
-    }
-
-    void add_slave(int fd, std::uint32_t net_id)
-    {
-        handler.add_slave(fd, net_id);
-    }
-
-    void remove_slave(std::uint32_t net_id)
-    {
-        handler.remove_slave(net_id);
-    }
-
-    [[nodiscard]] std::size_t get_slave_count() const
-    {
-        return handler.get_slave_count();
-    }
-
-private:
-    void run_sender(std::stop_token stop_token)
-    {
-        std::uint64_t last_cycles = m_total_cycles->load();
-
-        while (!stop_token.stop_requested())
-        {
-            if (!queue_reader.try_advance())
-            {
-                m_reader_backoff.wait(
-                [this, &stop_token]() { return stop_token.stop_requested() || queue_reader.try_advance(); });
-                continue;
-            }
-            m_reader_backoff.reset();
-
-            const auto pair = queue_reader.peek();
-            queue_reader.advance();
-            m_writer_backoff.wake();
-
-            const std::uint64_t now_cycles = m_total_cycles->load();
-            const auto delta = static_cast<std::uint32_t>(now_cycles - last_cycles);
-            last_cycles = now_cycles;
-            handler.process_bit(pair, delta);
-        }
-    }
-};
+        ResponseStatus status;
+        std::uint32_t data; // e.g., slave count
+    };
+}
 
 class GPIOConnection;
 
@@ -259,7 +184,6 @@ private:
     void handle_handshake();
     void handle_conf_msg(const handshake::ConfMessage& msg, const struct sockaddr_in& addr);
     void handle_response_msg(const handshake::ResponseMessage& msg, const struct sockaddr_in& addr);
-    void handle_final_response_msg(const handshake::FinalResponseMessage& msg, const struct sockaddr_in& addr);
     void handle_disconnect_msg(const handshake::DisconnectMessage& msg, const struct sockaddr_in& addr);
     void cleanup_finished_connections();
 
@@ -369,12 +293,11 @@ private:
     std::atomic<bool>& m_connection_running;
     const std::atomic<std::uint64_t>* m_total_cycles;
 
-    using processor_t =
-    std::variant<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE, UART_Handler<GPIOServer::BUFFER_SIZE>>,
-                 BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE, I2C_Master<GPIOServer::BUFFER_SIZE>>,
-                 BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE, I2C_Slave<GPIOServer::BUFFER_SIZE>>>;
+    using handler_t = std::variant<UART_Handler<GPIOServer::BUFFER_SIZE>,
+                                   I2C_Master<GPIOServer::BUFFER_SIZE>,
+                                   I2C_Slave<GPIOServer::BUFFER_SIZE>>;
 
-    std::optional<processor_t> m_processor;
+    std::optional<handler_t> m_handler;
 
 public:
     GPIOConnection() = delete;
@@ -402,30 +325,7 @@ public:
         return m_server_running.load() && m_connection_running.load();
     }
 
-    void add_slave(int fd, std::uint32_t slave_id)
-    {
-        if (m_processor.has_value())
-        {
-            std::visit([fd, slave_id](auto& p) { p.add_slave(fd, slave_id); }, *m_processor);
-        }
-    }
-
-    void remove_slave(std::uint32_t slave_id)
-    {
-        if (m_processor.has_value())
-        {
-            std::visit([slave_id](auto& p) { p.remove_slave(slave_id); }, *m_processor);
-        }
-    }
-
-    [[nodiscard]] std::size_t get_slave_count() const
-    {
-        if (m_processor.has_value())
-        {
-            return std::visit([](auto& p) { return p.get_slave_count(); }, *m_processor);
-        }
-        return 0;
-    }
+    command::Response execute(const command::Command& cmd);
 };
 
 // ---------------------------------------------------------------------------------------------------------------------

@@ -10,7 +10,6 @@ namespace handshake
     {
         Conf = 0,
         Response = 1,
-        FinalResponse = 2,
         Disconnect = 3,
     };
 
@@ -55,14 +54,6 @@ namespace handshake
         MessageType type = MessageType::Response;
         std::uint8_t status; // 1: Accept, 0: Decline
         std::uint16_t port;
-        std::uint32_t net_id;
-    } __attribute__((packed));
-
-    struct FinalResponseMessage
-    {
-        std::uint8_t magic = MAGIC_BYTE;
-        MessageType type = MessageType::FinalResponse;
-        std::uint8_t status; // 1: Accept, 0: Decline
         std::uint32_t net_id;
     } __attribute__((packed));
 

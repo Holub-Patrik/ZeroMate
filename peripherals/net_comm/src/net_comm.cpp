@@ -297,7 +297,7 @@ void GPIOServer::add_slave_to_master(std::uint32_t bus_id, int fd, std::uint32_t
         const auto idx = m_bus_id_to_idx.at(bus_id);
         if (active_connections[idx])
         {
-            active_connections[idx]->add_slave(fd, slave_id);
+            active_connections[idx]->execute(command::AddSlave{ fd, slave_id });
         }
     }
 }
@@ -310,7 +310,7 @@ void GPIOServer::remove_slave_from_master(std::uint32_t slave_id)
         {
             if (active_connections[i])
             {
-                active_connections[i]->remove_slave(slave_id);
+                active_connections[i]->execute(command::RemoveSlave{ slave_id });
             }
         }
     }
@@ -320,7 +320,11 @@ std::size_t GPIOServer::get_slave_count(std::size_t idx) const
 {
     if (idx < MAX_CONNECTION_COUNT && active_connections[idx])
     {
-        return active_connections[idx]->get_slave_count();
+        auto resp = active_connections[idx]->execute(command::GetSlaveCount{ });
+        if (resp.status == command::ResponseStatus::Success)
+        {
+            return resp.data;
+        }
     }
     return 0;
 }
@@ -382,7 +386,7 @@ void GPIOServer::initiate_handshake(std::size_t idx)
            &msg,
            sizeof(msg),
            0,
-           reinterpret_cast<struct sockaddr*>(&remote_addr),
+           reinterpret_cast<const struct sockaddr*>(&remote_addr),
            sizeof(remote_addr));
 
     // Update connection state
@@ -426,13 +430,6 @@ void GPIOServer::handle_handshake()
                     if (bytes_received == sizeof(handshake::ResponseMessage))
                     {
                         handle_response_msg(*reinterpret_cast<const handshake::ResponseMessage*>(buf), addr);
-                    }
-                    break;
-
-                case handshake::MessageType::FinalResponse:
-                    if (bytes_received == sizeof(handshake::FinalResponseMessage))
-                    {
-                        handle_final_response_msg(*reinterpret_cast<const handshake::FinalResponseMessage*>(buf), addr);
                     }
                     break;
 
@@ -554,13 +551,15 @@ void GPIOServer::handle_conf_msg(const handshake::ConfMessage& msg, const struct
     {
         // Update connection state for UART
         auto& conn = connection_data[found_idx];
-        conn.status = ConnectionStatus::Connecting;
+        conn.status = ConnectionStatus::Connected;
         conn.opened_port = data_port;
         conn.is_responder = true;
         conn.remote_ip = inet_ntoa(addr.sin_addr);
         conn.remote_port = ntohs(addr.sin_port);
         conn.remote_data_port = msg.port;
         conn.sockfd = sock;
+
+        construct_connection(conn);
     }
 }
 
@@ -578,16 +577,6 @@ void GPIOServer::handle_response_msg(const handshake::ResponseMessage& msg, cons
                 // Verify it's from the same IP and port
                 if (conn_data.remote_ip == inet_ntoa(addr.sin_addr) && conn_data.remote_port == ntohs(addr.sin_port))
                 {
-                    handshake::FinalResponseMessage final_resp{ };
-                    final_resp.status = msg.status;
-                    final_resp.net_id = msg.net_id;
-                    sendto(m_handshake_socket,
-                           &final_resp,
-                           sizeof(final_resp),
-                           0,
-                           reinterpret_cast<const struct sockaddr*>(&addr),
-                           sizeof(addr));
-
                     if (msg.status == 1)
                     {
                         conn_data.remote_data_port = msg.port;
@@ -611,47 +600,6 @@ void GPIOServer::handle_response_msg(const handshake::ResponseMessage& msg, cons
                             close(conn_data.sockfd);
                             conn_data.sockfd = -1;
                         }
-                    }
-                    break;
-                }
-            }
-        }
-    }
-}
-
-void GPIOServer::handle_final_response_msg(const handshake::FinalResponseMessage& msg, const struct sockaddr_in& addr)
-{
-    for (std::size_t i = 0; i < MAX_CONNECTION_COUNT; ++i)
-    {
-        if (connection_bit_map[i])
-        {
-            auto& conn_data = connection_data[i];
-            if (conn_data.net_id == msg.net_id && conn_data.status == ConnectionStatus::Connecting &&
-                conn_data.is_responder)
-            {
-                if (conn_data.remote_ip == inet_ntoa(addr.sin_addr) && conn_data.remote_port == ntohs(addr.sin_port))
-                {
-                    if (msg.status == 1)
-                    {
-                        conn_data.status = ConnectionStatus::Connected;
-
-                        if (logging_system)
-                        {
-                            std::string log_msg = "Final ACK received from " + conn_data.remote_ip + ":" +
-                                                  std::to_string(conn_data.remote_port);
-                            logging_system->Info(log_msg.c_str());
-                        }
-
-                        construct_connection(connection_data[i]);
-                    }
-                    else
-                    {
-                        if (connection_data[i].sockfd != -1)
-                        {
-                            close(connection_data[i].sockfd);
-                            connection_data[i].sockfd = -1;
-                        }
-                        connection_data[i].status = ConnectionStatus::Failed;
                     }
                     break;
                 }
@@ -773,13 +721,6 @@ GPIOConnection::GPIOConnection(std::size_t idx, GPIOServer& server)
     auto pin_write_cb = [this](std::uint8_t pin, std::uint8_t val) { this->write_to_pin(pin, val); };
     auto pin_read_cb = [this](std::uint8_t pin) { return static_cast<uint8_t>(m_read_pin(pin)); };
 
-    const BitProcessorContext<pin_pair, GPIOServer::BUFFER_SIZE> bp_ctx = {
-        .buf = server.get_out_queue_buffer(idx),
-        .total_cycles = m_total_cycles,
-        .reader_backoff = m_backoffs.out_queue_reader,
-        .writer_backoff = m_backoffs.out_queue_writer,
-    };
-
     if (std::holds_alternative<UART_P>(connection.protocol))
     {
         auto& uart_p = std::get<UART_P>(connection.protocol);
@@ -790,11 +731,7 @@ GPIOConnection::GPIOConnection(std::size_t idx, GPIOServer& server)
             .total_cycles = m_total_cycles,
         };
 
-        m_processor.emplace(
-        std::in_place_type<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE, UART_Handler<GPIOServer::BUFFER_SIZE>>>,
-        bp_ctx,
-        uart_p,
-        handler_ctx);
+        m_handler.emplace(std::in_place_type<UART_Handler<GPIOServer::BUFFER_SIZE>>, uart_p, handler_ctx);
     }
     else if (std::holds_alternative<I2C_Master_P>(connection.protocol))
     {
@@ -810,15 +747,11 @@ GPIOConnection::GPIOConnection(std::size_t idx, GPIOServer& server)
             .writer_backoff = m_backoffs.handler_queue_writer,
         };
 
-        m_processor.emplace(
-        std::in_place_type<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE, I2C_Master<GPIOServer::BUFFER_SIZE>>>,
-        bp_ctx,
-        i2c_m,
-        handler_ctx);
+        m_handler.emplace(std::in_place_type<I2C_Master<GPIOServer::BUFFER_SIZE>>, i2c_m, handler_ctx);
 
         if (m_socket != -1)
         {
-            this->add_slave(m_socket, static_cast<uint32_t>(connection.remote_port));
+            this->execute(command::AddSlave{ m_socket, static_cast<uint32_t>(connection.remote_port) });
         }
     }
     else if (std::holds_alternative<I2C_Slave_P>(connection.protocol))
@@ -836,11 +769,7 @@ GPIOConnection::GPIOConnection(std::size_t idx, GPIOServer& server)
             .writer_backoff = m_backoffs.out_queue_writer,
         };
 
-        m_processor.emplace(
-        std::in_place_type<BitProcessor<pin_pair, GPIOServer::BUFFER_SIZE, I2C_Slave<GPIOServer::BUFFER_SIZE>>>,
-        bp_ctx,
-        i2c_s,
-        handler_ctx);
+        m_handler.emplace(std::in_place_type<I2C_Slave<GPIOServer::BUFFER_SIZE>>, i2c_s, handler_ctx);
     }
 }
 
@@ -854,20 +783,76 @@ GPIOConnection::~GPIOConnection()
 
 void GPIOConnection::run(std::stop_token stop_token)
 {
-    if (m_processor.has_value())
+    if (!m_handler.has_value())
     {
-        std::visit(
-        [this, &stop_token](auto& p) {
-            p.start();
-            while (!stop_token.stop_requested() && m_connection_running.load() && p.is_running())
-            {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-            p.stop();
-        },
-        *m_processor);
+        m_connection_running.store(false);
+        return;
     }
+
+    std::visit([](auto& h) { h.start_receiver(); }, *m_handler);
+
+    std::uint64_t last_cycles = m_total_cycles->load();
+
+    while (!stop_token.stop_requested() && m_connection_running.load())
+    {
+        if (!m_queue_reader.try_advance())
+        {
+            m_backoffs.out_queue_reader.wait([this, &stop_token]() {
+                return stop_token.stop_requested() || !m_connection_running.load() || m_queue_reader.try_advance();
+            });
+            continue;
+        }
+        m_backoffs.out_queue_reader.reset();
+
+        const auto pair = m_queue_reader.peek();
+        m_queue_reader.advance();
+        m_backoffs.out_queue_writer.wake();
+
+        const std::uint64_t now_cycles = m_total_cycles->load();
+        const auto delta = static_cast<std::uint32_t>(now_cycles - last_cycles);
+        last_cycles = now_cycles;
+
+        std::visit([&pair, &delta](auto& h) { h.process_bit(pair, delta); }, *m_handler);
+
+        if (!std::visit([](auto& h) { return h.is_alive(); }, *m_handler))
+        {
+            break;
+        }
+    }
+
+    std::visit([](auto& h) { h.receiver_stop(); }, *m_handler);
     m_connection_running.store(false);
+}
+
+command::Response GPIOConnection::execute(const command::Command& cmd)
+{
+    const auto cmd_visitor =
+    overloads{ [this](const command::AddSlave& c) -> command::Response {
+                  if (m_handler.has_value() && std::holds_alternative<I2C_Master<GPIOServer::BUFFER_SIZE>>(*m_handler))
+                  {
+                      std::get<I2C_Master<GPIOServer::BUFFER_SIZE>>(*m_handler).add_slave(c.fd, c.slave_id);
+                      return { .status = command::ResponseStatus::Success, .data = 0 };
+                  }
+                  return { .status = command::ResponseStatus::Fail, .data = 0 };
+              },
+               [this](const command::RemoveSlave& c) -> command::Response {
+                   if (m_handler.has_value() && std::holds_alternative<I2C_Master<GPIOServer::BUFFER_SIZE>>(*m_handler))
+                   {
+                       std::get<I2C_Master<GPIOServer::BUFFER_SIZE>>(*m_handler).remove_slave(c.slave_id);
+                       return { .status = command::ResponseStatus::Success, .data = 0 };
+                   }
+                   return { .status = command::ResponseStatus::Fail, .data = 0 };
+               },
+               [this](const command::GetSlaveCount&) -> command::Response {
+                   if (m_handler.has_value())
+                   {
+                       auto count = std::visit([](auto& h) { return h.get_slave_count(); }, *m_handler);
+                       return { .status = command::ResponseStatus::Success, .data = static_cast<uint32_t>(count) };
+                   }
+                   return { .status = command::ResponseStatus::Fail, .data = 0 };
+               } };
+
+    return std::visit(cmd_visitor, cmd);
 }
 
 pin_pair GPIOConnection::read_queue()
