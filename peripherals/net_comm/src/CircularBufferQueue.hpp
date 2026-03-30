@@ -37,9 +37,6 @@
 #include <bit>
 #include <chrono>
 #include <cstdint>
-#include <iostream>
-#include <mutex>
-#include <condition_variable>
 #include <thread>
 
 #define ALIGNMENT 64

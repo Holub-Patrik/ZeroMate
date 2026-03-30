@@ -29,9 +29,16 @@
 #include "UART_Handler.hpp"
 #include "I2C_Handler.hpp"
 
+namespace net_comm
+{
+    static constexpr std::size_t MAX_CONNECTION_COUNT = 16;
+    static constexpr std::size_t BUFFER_SIZE = 512;
+    static constexpr std::size_t QUEUE_SIZE = 64;
+}
+
 using Protocol = std::variant<UART_P, I2C_Master_P, I2C_Slave_P>;
 
-enum class ConnectionStatus
+enum class ConnectionStatus : std::uint8_t
 {
     Defined,
     Connecting,
@@ -67,8 +74,8 @@ using conn_info = struct conn_info_struct
 using conn_id = std::uint64_t;
 using pin_pair = std::pair<std::uint8_t, std::uint8_t>;
 
-template<std::size_t QUEUE_SIZE>
-using protocol_variant = std::variant<UART_Handler<QUEUE_SIZE>, I2C_Master<QUEUE_SIZE>, I2C_Slave<QUEUE_SIZE>>;
+using handler_t =
+std::variant<UART_Handler<net_comm::BUFFER_SIZE>, I2C_Master<net_comm::BUFFER_SIZE>, I2C_Slave<net_comm::BUFFER_SIZE>>;
 
 namespace command
 {
@@ -87,9 +94,14 @@ namespace command
     {
     };
 
-    using Command = std::variant<AddSlave, RemoveSlave, GetSlaveCount>;
+    struct HasSlave
+    {
+        std::uint32_t slave_id;
+    };
 
-    enum class ResponseStatus
+    using Command = std::variant<AddSlave, RemoveSlave, GetSlaveCount, HasSlave>;
+
+    enum class ResponseStatus : std::uint8_t
     {
         Success,
         Fail
@@ -102,7 +114,57 @@ namespace command
     };
 }
 
-class GPIOConnection;
+class GPIOServer;
+
+class GPIOConnection final
+{
+public:
+    GPIOConnection() = default;
+    ~GPIOConnection();
+
+    GPIOConnection(const GPIOConnection&) = delete;
+    GPIOConnection& operator=(const GPIOConnection&) = delete;
+
+    void init(std::size_t idx, GPIOServer* server);
+    void update();
+    void run(std::stop_token stop_token);
+    void clear();
+
+    [[nodiscard]] bool is_defined() const noexcept
+    {
+        return m_is_defined;
+    }
+    void set_defined(bool defined)
+    {
+        m_is_defined = defined;
+    }
+
+    [[nodiscard]] conn_info& get_info()
+    {
+        return m_info;
+    }
+    [[nodiscard]] const conn_info& get_info() const
+    {
+        return m_info;
+    }
+
+    void start_thread();
+    void stop_thread();
+
+    command::Response execute(const command::Command& cmd);
+
+private:
+    std::size_t m_idx{ 0 };
+    GPIOServer* m_server{ nullptr };
+    conn_info m_info;
+    bool m_is_defined{ false };
+
+    std::optional<handler_t> m_handler;
+    std::jthread m_thread;
+    std::atomic<bool> m_running{ false };
+
+    void write_to_pin(std::uint8_t pin, std::uint8_t value);
+};
 
 class GPIOServer final
 {
@@ -110,10 +172,6 @@ public:
     static constexpr std::uint64_t BACKOFF_CYCLES_FAST = 1000;
     static constexpr std::uint64_t BACKOFF_CYCLES_RELAXED = 20'000;
     static constexpr auto NET_WAIT_TIME = std::chrono::microseconds{ 100 };
-    static constexpr std::size_t MAX_CONNECTION_COUNT = 16;
-    static constexpr std::size_t BUFFER_COUNT = MAX_CONNECTION_COUNT;
-    static constexpr std::size_t BUFFER_SIZE = 512;
-    static constexpr std::size_t QUEUE_SIZE = 64;
 
     struct ConnectionBackoffs
     {
@@ -129,37 +187,24 @@ public:
         , handler_queue_reader(BACKOFF_CYCLES_FAST, BACKOFF_CYCLES_RELAXED)
         {
         }
-
-        ConnectionBackoffs(const ConnectionBackoffs&) = delete;
-        ConnectionBackoffs& operator=(const ConnectionBackoffs&) = delete;
-        ConnectionBackoffs(ConnectionBackoffs&&) = delete;
-        ConnectionBackoffs& operator=(ConnectionBackoffs&&) = delete;
     };
 
 private:
-    TSP::Queue::Buffer<pin_pair, QUEUE_SIZE> pin_write_queue_buf{ };
-    TSP::Queue::Reader<pin_pair, QUEUE_SIZE> pin_write_queue_reader;
-    TSP::Queue::Writer<pin_pair, QUEUE_SIZE> pin_write_queue_writer;
+    TSP::Queue::Buffer<pin_pair, net_comm::QUEUE_SIZE> pin_write_queue_buf{ };
+    TSP::Queue::Reader<pin_pair, net_comm::QUEUE_SIZE> pin_write_queue_reader;
+    TSP::Queue::Writer<pin_pair, net_comm::QUEUE_SIZE> pin_write_queue_writer;
 
     Spinlock pin_write_spinlock;
     TSP::BF::SemBackoff pin_write_writer_backoff{ BACKOFF_CYCLES_FAST, BACKOFF_CYCLES_RELAXED };
     TSP::BF::SemBackoff pin_write_reader_backoff{ BACKOFF_CYCLES_FAST, BACKOFF_CYCLES_RELAXED };
 
-    std::array<TSP::Queue::Buffer<pin_pair, BUFFER_SIZE>, BUFFER_COUNT> out_queue_buffers;
-    std::array<TSP::Queue::Writer<pin_pair, BUFFER_SIZE>, BUFFER_COUNT> out_queue_writers;
-    std::array<ConnectionBackoffs, MAX_CONNECTION_COUNT> m_backoffs;
+    std::array<TSP::Queue::Buffer<pin_pair, net_comm::BUFFER_SIZE>, net_comm::MAX_CONNECTION_COUNT> out_queue_buffers;
+    std::array<TSP::Queue::Writer<pin_pair, net_comm::BUFFER_SIZE>, net_comm::MAX_CONNECTION_COUNT> out_queue_writers;
+    std::array<ConnectionBackoffs, net_comm::MAX_CONNECTION_COUNT> m_backoffs;
 
-    std::array<bool, MAX_CONNECTION_COUNT> connection_bit_map{ false };
-
-    std::array<std::jthread, MAX_CONNECTION_COUNT> connection_threads;
-    std::array<std::atomic<bool>, MAX_CONNECTION_COUNT> connection_running;
-
-    std::array<std::unique_ptr<GPIOConnection>, MAX_CONNECTION_COUNT> active_connections;
-    std::array<conn_info, MAX_CONNECTION_COUNT> connection_data;
+    std::array<GPIOConnection, net_comm::MAX_CONNECTION_COUNT> m_connections;
 
     FastMap pin_to_conn_id;
-    FastMap net_id_to_conn_id;
-    std::unordered_map<std::uint32_t, std::size_t> m_net_id_to_idx;
     std::unordered_map<std::uint32_t, std::size_t> m_bus_id_to_idx;
 
     zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin;
@@ -175,21 +220,17 @@ private:
     int m_handshake_socket{ -1 };
     uint16_t m_handshake_port{ 0 };
 
-    // Pin write entirely here since there will be multiple writers, so spinlock is added to ensure safety
     void pin_write(const std::stop_token& stop_token);
     void unmap_connection(const std::size_t conn_index);
     [[nodiscard]] std::uint8_t find_free_index() const noexcept;
 
-    // Handshake helpers
     void handle_handshake();
     void handle_conf_msg(const handshake::ConfMessage& msg, const struct sockaddr_in& addr);
     void handle_response_msg(const handshake::ResponseMessage& msg, const struct sockaddr_in& addr);
     void handle_disconnect_msg(const handshake::DisconnectMessage& msg, const struct sockaddr_in& addr);
-    void cleanup_finished_connections();
 
 public:
     GPIOServer() = delete;
-
     GPIOServer(zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t func_set_pin,
                zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t func_read_pin,
                zero_mate::IExternal_Peripheral::Halt_t func_halt,
@@ -198,28 +239,20 @@ public:
                const std::atomic<std::uint64_t>* total_cycles);
     ~GPIOServer();
 
-    GPIOServer(const GPIOServer& other) = delete;
-    GPIOServer& operator=(const GPIOServer& other) = delete;
-
-    GPIOServer(GPIOServer&& other) = delete;
-    GPIOServer& operator=(GPIOServer&& other) = delete;
-
     void Init(uint16_t handshake_port);
     [[nodiscard]] bool Is_Initialized() const noexcept;
     void write_to_pin(const std::uint8_t pin, const std::uint8_t value);
     void route_pin_info(const pin_pair pin_info);
     void add_connection(const conn_info& info);
     void remove_connection(std::size_t i);
-    void construct_connection(const conn_info& info);
     void add_slave_to_master(std::uint32_t bus_id, int fd, std::uint32_t slave_id);
     void remove_slave_from_master(std::uint32_t slave_id);
     void run(const std::stop_token& stop_token);
     void stop();
 
-    // Handshake initiation
     void initiate_handshake(std::size_t idx);
 
-    // used by GPIOConnection
+    // Getters for GPIOConnection
     [[nodiscard]] zero_mate::IExternal_Peripheral::Halt_t get_halt() const
     {
         return func_halt;
@@ -228,19 +261,11 @@ public:
     {
         return func_start;
     }
-    [[nodiscard]] zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t get_set_pin() const
-    {
-        return func_set_pin;
-    }
     [[nodiscard]] zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t get_read_pin() const
     {
         return func_read_pin;
     }
-    [[nodiscard]] conn_info& get_connection_info(std::size_t idx)
-    {
-        return connection_data[idx];
-    }
-    [[nodiscard]] TSP::Queue::Buffer<pin_pair, BUFFER_SIZE>* get_out_queue_buffer(std::size_t idx)
+    [[nodiscard]] TSP::Queue::Buffer<pin_pair, net_comm::BUFFER_SIZE>* get_out_queue_buffer(std::size_t idx)
     {
         return &out_queue_buffers[idx];
     }
@@ -248,84 +273,21 @@ public:
     {
         return m_backoffs[idx];
     }
-    [[nodiscard]] std::atomic<bool>& is_server_running()
-    {
-        return m_running;
-    }
-    [[nodiscard]] std::atomic<bool>& is_connection_running(std::size_t idx)
-    {
-        return connection_running[idx];
-    }
     [[nodiscard]] const std::atomic<std::uint64_t>* get_total_cycles() const
     {
         return m_total_cycles;
     }
+    [[nodiscard]] int get_handshake_socket() const
+    {
+        return m_handshake_socket;
+    }
 
     // UI access
-    [[nodiscard]] const auto& get_connection_bit_map() const
+    [[nodiscard]] const std::array<GPIOConnection, net_comm::MAX_CONNECTION_COUNT>& get_connections() const
     {
-        return connection_bit_map;
-    }
-    [[nodiscard]] const auto& get_connection_data() const
-    {
-        return connection_data;
+        return m_connections;
     }
     [[nodiscard]] std::size_t get_slave_count(std::size_t idx) const;
-};
-
-class GPIOConnection final
-{
-private:
-    conn_info& connection;
-    GPIOServer::ConnectionBackoffs& m_backoffs;
-
-    TSP::Queue::Reader<pin_pair, GPIOServer::BUFFER_SIZE> m_queue_reader;
-
-    int m_socket;
-    struct sockaddr_in m_other_side;
-
-    zero_mate::IExternal_Peripheral::Halt_t m_halt;
-    zero_mate::IExternal_Peripheral::Start_t m_start;
-    zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t m_read_pin;
-    GPIOServer& m_server;
-
-    std::atomic<bool>& m_server_running;
-    std::atomic<bool>& m_connection_running;
-    const std::atomic<std::uint64_t>* m_total_cycles;
-
-    using handler_t = std::variant<UART_Handler<GPIOServer::BUFFER_SIZE>,
-                                   I2C_Master<GPIOServer::BUFFER_SIZE>,
-                                   I2C_Slave<GPIOServer::BUFFER_SIZE>>;
-
-    std::optional<handler_t> m_handler;
-
-public:
-    GPIOConnection() = delete;
-    GPIOConnection(std::size_t idx, GPIOServer& server);
-
-    ~GPIOConnection();
-
-    GPIOConnection(const GPIOConnection& other) = delete;
-    void run(std::stop_token stop_token);
-
-    // Helper for SM
-    pin_pair read_queue();
-    void send_to_network(const std::vector<std::uint8_t>& data);
-    void write_to_pin(std::uint8_t pin, std::uint8_t value);
-    void halt()
-    {
-        m_halt();
-    }
-    void start()
-    {
-        m_start();
-    }
-    [[nodiscard]] bool is_running() const
-    {
-        return m_server_running.load() && m_connection_running.load();
-    }
-
-    command::Response execute(const command::Command& cmd);
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -388,11 +350,15 @@ private:
 #ifndef ZERO_MATE_UNIT_TESTS
     struct AddConnectionState
     {
+        static constexpr int DEFAULT_BAUDRATE = 115200;
+        static constexpr int DEFAULT_PORT = 12345;
+        static constexpr int DEFAULT_ADDRESS = 0x50;
+
         int protocol_type = 0; // 0: UART, 1: I2C Master, 2: I2C Slave
         int net_id = 1;
 
         // UART
-        int baudrate = 115200;
+        int baudrate = DEFAULT_BAUDRATE;
         int tx_pin = 0;
         int rx_pin = 0;
         int start_bits = 1;
@@ -400,21 +366,21 @@ private:
         int parity_bits = 0;
         int stop_bits = 1;
         char ip[64] = "127.0.0.1";
-        int port = 12345;
+        int port = DEFAULT_PORT;
 
         // I2C
         int scl_pin = 0;
         int sda_pin = 0;
-        int address = 0x50;
+        int address = DEFAULT_ADDRESS;
         int i2c_id = 0;
     } m_ui_add_state;
 
-    int m_ui_view_idx{ -1 };
-    int m_ui_handshake_port{ 12344 };
+    int m_ui_view_idx = -1;
+    int m_ui_handshake_port{ AddConnectionState::DEFAULT_PORT };
 
-    int ui_selected_local_pin_idx{ 0 };
-    int ui_target_net_pin{ 0 };
-    int ui_selected_net_pin_source{ 0 };
-    int ui_target_local_pin_idx{ 0 };
+    int ui_selected_local_pin_idx = 0;
+    int ui_target_net_pin = 0;
+    int ui_selected_net_pin_source = 0;
+    int ui_target_local_pin_idx = 0;
 #endif
 };

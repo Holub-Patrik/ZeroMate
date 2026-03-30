@@ -91,23 +91,7 @@ public:
         receiver = std::jthread([this](std::stop_token stop_token) { this->receiver_thread(stop_token); });
     }
 
-    void add_slave(int fd, std::uint32_t net_id)
-    {
-        (void)fd;
-        (void)net_id;
-    }
-
-    void remove_slave(std::uint32_t net_id)
-    {
-        (void)net_id;
-    }
-
-    [[nodiscard]] std::size_t get_slave_count() const
-    {
-        return 0;
-    }
-
-    void receiver_thread(std::stop_token stop_token)
+    void receiver_thread(const std::stop_token& stop_token)
     {
         // here it is simple, just expose the emulator writer queue
         // receive data, parse out clock for writing bits to pin

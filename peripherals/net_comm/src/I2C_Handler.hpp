@@ -10,6 +10,7 @@
 #include <thread>
 #include <functional>
 #include <mutex>
+#include <bitset>
 
 #include "Protocol.hpp"
 #include "CircularBufferQueue.hpp"
@@ -142,22 +143,6 @@ public:
         receiver_stop();
     }
 
-    virtual void add_slave(int fd, std::uint32_t slave_id)
-    {
-        (void)fd;
-        (void)slave_id;
-    }
-
-    virtual void remove_slave(std::uint32_t slave_id)
-    {
-        (void)slave_id;
-    }
-
-    virtual std::size_t get_slave_count() const
-    {
-        return 0;
-    }
-
     void receiver_stop()
     {
         if (running.exchange(false))
@@ -201,11 +186,10 @@ class I2C_Master final : public I2C_Base
     std::array<int, 2> wake_pipefd{ -1, -1 };
     mutable std::mutex slave_fds_mutex;
 
+    std::bitset<MAX_SLAVES> m_slave_active;
     std::array<int, MAX_SLAVES> m_slave_fds{ };
     std::array<std::uint32_t, MAX_SLAVES> m_slave_ids{ };
-    std::size_t m_slave_count = 0;
-    std::unordered_map<int, std::size_t> m_fd_to_idx;
-    std::unordered_map<std::uint32_t, int> m_slave_id_to_fd;
+    std::unordered_map<std::uint32_t, std::size_t> m_slave_id_to_idx;
 
     uint8_t shift_reg = 0;
 
@@ -219,6 +203,7 @@ public:
     , m_writer_backoff(ctx.writer_backoff)
     {
         m_slave_fds.fill(-1);
+        m_slave_active.reset();
     }
 
     ~I2C_Master() override
@@ -227,10 +212,13 @@ public:
 
         {
             std::lock_guard<std::mutex> lock(slave_fds_mutex);
-            for (std::size_t i = 0; i < m_slave_count; ++i)
+            for (std::size_t i = 0; i < MAX_SLAVES; ++i)
             {
-                send_disconnect(m_slave_fds[i]);
-                close(m_slave_fds[i]);
+                if (m_slave_active.test(i))
+                {
+                    send_disconnect(m_slave_fds[i]);
+                    close(m_slave_fds[i]);
+                }
             }
         }
 
@@ -244,63 +232,74 @@ public:
         }
     }
 
-    void add_slave(int fd, std::uint32_t slave_id) override
+    void add_slave(int fd, std::uint32_t slave_id)
     {
         {
             std::lock_guard<std::mutex> lock(slave_fds_mutex);
-            if (m_slave_count < MAX_SLAVES)
+            std::size_t idx = find_free_idx();
+            if (idx != MAX_SLAVES)
             {
-                m_slave_fds[m_slave_count] = fd;
-                m_slave_ids[m_slave_count] = slave_id;
-                m_fd_to_idx[fd] = m_slave_count;
-                m_slave_id_to_fd[slave_id] = fd;
-                m_slave_count++;
+                m_slave_fds[idx] = fd;
+                m_slave_ids[idx] = slave_id;
+                m_slave_id_to_idx[slave_id] = idx;
+                m_slave_active.set(idx);
             }
         }
         wake_thread();
     }
 
-    void remove_slave(std::uint32_t slave_id) override
+    void remove_slave(std::uint32_t slave_id)
     {
         {
             std::lock_guard<std::mutex> lock(slave_fds_mutex);
-            if (m_slave_id_to_fd.contains(slave_id))
+            if (m_slave_id_to_idx.contains(slave_id))
             {
-                _remove_slave_at(m_fd_to_idx.at(m_slave_id_to_fd.at(slave_id)));
+                std::size_t idx = m_slave_id_to_idx.at(slave_id);
+                _remove_slave_at(idx);
             }
         }
         this->start_func();
         wake_thread();
     }
 
-    std::size_t get_slave_count() const override
+    std::size_t get_slave_count() const
     {
         std::lock_guard<std::mutex> lock(slave_fds_mutex);
-        return m_slave_count;
+        return m_slave_active.count();
+    }
+
+    bool has_slave(std::uint32_t slave_id) const
+    {
+        std::lock_guard<std::mutex> lock(slave_fds_mutex);
+        return m_slave_id_to_idx.contains(slave_id);
     }
 
 private:
+    std::size_t find_free_idx() const
+    {
+        for (std::size_t i = 0; i < MAX_SLAVES; ++i)
+        {
+            if (!m_slave_active.test(i))
+            {
+                return i;
+            }
+        }
+        return MAX_SLAVES;
+    }
+
     void _remove_slave_at(std::size_t idx)
     {
         send_disconnect(m_slave_fds[idx]);
         close(m_slave_fds[idx]);
-        m_slave_id_to_fd.erase(m_slave_ids[idx]);
-        m_fd_to_idx.erase(m_slave_fds[idx]);
-
-        if (idx < m_slave_count - 1)
-        {
-            m_slave_fds[idx] = m_slave_fds[m_slave_count - 1];
-            m_slave_ids[idx] = m_slave_ids[m_slave_count - 1];
-            m_fd_to_idx[m_slave_fds[idx]] = idx;
-            m_slave_id_to_fd[m_slave_ids[idx]] = m_slave_fds[idx];
-        }
-
-        m_slave_count--;
-        m_slave_fds[m_slave_count] = -1;
+        m_slave_id_to_idx.erase(m_slave_ids[idx]);
+        m_slave_fds[idx] = -1;
+        m_slave_active.reset(idx);
     }
 
     void send_disconnect(int fd)
     {
+        if (fd == -1)
+            return;
         handshake::DisconnectMessage msg{ };
         msg.config.protocol_id = handshake::ProtocolID::I2C;
         msg.config.config.i2c.bus_id = config.bus_id;
@@ -322,9 +321,13 @@ private:
     {
         {
             std::lock_guard<std::mutex> lock(slave_fds_mutex);
-            if (m_fd_to_idx.contains(fd))
+            for (std::size_t i = 0; i < MAX_SLAVES; ++i)
             {
-                _remove_slave_at(m_fd_to_idx[fd]);
+                if (m_slave_active.test(i) && m_slave_fds[i] == fd)
+                {
+                    _remove_slave_at(i);
+                    break;
+                }
             }
         }
         this->start_func();
@@ -367,9 +370,12 @@ public:
 
             {
                 std::lock_guard<std::mutex> lock(slave_fds_mutex);
-                for (std::size_t i = 0; i < m_slave_count; ++i)
+                for (std::size_t i = 0; i < MAX_SLAVES; ++i)
                 {
-                    fds.emplace_back(m_slave_fds[i], POLLIN, 0);
+                    if (m_slave_active.test(i))
+                    {
+                        fds.emplace_back(m_slave_fds[i], POLLIN, 0);
+                    }
                 }
             }
 
@@ -515,7 +521,7 @@ private:
 
         {
             std::lock_guard<std::mutex> lock(slave_fds_mutex);
-            if (wait_for_response && m_slave_count > 0)
+            if (wait_for_response && m_slave_active.any())
             {
                 halt_func();
             }
@@ -551,9 +557,12 @@ private:
     {
         I2C_Packet packet{ type, value };
         std::lock_guard<std::mutex> lock(slave_fds_mutex);
-        for (std::size_t i = 0; i < m_slave_count; ++i)
+        for (std::size_t i = 0; i < MAX_SLAVES; ++i)
         {
-            send(m_slave_fds[i], &packet, sizeof(packet), 0);
+            if (m_slave_active.test(i))
+            {
+                send(m_slave_fds[i], &packet, sizeof(packet), 0);
+            }
         }
     }
 
