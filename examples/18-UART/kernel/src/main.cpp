@@ -10,7 +10,7 @@ extern "C" int _kernel_main(void)
 
     volatile unsigned int tim;
 
-    while (1)
+    while (true)
     {
         sUART0.Write("Welcome to KIV/OS RPiOS kernel\r\n");
 

@@ -1,0 +1,28 @@
+{
+	"peripherals": [
+		{
+			"name": "Button",
+			"connection": [5],
+			"lib_dir": "peripherals",
+			"lib_name": "button"
+		},
+		{
+			"name": "Net Comm",
+			"connection": [14, 15],
+			"lib_dir": "peripherals",
+			"lib_name": "net_comm"
+		},
+		{
+			"name": "Tens",
+			"connection": [2,3,4],
+			"lib_dir": "peripherals",
+			"lib_name": "seven_seg_display"
+		},
+		{
+			"name": "Ones",
+			"connection": [2,3,4],
+			"lib_dir": "peripherals",
+			"lib_name": "seven_seg_display"
+		}
+	]
+}

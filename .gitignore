@@ -7,6 +7,7 @@
 # build
 /build
 /output
+/output_2
 
 examples/**/build/**
 

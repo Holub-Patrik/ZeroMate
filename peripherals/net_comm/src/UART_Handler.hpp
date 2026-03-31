@@ -2,8 +2,8 @@
 #include <netinet/in.h>
 #include <array>
 #include <poll.h>
-#include <chrono>
 #include <functional>
+#include <iostream>
 
 #include "CircularBufferQueue.hpp"
 
@@ -194,6 +194,13 @@ private:
 
     void send_datagram()
     {
+        std::cout << "Data sent: ";
+        for (int i = 0; i < bit_count; i++)
+        {
+            std::cout << (static_cast<bool>(buf[i] & MASK_BIT_VALUE) ? "1" : "0");
+        }
+        std::cout << std::endl;
+
         send(config.other_side_fd, buf.data(), bit_count * sizeof(std::uint32_t), 0);
     }
 };
