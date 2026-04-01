@@ -15,6 +15,9 @@ set(CMAKE_BUILD_PARALLEL_LEVEL 4)
 # Default version of C++ is set to 20
 set(CMAKE_CXX_STANDARD 20)
 
+# Enable position independent code for all targets (needed for shared libraries)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Standard project settings
 include(cmake/standard_project_settings.cmake)
 
