@@ -27,13 +27,15 @@ namespace handshake
     {
         std::uint8_t magic = MAGIC_BYTE;
         MessageType type = MessageType::Response;
-        std::uint8_t status; // 1: Accept, 0: Decline
-        std::uint16_t port;  // Port opened by the responder for data
+        std::uint8_t status;      // 1: Accept, 0: Decline
+        std::uint16_t port;           // Port opened by the responder for data
+        std::uint16_t initiator_port; // Port of the initiator's data socket
     } __attribute__((packed));
 
     struct DisconnectMessage
     {
         std::uint8_t magic = MAGIC_BYTE;
         MessageType type = MessageType::Disconnect;
+        std::uint16_t port; // Port of the sender's data socket
     } __attribute__((packed));
 }

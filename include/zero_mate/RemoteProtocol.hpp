@@ -16,7 +16,7 @@
 namespace zero_mate::remote_protocol
 {
     // Handshake result callback: called to notify if the connection was successful or not.
-    typedef void (*handshake_result_callback_t)(void* context, bool success);
+    typedef void (*handshake_result_callback_t)(void* context, bool success, int fd, const char* remote_ip, uint16_t remote_port);
 
     // Receive callback: called when generic data arrives from the remote side.
     typedef void (*receive_callback_t)(void* context, const void* data, size_t size);
@@ -29,21 +29,21 @@ namespace zero_mate::remote_protocol
     typedef bool (*comparison_func_t)(void* context, const void* payload, size_t size);
 
     // Registration function exported by GPIOServer
-    typedef uint32_t (*register_t)(const char* protocol, 
-                                   comparison_func_t comp_func,
-                                   receive_callback_t on_receive, 
-                                   disconnect_callback_t on_disconnect,
-                                   handshake_result_callback_t on_handshake_result,
-                                   void* context);
+    typedef int (*register_t)(const char* protocol, 
+                              comparison_func_t comp_func,
+                              receive_callback_t on_receive, 
+                              disconnect_callback_t on_disconnect,
+                              handshake_result_callback_t on_handshake_result,
+                              void* context);
 
     // Unregistration function exported by GPIOServer
-    typedef void (*unregister_t)(uint32_t id);
+    typedef void (*unregister_t)(int fd);
 
     // Sending function exported by GPIOServer
-    typedef void (*send_t)(uint32_t id, const void* data, size_t size);
+    typedef void (*send_t)(int fd, const void* data, size_t size);
 
     // Handshake initiation exported by GPIOServer
     // remote_ip/port: where to send the ConfMessage
     // comp_payload: component-specific data (e.g. protocol ID, baudrate, net_id)
-    typedef void (*init_handshake_t)(uint32_t id, const char* remote_ip, uint16_t remote_port, const void* comp_payload, size_t size);
+    typedef void (*init_handshake_t)(int fd, const char* remote_ip, uint16_t remote_port, const void* comp_payload, size_t size);
 }

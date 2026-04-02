@@ -4,6 +4,11 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <thread>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
@@ -66,23 +71,33 @@ namespace zero_mate::peripheral
             m_server_init_handshake = (remote_protocol::init_handshake_t)LIB_SYM(proc, "server_init_handshake");
 
             if (m_server_register)
-                m_server_id = m_server_register("i2c_master",
+                m_server_fd = m_server_register("i2c_master",
                                                 On_Compare_Static,
                                                 On_Receive_Static,
                                                 On_Disconnect_Static,
                                                 On_Handshake_Result_Static,
                                                 this);
+            
+            if (m_server_fd != -1)
+            {
+                m_running = true;
+                m_rx_thread = std::thread(&CRemote_I2C_Master::RX_Thread, this);
+            }
         }
 
         ~CRemote_I2C_Master() override
         {
-            if (m_server_id != 0 && m_server_unregister)
-                m_server_unregister(m_server_id);
+            m_running = false;
+            if (m_rx_thread.joinable())
+                m_rx_thread.join();
+
+            if (m_server_fd != -1 && m_server_unregister)
+                m_server_unregister(m_server_fd);
         }
 
         void GPIO_Subscription_Callback(uint32_t pin_idx) override
         {
-            if (m_server_id == 0)
+            if (m_server_fd == -1)
                 return;
             const bool curr_pin_state = m_read_pin(pin_idx);
             if (pin_idx == (uint32_t)m_scl_pin)
@@ -138,35 +153,8 @@ namespace zero_mate::peripheral
             return false;
         }
 
-        static void On_Receive_Static(void* context, const void* data, size_t size)
+        static void On_Receive_Static(void* /*context*/, const void* /*data*/, size_t /*size*/)
         {
-            static_cast<CRemote_I2C_Master*>(context)->On_Receive(data, size);
-        }
-
-        void On_Receive(const void* data, size_t size)
-        {
-            if (size != sizeof(I2C_Packet))
-                return;
-            const auto* packet = static_cast<const I2C_Packet*>(data);
-            if (packet->type == I2C_Packet_Type::I2C_ACK)
-            {
-                m_ack_from_slave = (packet->value != 0);
-                m_queue_writer.insert_with_backoff(m_ack_from_slave ? 0 : 1, m_writer_backoff);
-                m_reader_backoff.wake();
-                if (m_state == I2C_State::RESPONSE && m_bit_count == 0)
-                    Drive_SDA_From_Queue();
-            }
-            else if (packet->type == I2C_Packet_Type::I2C_DATA)
-            {
-                for (int i = 7; i >= 0; --i)
-                {
-                    m_queue_writer.insert_with_backoff((packet->value >> i) & 0x01U, m_writer_backoff);
-                    m_reader_backoff.wake();
-                }
-                if (m_state == I2C_State::READ_BYTE && m_bit_count == 0)
-                    Drive_SDA_From_Queue();
-            }
-            m_start();
         }
 
         static void On_Disconnect_Static(void* context)
@@ -176,8 +164,58 @@ namespace zero_mate::peripheral
                 master->m_slave_count--;
         }
 
-        static void On_Handshake_Result_Static(void* /*context*/, bool /*success*/)
+        static void On_Handshake_Result_Static(void* context, bool success, int /*fd*/, const char* remote_ip, uint16_t remote_port)
         {
+            if (success)
+            {
+                auto* master = static_cast<CRemote_I2C_Master*>(context);
+                struct sockaddr_in addr{ };
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(remote_port);
+                inet_pton(AF_INET, remote_ip, &addr.sin_addr);
+                
+                std::lock_guard<std::mutex> lock(master->m_slaves_mutex);
+                master->m_slave_addrs.push_back(addr);
+            }
+        }
+
+        void RX_Thread()
+        {
+            uint8_t buffer[1024];
+            struct sockaddr_in remote_addr{ };
+            socklen_t addr_len = sizeof(remote_addr);
+
+            while (m_running)
+            {
+                ssize_t received = recvfrom(m_server_fd, buffer, sizeof(buffer), 0, (struct sockaddr*)&remote_addr, &addr_len);
+                if (received == sizeof(I2C_Packet))
+                {
+                    const auto* packet = reinterpret_cast<const I2C_Packet*>(buffer);
+                    if (packet->type == I2C_Packet_Type::I2C_ACK)
+                    {
+                        m_ack_from_slave = (packet->value != 0);
+                        m_queue_writer.insert_with_backoff(m_ack_from_slave ? 0 : 1, m_writer_backoff);
+                        m_reader_backoff.wake();
+                        if (m_state == I2C_State::RESPONSE && m_bit_count == 0)
+                            Drive_SDA_From_Queue();
+                    }
+                    else if (packet->type == I2C_Packet_Type::I2C_DATA)
+                    {
+                        for (int i = 7; i >= 0; --i)
+                        {
+                            m_queue_writer.insert_with_backoff((packet->value >> i) & 0x01U, m_writer_backoff);
+                            m_reader_backoff.wake();
+                        }
+                        if (m_state == I2C_State::READ_BYTE && m_bit_count == 0)
+                            Drive_SDA_From_Queue();
+                    }
+                    m_start();
+                }
+                else if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+                {
+                    break;
+                }
+            }
         }
 
         void Handle_SCL(bool is_high)
@@ -290,8 +328,11 @@ namespace zero_mate::peripheral
         void Send_Packet(I2C_Packet_Type type, uint8_t value)
         {
             I2C_Packet p{ type, value };
-            if (m_server_send && m_server_id != 0)
-                m_server_send(m_server_id, &p, sizeof(p));
+            std::lock_guard<std::mutex> lock(m_slaves_mutex);
+            for (const auto& addr : m_slave_addrs)
+            {
+                sendto(m_server_fd, &p, sizeof(p), 0, (struct sockaddr*)&addr, sizeof(addr));
+            }
         }
 
         std::string m_name;
@@ -302,7 +343,7 @@ namespace zero_mate::peripheral
         IExternal_Peripheral::Start_t m_start;
         utils::CLogging_System* m_logging_system;
         void* m_imgui_context{ nullptr };
-        uint32_t m_server_id{ 0 };
+        int m_server_fd{ -1 };
         std::atomic<uint32_t> m_slave_count{ 0 };
         bool m_scl_lvl{ true }, m_sda_lvl{ true }, m_is_read{ false }, m_ack_from_slave{ false };
         I2C_State m_state{ I2C_State::IDLE };
@@ -315,6 +356,11 @@ namespace zero_mate::peripheral
         TSP::Queue::Reader<uint8_t, QUEUE_SIZE> m_queue_reader;
         TSP::Queue::Writer<uint8_t, QUEUE_SIZE> m_queue_writer;
         TSP::BF::SemBackoff m_reader_backoff, m_writer_backoff;
+
+        std::mutex m_slaves_mutex;
+        std::vector<struct sockaddr_in> m_slave_addrs;
+        std::atomic<bool> m_running{ false };
+        std::thread m_rx_thread;
     };
 }
 

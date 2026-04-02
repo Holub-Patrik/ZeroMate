@@ -31,22 +31,22 @@ namespace zero_mate::peripheral
         void Set_ImGui_Context(void* context) override;
 
         // Exported symbols
-        static uint32_t Register(const char* protocol,
-                                 remote_protocol::comparison_func_t comp_func,
-                                 remote_protocol::receive_callback_t on_receive,
-                                 remote_protocol::disconnect_callback_t on_disconnect,
-                                 remote_protocol::handshake_result_callback_t on_handshake_result,
-                                 void* context);
+        static int Register(const char* protocol,
+                            remote_protocol::comparison_func_t comp_func,
+                            remote_protocol::receive_callback_t on_receive,
+                            remote_protocol::disconnect_callback_t on_disconnect,
+                            remote_protocol::handshake_result_callback_t on_handshake_result,
+                            void* context);
 
-        static void Unregister(uint32_t id);
-        static void Send(uint32_t id, const void* data, size_t size);
+        static void Unregister(int fd);
+        static void Send(int fd, const void* data, size_t size);
         static void
-        Init_Handshake(uint32_t id, const char* remote_ip, uint16_t remote_port, const void* comp_payload, size_t size);
+        Init_Handshake(int fd, const char* remote_ip, uint16_t remote_port, const void* comp_payload, size_t size);
 
     private:
         struct ComponentContext
         {
-            uint32_t id;
+            int fd;
             std::string protocol;
             remote_protocol::comparison_func_t comp_func;
             remote_protocol::receive_callback_t on_receive;
@@ -54,18 +54,18 @@ namespace zero_mate::peripheral
             remote_protocol::handshake_result_callback_t on_handshake_result;
             void* context;
 
-            // Networking info (UDP) - multiple endpoints support
-            std::vector<int> sockfds;
-            std::vector<struct sockaddr_in> remote_addrs;
-            bool connected{ false }; // Initiator connection status
+            struct sockaddr_in remote_handshake_addr{ };
+            uint16_t remote_data_port{ 0 };
         };
 
         void Networking_Thread();
         void Handle_Handshake(int sock);
-        void Handle_Data(int sock, uint32_t component_id);
+        void StartServer();
+        void StopServer();
 
         std::string m_name;
         uint16_t m_handshake_port;
+        int m_handshake_sock{ -1 };
         IExternal_Peripheral::Read_GPIO_Pin_t m_read_pin;
         IExternal_Peripheral::Set_GPIO_Pin_t m_set_pin;
         IExternal_Peripheral::Halt_t m_halt;
@@ -73,15 +73,16 @@ namespace zero_mate::peripheral
         utils::CLogging_System* m_logging_system;
         void* m_imgui_context{ nullptr };
 
-        std::atomic<bool> m_running{ true };
+        std::atomic<bool> m_running{ false };
+        bool m_enabled{ false };
+        int m_ui_port;
         std::thread m_networking_thread;
 
         std::mutex m_mutex;
-        std::unordered_map<uint32_t, ComponentContext> m_components;
-        uint32_t m_next_id{ 1 };
+        std::unordered_map<int, ComponentContext> m_components;
 
         static inline std::mutex s_instances_mutex;
         static inline std::vector<CGPIO_Server*> s_instances;
-        static inline std::unordered_map<uint32_t, CGPIO_Server*> s_id_to_instance;
+        static inline std::unordered_map<int, CGPIO_Server*> s_fd_to_instance;
     };
 }

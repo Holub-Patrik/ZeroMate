@@ -3,6 +3,11 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <thread>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
@@ -47,7 +52,7 @@ namespace zero_mate::peripheral
             m_server_init_handshake = (remote_protocol::init_handshake_t)LIB_SYM(proc, "server_init_handshake");
 
             if (m_server_register)
-                m_server_id = m_server_register("i2c_slave",
+                m_server_fd = m_server_register("i2c_slave",
                                                 On_Compare_Static,
                                                 On_Receive_Static,
                                                 On_Disconnect_Static,
@@ -59,8 +64,12 @@ namespace zero_mate::peripheral
 
         ~CRemote_I2C_Slave() override
         {
-            if (m_server_id != 0 && m_server_unregister)
-                m_server_unregister(m_server_id);
+            m_running = false;
+            if (m_rx_thread.joinable())
+                m_rx_thread.join();
+
+            if (m_server_fd != -1 && m_server_unregister)
+                m_server_unregister(m_server_fd);
         }
 
         void Render() override
@@ -80,7 +89,7 @@ namespace zero_mate::peripheral
                     ImGui::InputInt("SCL Pin", &m_scl_pin);
                     if (ImGui::Button("Connect to Master"))
                     {
-                        if (m_server_id != 0 && m_server_init_handshake)
+                        if (m_server_fd != -1 && m_server_init_handshake)
                         {
                             struct I2CPayload
                             {
@@ -90,7 +99,7 @@ namespace zero_mate::peripheral
                                 uint32_t bus_id;
                             } __attribute__((packed));
                             I2CPayload payload = { 1, 0, (int32_t)m_slave_id, (uint32_t)m_bus_id };
-                            m_server_init_handshake(m_server_id,
+                            m_server_init_handshake(m_server_fd,
                                                     m_remote_ip,
                                                     (uint16_t)m_remote_port,
                                                     &payload,
@@ -105,6 +114,11 @@ namespace zero_mate::peripheral
                     if (ImGui::Button("Disconnect"))
                     {
                         m_connected = false;
+                        if (m_server_fd != -1 && m_server_unregister)
+                        {
+                            m_server_unregister(m_server_fd);
+                            m_server_fd = -1;
+                        }
                     }
                 }
             }
@@ -121,9 +135,8 @@ namespace zero_mate::peripheral
         {
             return false;
         }
-        static void On_Receive_Static(void* context, const void* data, size_t size)
+        static void On_Receive_Static(void* /*context*/, const void* /*data*/, size_t /*size*/)
         {
-            static_cast<CRemote_I2C_Slave*>(context)->On_Receive(data, size);
         }
 
         void On_Receive(const void* data, size_t size)
@@ -165,9 +178,46 @@ namespace zero_mate::peripheral
         {
             static_cast<CRemote_I2C_Slave*>(context)->m_connected = false;
         }
-        static void On_Handshake_Result_Static(void* context, bool success)
+        
+        static void On_Handshake_Result_Static(void* context, bool success, int fd, const char* remote_ip, uint16_t remote_port)
         {
-            static_cast<CRemote_I2C_Slave*>(context)->m_connected = success;
+            static_cast<CRemote_I2C_Slave*>(context)->On_Handshake_Result(success, fd, remote_ip, remote_port);
+        }
+
+        void On_Handshake_Result(bool success, int fd, const char* remote_ip, uint16_t remote_port)
+        {
+            if (success)
+            {
+                struct sockaddr_in remote_addr{ };
+                remote_addr.sin_family = AF_INET;
+                remote_addr.sin_port = htons(remote_port);
+                inet_pton(AF_INET, remote_ip, &remote_addr.sin_addr);
+
+                if (connect(fd, (struct sockaddr*)&remote_addr, sizeof(remote_addr)) == 0)
+                {
+                    m_connected = true;
+                    m_running = true;
+                    m_rx_thread = std::thread(&CRemote_I2C_Slave::RX_Thread, this);
+                }
+            }
+        }
+
+        void RX_Thread()
+        {
+            uint8_t buffer[1024];
+            while (m_running)
+            {
+                ssize_t received = recv(m_server_fd, buffer, sizeof(buffer), 0);
+                if (received > 0)
+                {
+                    On_Receive(buffer, received);
+                }
+                else if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+                {
+                    m_connected = false;
+                    break;
+                }
+            }
         }
 
         void bit_bang_byte_local(uint8_t value)
@@ -222,8 +272,8 @@ namespace zero_mate::peripheral
         void Send_Packet(I2C_Packet_Type type, uint8_t value)
         {
             I2C_Packet p{ type, value };
-            if (m_server_send && m_server_id != 0)
-                m_server_send(m_server_id, &p, sizeof(p));
+            if (m_server_fd != -1)
+                send(m_server_fd, &p, sizeof(p), 0);
         }
 
         std::string m_name;
@@ -233,12 +283,15 @@ namespace zero_mate::peripheral
         IExternal_Peripheral::Set_GPIO_Pin_t m_set_pin;
         utils::CLogging_System* m_logging_system;
         void* m_imgui_context{ nullptr };
-        uint32_t m_server_id{ 0 };
+        int m_server_fd{ -1 };
         bool m_connected{ false };
         remote_protocol::register_t m_server_register{ nullptr };
         remote_protocol::unregister_t m_server_unregister{ nullptr };
         remote_protocol::send_t m_server_send{ nullptr };
         remote_protocol::init_handshake_t m_server_init_handshake{ nullptr };
+
+        std::atomic<bool> m_running{ false };
+        std::thread m_rx_thread;
     };
 }
 

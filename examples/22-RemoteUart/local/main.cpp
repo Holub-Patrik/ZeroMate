@@ -80,7 +80,7 @@ extern "C" int _kernel_main(void)
     sUART0.Set_Char_Length(NUART_Char_Length::Char_8);
 
     sGPIO.Set_GPIO_Function(5, NGPIO_Function::Input);
-    sGPIO.Enable_Event_Detect(5, NGPIO_Interrupt_Type::Rising_Edge);
+    sGPIO.Enable_Event_Detect(5, NGPIO_Interrupt_Type::Falling_Edge);
 
     sGPIO.Set_GPIO_Function(TENS_LATCH, NGPIO_Function::Output);
     sGPIO.Set_GPIO_Function(TENS_DATA, NGPIO_Function::Output);
