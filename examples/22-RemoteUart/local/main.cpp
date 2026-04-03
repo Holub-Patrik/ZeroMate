@@ -26,6 +26,10 @@ static const uint8_t sDigit_Map[] = {
     0x02, // 9
 };
 
+char op1 = 1;
+char op2 = 2;
+char op = 0;
+
 void Display_Digit(uint32_t latch, uint32_t data, uint32_t clock, uint8_t value)
 {
     for (int i = 0; i < 8; ++i)
@@ -41,9 +45,13 @@ void Display_Digit(uint32_t latch, uint32_t data, uint32_t clock, uint8_t value)
 void Update_Display(int result)
 {
     if (result < 0)
+    {
         result = 0;
+    }
     if (result > 99)
+    {
         result = 99;
+    }
 
     int tens = result / 10;
     int units = result % 10;
@@ -56,18 +64,24 @@ extern "C" void _irq_handler(void)
 {
     sGPIO.Clear_Detected_Event(5);
 
-    static int op1 = 1;
-    static int op2 = 2;
-    static char ops[] = { '+', '-', '*' };
-    static int op_idx = 0;
-
     sUART0.Write(static_cast<char>(op1 + '0'));
-    sUART0.Write(ops[op_idx]);
+    if (op == 0)
+    {
+        sUART0.Write(static_cast<char>('+'));
+    }
+    else if (op == 1)
+    {
+        sUART0.Write(static_cast<char>('-'));
+    }
+    else if (op == 2)
+    {
+        sUART0.Write(static_cast<char>('*'));
+    }
     sUART0.Write(static_cast<char>(op2 + '0'));
 
     op1 = (op1 + 1) % 10;
     op2 = (op2 + 2) % 10;
-    op_idx = (op_idx + 1) % 3;
+    op = (op + 1) % 3;
 }
 
 extern "C" void _fiq_handler(void)
@@ -97,12 +111,10 @@ extern "C" int _kernel_main(void)
 
     while (1)
     {
-        char c1, c2;
-        sUART0.Read(&c1);
-        sUART0.Read(&c2);
+        char res;
+        sUART0.Read(&res);
 
-        int res = (c1 - '0') * 10 + (c2 - '0');
-        Update_Display(res);
+        Update_Display(res - '0');
     }
 
     return 0;

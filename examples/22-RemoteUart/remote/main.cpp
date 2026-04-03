@@ -16,29 +16,40 @@ extern "C" int _kernel_main(void)
 
     while (1)
     {
-        char c1, op, c2;
-        sUART0.Read(&c1);
-        sUART0.Read(&op);
-        sUART0.Read(&c2);
+        char value_1 = 0;
+        char operation = 0;
+        char value_2 = 0;
+        char res = 0;
 
-        int v1 = c1 - '0';
-        int v2 = c2 - '0';
-        int res = 0;
+        sUART0.Read(&value_1);
+        sUART0.Read(&operation);
+        sUART0.Read(&value_2);
 
-        if (op == '+')
-            res = v1 + v2;
-        else if (op == '-')
-            res = v1 - v2;
-        else if (op == '*')
-            res = v1 * v2;
+        value_1 -= '0';
+        value_2 -= '0';
 
-        if (res < 0)
-            res = 0;
-        if (res > 99)
-            res = 99;
+        if (operation == '+')
+        {
+            res = static_cast<char>(value_1 + value_2);
+        }
+        // calculate absolute difference so that I don't deal with negative
+        else if (operation == '-')
+        {
+            if (value_1 > value_2)
+            {
+                res = static_cast<char>(value_1 - value_2);
+            }
+            else
+            {
+                res = static_cast<char>(value_2 - value_1);
+            }
+        }
+        else if (operation == '*')
+        {
+            res = static_cast<char>(value_1 * value_2);
+        }
 
-        sUART0.Write(static_cast<char>((res / 10) + '0'));
-        sUART0.Write(static_cast<char>((res % 10) + '0'));
+        sUART0.Write(static_cast<char>(res + '0'));
     }
 
     return 0;

@@ -1,3 +1,4 @@
+#include <utility>
 #include <vector>
 #include <string>
 #include <array>
@@ -15,7 +16,7 @@
 #include "zero_mate/Protocol.hpp"
 #include "CircularBufferQueue.hpp"
 
-namespace zero_mate::peripheral
+namespace
 {
     enum class I2C_Packet_Type : uint8_t
     {
@@ -33,14 +34,50 @@ namespace zero_mate::peripheral
         uint8_t value;
     };
 
+    struct I2CPayload
+    {
+        uint8_t proto;
+        uint8_t is_master;
+        int32_t slave_id;
+        uint32_t bus_id;
+    } __attribute__((packed));
+
+}
+
+namespace zero_mate::peripheral
+{
     class CRemote_I2C_Slave final : public IExternal_Peripheral
     {
     public:
-        CRemote_I2C_Slave(const std::string& name,
+        std::string m_name;
+        int m_sda_pin{ 2 };
+        int m_scl_pin{ 3 };
+        int m_address{ 0x3C };
+        int m_slave_id{ 10 };
+        int m_bus_id{ 12 };
+        int m_remote_port{ 5000 };
+        char m_remote_ip[64]{ 0 };
+
+        IExternal_Peripheral::Read_GPIO_Pin_t m_read_pin;
+        IExternal_Peripheral::Set_GPIO_Pin_t m_set_pin;
+        utils::CLogging_System* m_logging_system;
+        void* m_imgui_context{ nullptr };
+
+        int m_server_fd{ -1 };
+        bool m_connected{ false };
+
+        remote_protocol::register_t m_server_register{ nullptr };
+        remote_protocol::unregister_t m_server_unregister{ nullptr };
+        remote_protocol::init_handshake_t m_server_init_handshake{ nullptr };
+
+        std::atomic<bool> m_running{ false };
+        std::thread m_rx_thread;
+
+        CRemote_I2C_Slave(std::string name,
                           IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
                           IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
                           utils::CLogging_System* logging_system)
-        : m_name{ name }
+        : m_name{ std::move(name) }
         , m_read_pin{ read_pin }
         , m_set_pin{ set_pin }
         , m_logging_system{ logging_system }
@@ -48,16 +85,16 @@ namespace zero_mate::peripheral
             void* proc = LIB_SELF();
             m_server_register = (remote_protocol::register_t)LIB_SYM(proc, "server_register_channel");
             m_server_unregister = (remote_protocol::unregister_t)LIB_SYM(proc, "server_unregister_channel");
-            m_server_send = (remote_protocol::send_t)LIB_SYM(proc, "server_send_data");
             m_server_init_handshake = (remote_protocol::init_handshake_t)LIB_SYM(proc, "server_init_handshake");
 
-            if (m_server_register)
+            if (m_server_register != nullptr)
+            {
                 m_server_fd = m_server_register("i2c_slave",
                                                 On_Compare_Static,
-                                                On_Receive_Static,
                                                 On_Disconnect_Static,
                                                 On_Handshake_Result_Static,
                                                 this);
+            }
 
             std::strncpy(m_remote_ip, "127.0.0.1", sizeof(m_remote_ip) - 1);
         }
@@ -66,16 +103,22 @@ namespace zero_mate::peripheral
         {
             m_running = false;
             if (m_rx_thread.joinable())
+            {
                 m_rx_thread.join();
+            }
 
-            if (m_server_fd != -1 && m_server_unregister)
+            if (m_server_fd != -1 && (m_server_unregister != nullptr))
+            {
                 m_server_unregister(m_server_fd);
+            }
         }
 
         void Render() override
         {
-            if (m_imgui_context)
+            if (m_imgui_context != nullptr)
+            {
                 ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_context));
+            }
             if (ImGui::Begin(m_name.c_str()))
             {
                 if (!m_connected)
@@ -89,16 +132,13 @@ namespace zero_mate::peripheral
                     ImGui::InputInt("SCL Pin", &m_scl_pin);
                     if (ImGui::Button("Connect to Master"))
                     {
-                        if (m_server_fd != -1 && m_server_init_handshake)
+                        if (m_server_fd != -1 && (m_server_init_handshake != nullptr))
                         {
-                            struct I2CPayload
-                            {
-                                uint8_t proto;
-                                uint8_t is_master;
-                                int32_t slave_id;
-                                uint32_t bus_id;
-                            } __attribute__((packed));
-                            I2CPayload payload = { 1, 0, (int32_t)m_slave_id, (uint32_t)m_bus_id };
+                            I2CPayload payload = { .proto = 1,
+                                                   .is_master = 0,
+                                                   .slave_id = (int32_t)m_slave_id,
+                                                   .bus_id = (uint32_t)m_bus_id };
+
                             m_server_init_handshake(m_server_fd,
                                                     m_remote_ip,
                                                     (uint16_t)m_remote_port,
@@ -114,7 +154,7 @@ namespace zero_mate::peripheral
                     if (ImGui::Button("Disconnect"))
                     {
                         m_connected = false;
-                        if (m_server_fd != -1 && m_server_unregister)
+                        if (m_server_fd != -1 && (m_server_unregister != nullptr))
                         {
                             m_server_unregister(m_server_fd);
                             m_server_fd = -1;
@@ -135,14 +175,14 @@ namespace zero_mate::peripheral
         {
             return false;
         }
-        static void On_Receive_Static(void* /*context*/, const void* /*data*/, size_t /*size*/)
-        {
-        }
 
         void On_Receive(const void* data, size_t size)
         {
             if (size != sizeof(I2C_Packet))
+            {
                 return;
+            }
+
             const auto* packet = static_cast<const I2C_Packet*>(data);
             switch (packet->type)
             {
@@ -178,8 +218,9 @@ namespace zero_mate::peripheral
         {
             static_cast<CRemote_I2C_Slave*>(context)->m_connected = false;
         }
-        
-        static void On_Handshake_Result_Static(void* context, bool success, int fd, const char* remote_ip, uint16_t remote_port)
+
+        static void
+        On_Handshake_Result_Static(void* context, bool success, int fd, const char* remote_ip, uint16_t remote_port)
         {
             static_cast<CRemote_I2C_Slave*>(context)->On_Handshake_Result(success, fd, remote_ip, remote_port);
         }
@@ -220,78 +261,73 @@ namespace zero_mate::peripheral
             }
         }
 
-        void bit_bang_byte_local(uint8_t value)
+        void bit_bang_byte_local(uint8_t value) const
         {
             for (int i = 7; i >= 0; --i)
             {
                 m_set_pin(m_sda_pin, (value >> i) & 0x01U);
-                m_set_pin(m_scl_pin, 1);
-                m_set_pin(m_scl_pin, 0);
+                m_set_pin(m_scl_pin, true);
+                m_set_pin(m_scl_pin, false);
             }
         }
-        uint8_t read_byte_local()
+
+        uint8_t read_byte_local() const
         {
             uint8_t value = 0;
-            m_set_pin(m_sda_pin, 1);
+            m_set_pin(m_sda_pin, true);
+
             for (int i = 7; i >= 0; --i)
             {
-                m_set_pin(m_scl_pin, 1);
+                m_set_pin(m_scl_pin, true);
                 value |= (m_read_pin(m_sda_pin) << i);
-                m_set_pin(m_scl_pin, 0);
+                m_set_pin(m_scl_pin, false);
             }
+
             return value;
         }
-        void start_local()
+
+        void start_local() const
         {
-            m_set_pin(m_sda_pin, 1);
-            m_set_pin(m_scl_pin, 1);
-            m_set_pin(m_sda_pin, 0);
-            m_set_pin(m_scl_pin, 0);
+            m_set_pin(m_sda_pin, true);
+            m_set_pin(m_scl_pin, true);
+            m_set_pin(m_sda_pin, false);
+            m_set_pin(m_scl_pin, false);
         }
-        void stop_local()
+
+        void stop_local() const
         {
-            m_set_pin(m_sda_pin, 0);
-            m_set_pin(m_scl_pin, 1);
-            m_set_pin(m_sda_pin, 1);
+            m_set_pin(m_sda_pin, false);
+            m_set_pin(m_scl_pin, true);
+            m_set_pin(m_sda_pin, true);
         }
-        bool read_ack_local()
+
+        bool read_ack_local() const
         {
-            m_set_pin(m_sda_pin, 1);
-            m_set_pin(m_scl_pin, 1);
-            bool ack = (m_read_pin(m_sda_pin) == 0);
-            m_set_pin(m_scl_pin, 0);
+            m_set_pin(m_sda_pin, true);
+            m_set_pin(m_scl_pin, true);
+
+            bool ack = m_read_pin(m_sda_pin);
+
+            m_set_pin(m_scl_pin, false);
             return ack;
         }
-        void write_ack_local(bool ack)
+
+        void write_ack_local(bool ack) const
         {
-            m_set_pin(m_sda_pin, ack ? 0 : 1);
-            m_set_pin(m_scl_pin, 1);
-            m_set_pin(m_scl_pin, 0);
-            m_set_pin(m_sda_pin, 1);
+            m_set_pin(m_sda_pin, !ack);
+            m_set_pin(m_scl_pin, true);
+            m_set_pin(m_scl_pin, false);
+            m_set_pin(m_sda_pin, true);
         }
-        void Send_Packet(I2C_Packet_Type type, uint8_t value)
+
+        void Send_Packet(I2C_Packet_Type type, uint8_t value) const
         {
-            I2C_Packet p{ type, value };
+            I2C_Packet packet{ .type = type, .value = value };
             if (m_server_fd != -1)
-                send(m_server_fd, &p, sizeof(p), 0);
+            {
+                send(m_server_fd, &packet, sizeof(packet), 0);
+            }
         }
-
-        std::string m_name;
-        int m_sda_pin{ 2 }, m_scl_pin{ 3 }, m_address{ 0x3C }, m_slave_id{ 10 }, m_bus_id{ 12 }, m_remote_port{ 5000 };
-        char m_remote_ip[64]{ 0 };
-        IExternal_Peripheral::Read_GPIO_Pin_t m_read_pin;
-        IExternal_Peripheral::Set_GPIO_Pin_t m_set_pin;
-        utils::CLogging_System* m_logging_system;
-        void* m_imgui_context{ nullptr };
-        int m_server_fd{ -1 };
-        bool m_connected{ false };
-        remote_protocol::register_t m_server_register{ nullptr };
-        remote_protocol::unregister_t m_server_unregister{ nullptr };
-        remote_protocol::send_t m_server_send{ nullptr };
-        remote_protocol::init_handshake_t m_server_init_handshake{ nullptr };
-
-        std::atomic<bool> m_running{ false };
-        std::thread m_rx_thread;
     };
 }
 

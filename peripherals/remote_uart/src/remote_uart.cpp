@@ -22,15 +22,81 @@ namespace zero_mate::peripheral
     class CRemote_UART final : public IExternal_Peripheral
     {
     public:
-        static constexpr size_t QUEUE_SIZE = 1024;
-        static constexpr uint32_t Clock_Rate = 250000000;
+        static constexpr std::size_t QUEUE_SIZE = 1024;
+        static constexpr std::uint32_t Clock_Rate = 250000000;
 
-        enum class UART_State
+        enum class UART_State : std::uint8_t
         {
             Idle,
+            Start_Bits,
             Data_Bits,
-            Stop_Bit
+            Stop_Bits
         };
+
+        struct UARTPayload
+        {
+            uint8_t proto;
+            uint32_t baud;
+            uint32_t net_id;
+        } __attribute__((packed));
+
+        std::string m_name;
+        int m_net_id{ 1 };
+        int m_remote_port{ 9000 };
+        char m_remote_ip[64]{ 0 };
+        int m_fd{ -1 };
+        bool m_connected{ false };
+
+        int m_tx_pin{ 14 };
+        int m_rx_pin{ 15 };
+
+        int m_start_bits{ 1 };
+        int m_start_bits_curr{ m_start_bits };
+
+        int m_data_bits{ 8 };
+        int m_data_bits_curr{ m_data_bits };
+
+        int m_stop_bits{ 1 };
+        int m_stop_bits_curr{ m_stop_bits };
+
+        IExternal_Peripheral::Read_GPIO_Pin_t m_read_pin;
+        IExternal_Peripheral::Set_GPIO_Pin_t m_set_pin;
+        utils::CLogging_System* m_logging_system;
+        void* m_imgui_context{ nullptr };
+        remote_protocol::register_t m_server_register{ nullptr };
+        remote_protocol::unregister_t m_server_unregister{ nullptr };
+        remote_protocol::init_handshake_t m_server_init_handshake{ nullptr };
+
+        TSP::Queue::Buffer<bool, QUEUE_SIZE> m_rx_buffer_buf;
+        TSP::Queue::Reader<bool, QUEUE_SIZE> m_rx_reader;
+        TSP::Queue::Writer<bool, QUEUE_SIZE> m_rx_writer;
+        TSP::BF::SemBackoff m_rx_backoff;
+
+        std::array<bool, 64> m_tx_buf{ false };
+        std::uint8_t m_tx_buf_idx;
+
+        struct UART_Word
+        {
+            std::uint8_t bit_count{ 0 };
+            std::uint32_t word{ 0 };
+        } __attribute__((packed));
+
+        // For now just send the words, later on buffer words and send them all at once
+        // A word is 64 bit number where first 8 bits signify the number of following bits which are meaningful
+        /*
+        static constexpr std::size_t WORD_COUNT = 8;
+        std::array<UART_Word, WORD_COUNT> m_send_buf;
+        std::size_t m_send_buf_idx;
+         */
+
+        UART_State m_tx_state{ UART_State::Idle };
+
+        std::uint32_t m_cpu_cycles{ 0 };
+        std::uint32_t m_baud_rate;
+        int m_baudrate_val{ 115200 };
+
+        std::atomic<bool> m_running{ false };
+        std::thread m_rx_thread;
 
         CRemote_UART(const std::string& name,
                      IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
@@ -40,6 +106,7 @@ namespace zero_mate::peripheral
         , m_read_pin{ read_pin }
         , m_set_pin{ set_pin }
         , m_logging_system{ logging_system }
+        , m_tx_buf_idx{ 0 }
         , m_rx_reader(&m_rx_buffer_buf)
         , m_rx_writer(&m_rx_buffer_buf)
         , m_rx_backoff(10, 100)
@@ -47,17 +114,12 @@ namespace zero_mate::peripheral
             void* proc = LIB_SELF();
             m_server_register = (remote_protocol::register_t)LIB_SYM(proc, "server_register_channel");
             m_server_unregister = (remote_protocol::unregister_t)LIB_SYM(proc, "server_unregister_channel");
-            m_server_send = (remote_protocol::send_t)LIB_SYM(proc, "server_send_data");
             m_server_init_handshake = (remote_protocol::init_handshake_t)LIB_SYM(proc, "server_init_handshake");
 
             if (m_server_register)
             {
-                m_server_fd = m_server_register("uart",
-                                                On_Compare_Static,
-                                                On_Receive_Static,
-                                                On_Disconnect_Static,
-                                                On_Handshake_Result_Static,
-                                                this);
+                m_fd =
+                m_server_register("uart", On_Compare_Static, On_Disconnect_Static, On_Handshake_Result_Static, this);
             }
 
             std::strncpy(m_remote_ip, "127.0.0.1", sizeof(m_remote_ip) - 1);
@@ -69,127 +131,125 @@ namespace zero_mate::peripheral
             if (m_rx_thread.joinable())
                 m_rx_thread.join();
 
-            if (m_server_fd != -1 && m_server_unregister)
-                m_server_unregister(m_server_fd);
+            if (m_fd != -1 && m_server_unregister)
+                m_server_unregister(m_fd);
+        }
+
+        void SendWord()
+        {
+            std::uint32_t word = 0;
+
+            for (std::size_t i = 0; i < m_tx_buf_idx; i++)
+            {
+                if (i < 32)
+                {
+                    // set the bits in order of receiving;
+                    word |= (m_tx_buf[i] ? 1U : 0U) << i;
+                }
+            }
+
+            UART_Word u_word = {
+                .bit_count = m_tx_buf_idx,
+                .word = word,
+            };
+            // printf("Sending: %b |%d|\n", u_word.word, u_word.bit_count);
+
+            send(m_fd, &u_word, sizeof(u_word), 0);
+
+            m_tx_buf_idx = 0;
+        }
+
+        void ProcessFromTX()
+        {
+
+            const auto bit = m_read_pin(m_tx_pin);
+
+            switch (m_tx_state)
+            {
+                case UART_State::Idle:
+                    if (bit)
+                    {
+                        m_tx_state = UART_State::Start_Bits;
+                    }
+                    break;
+
+                case UART_State::Start_Bits:
+                    if (!bit)
+                    {
+                        m_tx_buf[m_tx_buf_idx++] = bit;
+                        if (--m_start_bits_curr == 0)
+                        {
+                            m_start_bits_curr = m_start_bits;
+                            m_tx_state = UART_State::Data_Bits;
+                        }
+                    }
+                    else if (m_start_bits_curr < m_start_bits)
+                    {
+                        // start bits weren't correct
+                        // efectively clear the buffer
+                        m_start_bits_curr = m_start_bits;
+                        m_tx_buf_idx = 0;
+                        m_tx_state = UART_State::Idle;
+                    }
+                    break;
+
+                case UART_State::Data_Bits:
+                    m_tx_buf[m_tx_buf_idx++] = bit;
+
+                    if (--m_data_bits_curr == 0)
+                    {
+                        m_data_bits_curr = m_data_bits;
+                        m_tx_state = UART_State::Stop_Bits;
+                    }
+                    break;
+
+                case UART_State::Stop_Bits:
+                    m_tx_buf[m_tx_buf_idx++] = bit;
+
+                    if (--m_stop_bits_curr == 0)
+                    {
+                        m_stop_bits_curr = m_stop_bits;
+                        m_tx_state = UART_State::Idle;
+                        SendWord();
+                    }
+            }
+        }
+
+        void DrainToRX()
+        {
+            if (m_rx_reader.try_advance())
+            {
+                const auto& bit = static_cast<bool>(m_rx_reader.peek());
+                m_rx_reader.advance();
+                m_rx_backoff.wake();
+
+                m_set_pin(m_rx_pin, bit);
+            }
         }
 
         void Increment_Passed_Cycles(uint32_t count) override
         {
-            if (!m_connected || m_bit_time_cycles == 0)
+            m_cpu_cycles += count;
+
+            if (!m_connected)
+            {
                 return;
-
-            // Process TX (Guest -> Network)
-            if (m_tx_state == UART_State::Idle)
-            {
-                if (!m_read_pin(m_tx_pin)) // Start bit edge
-                {
-                    m_tx_state = UART_State::Data_Bits;
-                    m_tx_timer = (m_bit_time_cycles * 3) / 2; // 1.5 bit times to Bit 0
-                    m_tx_bit_count = 0;
-                    m_tx_shift_reg = 0;
-                }
-            }
-            else
-            {
-                if (count >= m_tx_timer)
-                {
-                    uint32_t remaining = count - m_tx_timer;
-                    m_tx_timer = 0;
-                    
-                    if (m_tx_state == UART_State::Data_Bits)
-                    {
-                        if (m_read_pin(m_tx_pin)) m_tx_shift_reg |= (1U << m_tx_bit_count);
-                        m_tx_bit_count++;
-                        
-                        if (m_tx_bit_count >= 8)
-                        {
-                            m_tx_state = UART_State::Stop_Bit;
-                            m_tx_timer = m_bit_time_cycles;
-                        }
-                        else
-                        {
-                            m_tx_timer = m_bit_time_cycles;
-                        }
-                    }
-                    else if (m_tx_state == UART_State::Stop_Bit)
-                    {
-                        if (m_logging_system)
-                            m_logging_system->Debug(fmt::format("Remote UART: Sending 0x{:02X}", m_tx_shift_reg).c_str());
-                        
-                        send(m_server_fd, &m_tx_shift_reg, 1, 0);
-                        m_tx_state = UART_State::Idle;
-                    }
-                    
-                    if (m_tx_timer > remaining) m_tx_timer -= remaining;
-                    else m_tx_timer = 0;
-                }
-                else
-                {
-                    m_tx_timer -= count;
-                }
             }
 
-            // Process RX (Network -> Guest)
-            if (m_rx_state == UART_State::Idle)
+            if (m_cpu_cycles >= m_baud_rate)
             {
-                if (m_rx_reader.try_advance())
-                {
-                    m_rx_current_byte = m_rx_reader.peek();
-                    m_rx_reader.advance();
-                    m_rx_backoff.wake();
-                    
-                    m_rx_state = UART_State::Data_Bits;
-                    m_rx_timer = m_bit_time_cycles;
-                    m_rx_bit_count = 0;
-                    m_set_pin(m_rx_pin, false); // Start bit
-                }
-                else
-                {
-                    m_set_pin(m_rx_pin, true); // Idle High
-                }
-            }
-            else
-            {
-                if (count >= m_rx_timer)
-                {
-                    uint32_t remaining = count - m_rx_timer;
-                    m_rx_timer = 0;
-
-                    if (m_rx_state == UART_State::Data_Bits)
-                    {
-                        m_set_pin(m_rx_pin, (m_rx_current_byte & (1U << m_rx_bit_count)) != 0);
-                        m_rx_bit_count++;
-                        
-                        if (m_rx_bit_count >= 8)
-                        {
-                            m_rx_state = UART_State::Stop_Bit;
-                            m_rx_timer = m_bit_time_cycles * 2; // 2 stop bits for safety
-                        }
-                        else
-                        {
-                            m_rx_timer = m_bit_time_cycles;
-                        }
-                    }
-                    else if (m_rx_state == UART_State::Stop_Bit)
-                    {
-                        m_set_pin(m_rx_pin, true);
-                        m_rx_state = UART_State::Idle;
-                    }
-
-                    if (m_rx_timer > remaining) m_rx_timer -= remaining;
-                    else m_rx_timer = 0;
-                }
-                else
-                {
-                    m_rx_timer -= count;
-                }
+                m_cpu_cycles = 0;
+                ProcessFromTX();
+                DrainToRX();
             }
         }
 
         void Render() override
         {
             if (m_imgui_context)
+            {
                 ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_context));
+            }
 
             if (ImGui::Begin(m_name.c_str()))
             {
@@ -202,19 +262,26 @@ namespace zero_mate::peripheral
                     ImGui::InputInt("RX Pin", &m_rx_pin);
                     ImGui::InputInt("Baudrate", &m_baudrate_val);
 
+                    ImGui::InputInt("Start Bits", &m_start_bits);
+                    ImGui::InputInt("Data Bits", &m_data_bits);
+                    ImGui::InputInt("Stop Bits", &m_stop_bits);
+
                     if (ImGui::Button("Connect"))
                     {
-                        m_bit_time_cycles = (Clock_Rate / (uint32_t)m_baudrate_val) / 8;
-                        if (m_server_fd != -1 && m_server_init_handshake)
+                        m_tx_state = UART_State::Idle;
+                        m_tx_buf_idx = 0;
+                        m_start_bits_curr = m_start_bits;
+                        m_data_bits_curr = m_data_bits;
+                        m_stop_bits_curr = m_stop_bits;
+
+                        m_baud_rate = ((Clock_Rate / (uint32_t)m_baudrate_val) / 8) - 1;
+                        if (m_fd != -1 && (m_server_init_handshake != nullptr))
                         {
-                            struct UARTPayload
-                            {
-                                uint8_t proto;
-                                uint32_t baud;
-                                uint32_t net_id;
-                            } __attribute__((packed));
-                            UARTPayload payload = { 0, (uint32_t)m_baudrate_val, (uint32_t)m_net_id };
-                            m_server_init_handshake(m_server_fd,
+
+                            const UARTPayload payload = { .proto = 0,
+                                                          .baud = (uint32_t)m_baudrate_val,
+                                                          .net_id = (uint32_t)m_net_id };
+                            m_server_init_handshake(m_fd,
                                                     m_remote_ip,
                                                     (uint16_t)m_remote_port,
                                                     &payload,
@@ -229,10 +296,10 @@ namespace zero_mate::peripheral
                     if (ImGui::Button("Disconnect"))
                     {
                         m_connected = false;
-                        if (m_server_fd != -1 && m_server_unregister)
+                        if (m_fd != -1 && (m_server_unregister != nullptr))
                         {
-                            m_server_unregister(m_server_fd);
-                            m_server_fd = -1;
+                            m_server_unregister(m_fd);
+                            m_fd = -1;
                         }
                     }
                 }
@@ -251,22 +318,15 @@ namespace zero_mate::peripheral
             return static_cast<CRemote_UART*>(context)->On_Compare(payload, size);
         }
 
-        bool On_Compare(const void* payload, size_t size)
+        bool On_Compare(const void* payload, size_t size) const
         {
-            struct UARTPayload
-            {
-                uint8_t proto;
-                uint32_t baud;
-                uint32_t net_id;
-            } __attribute__((packed));
             if (size < sizeof(UARTPayload))
+            {
                 return false;
-            const auto* p = static_cast<const UARTPayload*>(payload);
-            return (p->proto == 0 && p->net_id == (uint32_t)m_net_id);
-        }
+            }
 
-        static void On_Receive_Static(void* /*context*/, const void* /*data*/, size_t /*size*/)
-        {
+            const auto* protocol = static_cast<const UARTPayload*>(payload);
+            return (protocol->proto == 0 && protocol->net_id == (uint32_t)m_net_id);
         }
 
         static void On_Disconnect_Static(void* context)
@@ -274,7 +334,8 @@ namespace zero_mate::peripheral
             static_cast<CRemote_UART*>(context)->m_connected = false;
         }
 
-        static void On_Handshake_Result_Static(void* context, bool success, int fd, const char* remote_ip, uint16_t remote_port)
+        static void
+        On_Handshake_Result_Static(void* context, bool success, int fd, const char* remote_ip, uint16_t remote_port)
         {
             static_cast<CRemote_UART*>(context)->On_Handshake_Result(success, fd, remote_ip, remote_port);
         }
@@ -290,81 +351,72 @@ namespace zero_mate::peripheral
 
                 if (connect(fd, (struct sockaddr*)&remote_addr, sizeof(remote_addr)) == 0)
                 {
-                    m_bit_time_cycles = (Clock_Rate / (uint32_t)m_baudrate_val) / 8;
-                    if (m_logging_system)
-                        m_logging_system->Info(fmt::format("Remote UART: Connected to {}:{} (bit time cycles: {})", remote_ip, remote_port, m_bit_time_cycles).c_str());
-                    
+                    m_baud_rate = ((Clock_Rate / (uint32_t)m_baudrate_val) / 8) - 1;
+
+                    if (m_logging_system != nullptr)
+
+                    {
+                        m_logging_system->Info(fmt::format("Remote UART: Connected to {}:{} (baud_rate: {})",
+                                                           remote_ip,
+                                                           remote_port,
+                                                           m_baud_rate)
+                                               .c_str());
+                    }
+
                     m_connected = true;
                     m_running = true;
                     m_rx_thread = std::thread(&CRemote_UART::RX_Thread, this);
                 }
                 else
                 {
-                    if (m_logging_system)
-                        m_logging_system->Error(fmt::format("Remote UART: Failed to connect to {}:{} (errno {})", remote_ip, remote_port, errno).c_str());
+                    if (m_logging_system != nullptr)
+                    {
+                        m_logging_system->Error(
+                        fmt::format("Remote UART: Failed to connect to {}:{} (errno {})", remote_ip, remote_port, errno)
+                        .c_str());
+                    }
                 }
             }
         }
 
         void RX_Thread()
         {
-            uint8_t buffer[1024];
+            std::array<std::uint8_t, 1024> buffer{ 0 };
             while (m_running)
             {
-                ssize_t received = recv(m_server_fd, buffer, sizeof(buffer), 0);
+
+                const auto received = recv(m_fd, buffer.data(), sizeof(buffer), 0);
+
                 if (received > 0)
                 {
-                    if (m_logging_system)
-                        m_logging_system->Debug(fmt::format("Remote UART: Received {} bytes from network", received).c_str());
 
-                    for (ssize_t i = 0; i < received; ++i)
+                    if (received < sizeof(UART_Word))
                     {
-                        m_rx_writer.insert_with_backoff(buffer[i], m_rx_backoff);
-                        m_rx_backoff.wake();
+                        continue;
+                    }
+
+                    UART_Word u_word{ };
+                    std::memcpy(&u_word, buffer.data(), sizeof(UART_Word));
+                    printf("Received: %b |%d| \n", u_word.word, u_word.bit_count);
+
+                    for (std::uint8_t i = 0; i < u_word.bit_count; i++)
+                    {
+                        const bool bit = (u_word.word & (1U << i)) > 0;
+                        m_rx_writer.insert_with_backoff(bit, m_rx_backoff);
                     }
                 }
                 else if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
                 {
-                    if (m_logging_system)
+                    if (m_logging_system != nullptr)
+                    {
                         m_logging_system->Info("Remote UART: Network connection closed");
+                    }
+
                     m_connected = false;
                     break;
                 }
             }
         }
-
-        std::string m_name;
-        int m_tx_pin{ 14 }, m_rx_pin{ 15 }, m_baudrate_val{ 115200 }, m_net_id{ 1 }, m_remote_port{ 5000 };
-        char m_remote_ip[64]{ 0 };
-        uint32_t m_bit_time_cycles{ 0 };
-        int m_server_fd{ -1 };
-        bool m_connected{ false };
-        IExternal_Peripheral::Read_GPIO_Pin_t m_read_pin;
-        IExternal_Peripheral::Set_GPIO_Pin_t m_set_pin;
-        utils::CLogging_System* m_logging_system;
-        void* m_imgui_context{ nullptr };
-        remote_protocol::register_t m_server_register{ nullptr };
-        remote_protocol::unregister_t m_server_unregister{ nullptr };
-        remote_protocol::send_t m_server_send{ nullptr };
-        remote_protocol::init_handshake_t m_server_init_handshake{ nullptr };
-        
-        TSP::Queue::Buffer<uint8_t, QUEUE_SIZE> m_rx_buffer_buf;
-        TSP::Queue::Reader<uint8_t, QUEUE_SIZE> m_rx_reader;
-        TSP::Queue::Writer<uint8_t, QUEUE_SIZE> m_rx_writer;
-        TSP::BF::SemBackoff m_rx_backoff;
-
-        UART_State m_tx_state{ UART_State::Idle };
-        uint32_t m_tx_timer{ 0 };
-        uint8_t m_tx_shift_reg{ 0 };
-        uint8_t m_tx_bit_count{ 0 };
-
-        UART_State m_rx_state{ UART_State::Idle };
-        uint32_t m_rx_timer{ 0 };
-        uint8_t m_rx_current_byte{ 0 };
-        uint8_t m_rx_bit_count{ 0 };
-
-        std::atomic<bool> m_running{ false };
-        std::thread m_rx_thread;
     };
 }
 

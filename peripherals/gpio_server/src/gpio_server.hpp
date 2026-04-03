@@ -33,7 +33,6 @@ namespace zero_mate::peripheral
         // Exported symbols
         static int Register(const char* protocol,
                             remote_protocol::comparison_func_t comp_func,
-                            remote_protocol::receive_callback_t on_receive,
                             remote_protocol::disconnect_callback_t on_disconnect,
                             remote_protocol::handshake_result_callback_t on_handshake_result,
                             void* context);
@@ -49,7 +48,6 @@ namespace zero_mate::peripheral
             int fd;
             std::string protocol;
             remote_protocol::comparison_func_t comp_func;
-            remote_protocol::receive_callback_t on_receive;
             remote_protocol::disconnect_callback_t on_disconnect;
             remote_protocol::handshake_result_callback_t on_handshake_result;
             void* context;

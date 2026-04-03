@@ -143,7 +143,7 @@ CSerial_Terminal::CSerial_Terminal(const std::string& name,
 , m_RX_state{ NState_Machine::Bus_Idle }
 , m_RX_bit_idx{ 0 }
 , m_terminal{ Terminal_Width, Terminal_Height }
-, m_user_input{}
+, m_user_input{ }
 , m_TX_state{ NState_Machine::Start_Bit }
 , m_TX_bit_idx{ 0 }
 , m_TX_curr_data{ 0 }

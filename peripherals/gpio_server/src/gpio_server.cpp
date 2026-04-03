@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <vector>
+#include <array>
 
 #include "fmt/format.h"
 #include "imgui.h"
@@ -40,14 +41,18 @@ namespace zero_mate::peripheral
         {
             std::lock_guard<std::mutex> lock(s_instances_mutex);
             std::erase(s_instances, this);
-            
-            auto it = s_fd_to_instance.begin();
-            while (it != s_fd_to_instance.end())
+
+            auto iter = s_fd_to_instance.begin();
+            while (iter != s_fd_to_instance.end())
             {
-                if (it->second == this)
-                    it = s_fd_to_instance.erase(it);
+                if (iter->second == this)
+                {
+                    iter = s_fd_to_instance.erase(iter);
+                }
                 else
-                    ++it;
+                {
+                    ++iter;
+                }
             }
         }
     }
@@ -55,13 +60,18 @@ namespace zero_mate::peripheral
     void CGPIO_Server::StartServer()
     {
         if (m_enabled)
+        {
             return;
+        }
 
         m_handshake_sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (m_handshake_sock == -1)
         {
-            if (m_logging_system)
-                m_logging_system->Error(fmt::format("CGPIO_Server [{}]: Failed to create handshake socket", m_name).c_str());
+            if (m_logging_system != nullptr)
+            {
+                m_logging_system->Error(
+                fmt::format("CGPIO_Server [{}]: Failed to create handshake socket", m_name).c_str());
+            }
             return;
         }
 
@@ -70,8 +80,12 @@ namespace zero_mate::peripheral
                                  .sin_addr = { .s_addr = INADDR_ANY } };
         if (bind(m_handshake_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0)
         {
-            if (m_logging_system)
-                m_logging_system->Error(fmt::format("CGPIO_Server [{}]: Failed to bind handshake socket to port {}", m_name, m_ui_port).c_str());
+            if (m_logging_system != nullptr)
+            {
+                m_logging_system->Error(
+                fmt::format("CGPIO_Server [{}]: Failed to bind handshake socket to port {}", m_name, m_ui_port)
+                .c_str());
+            }
             close(m_handshake_sock);
             m_handshake_sock = -1;
             return;
@@ -80,9 +94,12 @@ namespace zero_mate::peripheral
         m_running = true;
         m_enabled = true;
         m_networking_thread = std::thread(&CGPIO_Server::Networking_Thread, this);
-        
-        if (m_logging_system)
-            m_logging_system->Info(fmt::format("CGPIO_Server [{}]: Server started on port {}", m_name, m_ui_port).c_str());
+
+        if (m_logging_system != nullptr)
+        {
+            m_logging_system->Info(
+            fmt::format("CGPIO_Server [{}]: Server started on port {}", m_name, m_ui_port).c_str());
+        }
     }
 
     void CGPIO_Server::StopServer()
@@ -90,12 +107,16 @@ namespace zero_mate::peripheral
         if (!m_enabled)
             return;
 
-        if (m_logging_system)
+        if (m_logging_system != nullptr)
+        {
             m_logging_system->Info(fmt::format("CGPIO_Server [{}]: Stopping server", m_name).c_str());
+        }
 
         m_running = false;
         if (m_networking_thread.joinable())
+        {
             m_networking_thread.join();
+        }
 
         if (m_handshake_sock != -1)
         {
@@ -107,21 +128,30 @@ namespace zero_mate::peripheral
         std::vector<int> fds_to_remove;
         for (auto& [fd, comp] : m_components)
         {
-            if (m_logging_system)
-                m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: Disconnecting component FD {}", m_name, fd).c_str());
-            
-            if (comp.on_disconnect)
+            if (m_logging_system != nullptr)
+            {
+                m_logging_system->Debug(
+                fmt::format("CGPIO_Server [{}]: Disconnecting component FD {}", m_name, fd).c_str());
+            }
+
+            if (comp.on_disconnect != nullptr)
+            {
                 comp.on_disconnect(comp.context);
-            
+            }
+
             if (fd != -1)
+            {
                 close(fd);
+            }
             fds_to_remove.push_back(fd);
         }
 
         {
             std::lock_guard<std::mutex> lock_instances(s_instances_mutex);
             for (int fd : fds_to_remove)
+            {
                 s_fd_to_instance.erase(fd);
+            }
         }
         m_components.clear();
         m_enabled = false;
@@ -129,8 +159,10 @@ namespace zero_mate::peripheral
 
     void CGPIO_Server::Render()
     {
-        if (m_imgui_context)
+        if (m_imgui_context != nullptr)
+        {
             ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_context));
+        }
 
         if (ImGui::Begin(m_name.c_str()))
         {
@@ -138,25 +170,34 @@ namespace zero_mate::peripheral
             if (m_enabled)
             {
                 if (ImGui::Button("Stop Server"))
+                {
                     StopServer();
+                }
             }
             else
             {
                 if (ImGui::Button("Start Server"))
+                {
                     StartServer();
+                }
             }
 
             ImGui::Separator();
             ImGui::Text("Status: %s", m_enabled ? "Running" : "Stopped");
             if (m_enabled)
+            {
                 ImGui::Text("Listening on port %d", m_ui_port);
-            
+            }
+
             ImGui::Separator();
             std::lock_guard<std::mutex> lock(m_mutex);
             ImGui::Text("Registered components: %zu", m_components.size());
-            for (auto& [fd, comp] : m_components)
+            for (auto& [f_d, comp] : m_components)
             {
-                ImGui::BulletText("FD: %d [%s], %s", fd, comp.protocol.c_str(), comp.remote_data_port != 0 ? "Connected" : "Waiting");
+                ImGui::BulletText("FD: %d [%s], %s",
+                                  f_d,
+                                  comp.protocol.c_str(),
+                                  comp.remote_data_port != 0 ? "Connected" : "Waiting");
             }
         }
         ImGui::End();
@@ -169,20 +210,23 @@ namespace zero_mate::peripheral
 
     int CGPIO_Server::Register(const char* protocol,
                                remote_protocol::comparison_func_t comp_func,
-                               remote_protocol::receive_callback_t on_receive,
                                remote_protocol::disconnect_callback_t on_disconnect,
                                remote_protocol::handshake_result_callback_t on_handshake_result,
                                void* context)
     {
         std::lock_guard<std::mutex> lock_instances(s_instances_mutex);
         if (s_instances.empty())
+        {
             return -1;
+        }
 
         CGPIO_Server* instance = s_instances.back();
-        
+
         int fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd == -1)
+        {
             return -1;
+        }
 
         struct sockaddr_in addr{ .sin_family = AF_INET, .sin_port = 0, .sin_addr = { .s_addr = INADDR_ANY } };
         if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
@@ -192,19 +236,39 @@ namespace zero_mate::peripheral
         }
 
         std::lock_guard<std::mutex> lock(instance->m_mutex);
-        if (instance->m_logging_system)
-            instance->m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: Registering component with FD {} and protocol {}", instance->m_name, fd, protocol).c_str());
-        
-        instance->m_components[fd] = { fd, protocol, comp_func, on_receive, on_disconnect, on_handshake_result, context };
+        if (instance->m_logging_system != nullptr)
+        {
+            instance->m_logging_system->Debug(
+            fmt::format("CGPIO_Server [{}]: Registering component with FD {} and protocol {}",
+                        instance->m_name,
+                        fd,
+                        protocol)
+            .c_str());
+        }
+
+        instance->m_components[fd] = { .fd = fd,
+                                       .protocol = protocol,
+                                       .comp_func = comp_func,
+                                       .on_disconnect = on_disconnect,
+                                       .on_handshake_result = on_handshake_result,
+                                       .context = context };
+
         s_fd_to_instance[fd] = instance;
-        
+
         struct sockaddr_in local_addr{ };
         socklen_t addr_len = sizeof(local_addr);
         getsockname(fd, (struct sockaddr*)&local_addr, &addr_len);
 
-        if (instance->m_logging_system)
-            instance->m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: Component registered. FD: {}, Protocol: {}, Local Data Port: {}", 
-                                              instance->m_name, fd, protocol, ntohs(local_addr.sin_port)).c_str());
+        if (instance->m_logging_system != nullptr)
+        {
+            instance->m_logging_system->Debug(
+            fmt::format("CGPIO_Server [{}]: Component registered. FD: {}, Protocol: {}, Local Data Port: {}",
+                        instance->m_name,
+                        fd,
+                        protocol,
+                        ntohs(local_addr.sin_port))
+            .c_str());
+        }
 
         return fd;
     }
@@ -225,12 +289,12 @@ namespace zero_mate::peripheral
                     socklen_t data_addr_len = sizeof(local_data_addr);
                     getsockname(fd, (struct sockaddr*)&local_data_addr, &data_addr_len);
 
-                    handshake::DisconnectMessage dm{ .magic = handshake::MAGIC_BYTE,
-                                                     .type = handshake::MessageType::Disconnect,
-                                                     .port = ntohs(local_data_addr.sin_port) };
+                    handshake::DisconnectMessage dconn_msg{ .magic = handshake::MAGIC_BYTE,
+                                                            .type = handshake::MessageType::Disconnect,
+                                                            .port = ntohs(local_data_addr.sin_port) };
                     sendto(instance->m_handshake_sock,
-                           &dm,
-                           sizeof(dm),
+                           &dconn_msg,
+                           sizeof(dconn_msg),
                            0,
                            (struct sockaddr*)&comp.remote_handshake_addr,
                            sizeof(comp.remote_handshake_addr));
@@ -254,18 +318,25 @@ namespace zero_mate::peripheral
         {
             std::lock_guard<std::mutex> lock_instances(s_instances_mutex);
             if (!s_fd_to_instance.contains(fd))
+            {
                 return;
+            }
             instance = s_fd_to_instance[fd];
         }
 
         std::lock_guard<std::mutex> lock(instance->m_mutex);
         if (!instance->m_components.contains(fd))
+        {
             return;
+        }
 
         if (instance->m_handshake_sock == -1)
         {
-            if (instance->m_logging_system)
-                instance->m_logging_system->Error(fmt::format("CGPIO_Server [{}]: Cannot init handshake, server not running", instance->m_name).c_str());
+            if (instance->m_logging_system != nullptr)
+            {
+                instance->m_logging_system->Error(
+                fmt::format("CGPIO_Server [{}]: Cannot init handshake, server not running", instance->m_name).c_str());
+            }
             return;
         }
 
@@ -287,9 +358,16 @@ namespace zero_mate::peripheral
         conf->payload_size = static_cast<uint16_t>(size);
         std::memcpy(msg_buf.data() + sizeof(handshake::ConfMessage), comp_payload, size);
 
-        if (instance->m_logging_system)
-            instance->m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: Sending Conf message to {}:{} from handshake socket (initiator port {})", 
-                                              instance->m_name, remote_ip, remote_port, conf->port).c_str());
+        if (instance->m_logging_system != nullptr)
+        {
+            instance->m_logging_system->Debug(
+            fmt::format("CGPIO_Server [{}]: Sending Conf message to {}:{} from handshake socket (initiator port {})",
+                        instance->m_name,
+                        remote_ip,
+                        remote_port,
+                        conf->port)
+            .c_str());
+        }
 
         // Control messages are sent from the handshake socket.
         ssize_t sent = sendto(instance->m_handshake_sock,
@@ -298,26 +376,34 @@ namespace zero_mate::peripheral
                               0,
                               (struct sockaddr*)&comp.remote_handshake_addr,
                               sizeof(comp.remote_handshake_addr));
-        
-        if (sent < 0 && instance->m_logging_system)
-            instance->m_logging_system->Error(fmt::format("CGPIO_Server [{}]: Failed to send Conf message (errno {})", instance->m_name, errno).c_str());
+
+        if (sent < 0 && (instance->m_logging_system != nullptr))
+        {
+            instance->m_logging_system->Error(
+            fmt::format("CGPIO_Server [{}]: Failed to send Conf message (errno {})", instance->m_name, errno).c_str());
+        }
     }
 
     void CGPIO_Server::Networking_Thread()
     {
         while (m_running)
         {
-            struct pollfd pfd{ m_handshake_sock, POLLIN, 0 };
+            struct pollfd pfd{ .fd = m_handshake_sock, .events = POLLIN, .revents = 0 };
             int ret = poll(&pfd, 1, 100);
             if (ret > 0)
             {
                 if (pfd.revents & POLLIN)
+                {
                     Handle_Handshake(m_handshake_sock);
+                }
             }
             else if (ret < 0 && errno != EINTR)
             {
-                if (m_logging_system)
-                    m_logging_system->Error(fmt::format("CGPIO_Server [{}]: poll error (errno {})", m_name, errno).c_str());
+                if (m_logging_system != nullptr)
+                {
+                    m_logging_system->Error(
+                    fmt::format("CGPIO_Server [{}]: poll error (errno {})", m_name, errno).c_str());
+                }
                 break;
             }
         }
@@ -327,28 +413,41 @@ namespace zero_mate::peripheral
     {
         struct sockaddr_in remote_addr{ };
         socklen_t addr_len = sizeof(remote_addr);
-        uint8_t buffer[4096];
-        ssize_t received = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr*)&remote_addr, &addr_len);
-        if (received < (ssize_t)sizeof(handshake::ConfMessage))
-            return;
+        std::array<std::uint8_t, 4096> buffer{ 0 };
+        const auto received =
+        recvfrom(sock, buffer.data(), buffer.size(), 0, (struct sockaddr*)&remote_addr, &addr_len);
 
-        auto* conf = reinterpret_cast<handshake::ConfMessage*>(buffer);
-        if (conf->magic != handshake::MAGIC_BYTE)
+        if (received < (ssize_t)sizeof(handshake::ConfMessage))
+        {
             return;
+        }
+
+        auto* conf = reinterpret_cast<handshake::ConfMessage*>(buffer.data());
+        if (conf->magic != handshake::MAGIC_BYTE)
+        {
+            return;
+        }
 
         char remote_ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &remote_addr.sin_addr, remote_ip_str, INET_ADDRSTRLEN);
 
         if (conf->type == handshake::MessageType::Conf)
         {
-            if (m_logging_system)
-                m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: Received Conf from {}:{} (remote data port {})", m_name, remote_ip_str, ntohs(remote_addr.sin_port), conf->port).c_str());
+            if (m_logging_system != nullptr)
+            {
+                m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: Received Conf from {}:{} (remote data port {})",
+                                                    m_name,
+                                                    remote_ip_str,
+                                                    ntohs(remote_addr.sin_port),
+                                                    conf->port)
+                                        .c_str());
+            }
 
             bool accepted = false;
             std::lock_guard<std::mutex> lock(m_mutex);
             for (auto& [fd, comp] : m_components)
             {
-                if (comp.comp_func(comp.context, buffer + sizeof(handshake::ConfMessage), conf->payload_size))
+                if (comp.comp_func(comp.context, buffer.data() + sizeof(handshake::ConfMessage), conf->payload_size))
                 {
                     comp.remote_handshake_addr = remote_addr;
                     comp.remote_data_port = conf->port;
@@ -362,15 +461,25 @@ namespace zero_mate::peripheral
                                                      .status = 1,
                                                      .port = ntohs(local_data_addr.sin_port),
                                                      .initiator_port = conf->port };
-                    
-                    if (m_logging_system)
-                        m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: Accepting connection, responder data port {}, initiator data port {}", m_name, resp.port, resp.initiator_port).c_str());
+
+                    if (m_logging_system != nullptr)
+                    {
+                        m_logging_system->Debug(
+                        fmt::format(
+                        "CGPIO_Server [{}]: Accepting connection, responder data port {}, initiator data port {}",
+                        m_name,
+                        resp.port,
+                        resp.initiator_port)
+                        .c_str());
+                    }
 
                     sendto(sock, &resp, sizeof(resp), 0, (struct sockaddr*)&remote_addr, sizeof(remote_addr));
 
-                    if (comp.on_handshake_result)
+                    if (comp.on_handshake_result != nullptr)
+                    {
                         comp.on_handshake_result(comp.context, true, fd, remote_ip_str, conf->port);
-                    
+                    }
+
                     accepted = true;
                     break;
                 }
@@ -379,7 +488,11 @@ namespace zero_mate::peripheral
             if (!accepted)
             {
                 if (m_logging_system)
-                    m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: No matching component for Conf from {}:{}", m_name, remote_ip_str, ntohs(remote_addr.sin_port)).c_str());
+                    m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: No matching component for Conf from {}:{}",
+                                                        m_name,
+                                                        remote_ip_str,
+                                                        ntohs(remote_addr.sin_port))
+                                            .c_str());
 
                 handshake::ResponseMessage resp{ .magic = handshake::MAGIC_BYTE,
                                                  .type = handshake::MessageType::Response,
@@ -391,10 +504,19 @@ namespace zero_mate::peripheral
         }
         else if (conf->type == handshake::MessageType::Response)
         {
-            auto* resp = reinterpret_cast<handshake::ResponseMessage*>(buffer);
-            if (m_logging_system)
-                m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: Received Response from {}:{} (status {}, responder data port {}, initiator data port {})", 
-                                        m_name, remote_ip_str, ntohs(remote_addr.sin_port), (int)resp->status, resp->port, resp->initiator_port).c_str());
+            auto* resp = reinterpret_cast<handshake::ResponseMessage*>(buffer.data());
+            if (m_logging_system != nullptr)
+            {
+                m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: Received Response from {}:{} (status {}, "
+                                                    "responder data port {}, initiator data port {})",
+                                                    m_name,
+                                                    remote_ip_str,
+                                                    ntohs(remote_addr.sin_port),
+                                                    (int)resp->status,
+                                                    resp->port,
+                                                    resp->initiator_port)
+                                        .c_str());
+            }
 
             std::lock_guard<std::mutex> lock(m_mutex);
             bool found = false;
@@ -411,22 +533,38 @@ namespace zero_mate::peripheral
                         comp.remote_data_port = resp->port;
                         comp.remote_handshake_addr = remote_addr;
                     }
-                    
-                    if (comp.on_handshake_result)
+
+                    if (comp.on_handshake_result != nullptr)
+                    {
                         comp.on_handshake_result(comp.context, resp->status == 1, fd, remote_ip_str, resp->port);
-                    
+                    }
+
                     found = true;
                     break;
                 }
             }
-            if (!found && m_logging_system)
-                m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: Could not find component with initiator port {} for Response", m_name, resp->initiator_port).c_str());
+            if (!found && (m_logging_system != nullptr))
+            {
+                m_logging_system->Debug(
+                fmt::format("CGPIO_Server [{}]: Could not find component with initiator port {} for Response",
+                            m_name,
+                            resp->initiator_port)
+                .c_str());
+            }
         }
         else if (conf->type == handshake::MessageType::Disconnect)
         {
-            auto* dm = reinterpret_cast<handshake::DisconnectMessage*>(buffer);
-            if (m_logging_system)
-                m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: Received Disconnect from {}:{} (remote data port {})", m_name, remote_ip_str, ntohs(remote_addr.sin_port), dm->port).c_str());
+            auto* dm = reinterpret_cast<handshake::DisconnectMessage*>(buffer.data());
+            if (m_logging_system != nullptr)
+            {
+                m_logging_system->Debug(
+                fmt::format("CGPIO_Server [{}]: Received Disconnect from {}:{} (remote data port {})",
+                            m_name,
+                            remote_ip_str,
+                            ntohs(remote_addr.sin_port),
+                            dm->port)
+                .c_str());
+            }
 
             std::lock_guard<std::mutex> lock_instances(s_instances_mutex);
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -435,12 +573,17 @@ namespace zero_mate::peripheral
                 if (comp.remote_handshake_addr.sin_addr.s_addr == remote_addr.sin_addr.s_addr &&
                     comp.remote_handshake_addr.sin_port == remote_addr.sin_port && comp.remote_data_port == dm->port)
                 {
-                    if (m_logging_system)
-                        m_logging_system->Debug(fmt::format("CGPIO_Server [{}]: Component FD {} disconnected remotely", m_name, fd).c_str());
+                    if (m_logging_system != nullptr)
+                    {
+                        m_logging_system->Debug(
+                        fmt::format("CGPIO_Server [{}]: Component FD {} disconnected remotely", m_name, fd).c_str());
+                    }
 
-                    if (comp.on_disconnect)
+                    if (comp.on_disconnect != nullptr)
+                    {
                         comp.on_disconnect(comp.context);
-                    
+                    }
+
                     s_fd_to_instance.erase(fd);
                     close(fd);
                     m_components.erase(fd);
@@ -455,14 +598,12 @@ extern "C"
 {
     int server_register_channel(const char* protocol,
                                 zero_mate::remote_protocol::comparison_func_t comp_func,
-                                zero_mate::remote_protocol::receive_callback_t on_receive,
                                 zero_mate::remote_protocol::disconnect_callback_t on_disconnect,
                                 zero_mate::remote_protocol::handshake_result_callback_t on_handshake_result,
                                 void* context)
     {
         return zero_mate::peripheral::CGPIO_Server::Register(protocol,
                                                              comp_func,
-                                                             on_receive,
                                                              on_disconnect,
                                                              on_handshake_result,
                                                              context);
@@ -476,8 +617,8 @@ extern "C"
     {
         zero_mate::peripheral::CGPIO_Server::Send(fd, data, size);
     }
-    void server_init_handshake(
-    int fd, const char* remote_ip, uint16_t remote_port, const void* comp_payload, size_t size)
+    void
+    server_init_handshake(int fd, const char* remote_ip, uint16_t remote_port, const void* comp_payload, size_t size)
     {
         zero_mate::peripheral::CGPIO_Server::Init_Handshake(fd, remote_ip, remote_port, comp_payload, size);
     }
