@@ -20,7 +20,7 @@ namespace zero_mate::remote_protocol
     void (*)(void* context, bool success, int fd, const char* remote_ip, uint16_t remote_port);
 
     // Disconnect callback: called when the remote side disconnects or the connection is lost.
-    using disconnect_callback_t = void (*)(void* context);
+    using disconnect_callback_t = void (*)(void* context, const char* remote_ip, uint16_t remote_port);
 
     // Comparison function: returns true if the incoming component-specific handshake payload matches.
     // The server will pass the payload extracted from the ConfMessage.
@@ -41,4 +41,7 @@ namespace zero_mate::remote_protocol
     // comp_payload: component-specific data (e.g. protocol ID, baudrate, net_id)
     using init_handshake_t =
     void (*)(int fd, const char* remote_ip, uint16_t remote_port, const void* comp_payload, size_t size);
+
+    // Disconnect function exported by GPIOServer
+    using disconnect_t = void (*)(int fd);
 }

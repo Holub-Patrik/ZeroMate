@@ -9,7 +9,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <poll.h>
 
+#include "fmt/format.h"
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
 #include "zero_mate/RemoteProtocol.hpp"
@@ -38,7 +40,6 @@ namespace
     {
         uint8_t proto;
         uint8_t is_master;
-        int32_t slave_id;
         uint32_t bus_id;
     } __attribute__((packed));
 
@@ -53,9 +54,8 @@ namespace zero_mate::peripheral
         int m_sda_pin{ 2 };
         int m_scl_pin{ 3 };
         int m_address{ 0x3C };
-        int m_slave_id{ 10 };
-        int m_bus_id{ 12 };
-        int m_remote_port{ 5000 };
+        int m_bus_id{ 1 };
+        int m_remote_port{ 9000 };
         char m_remote_ip[64]{ 0 };
 
         IExternal_Peripheral::Read_GPIO_Pin_t m_read_pin;
@@ -64,10 +64,13 @@ namespace zero_mate::peripheral
         void* m_imgui_context{ nullptr };
 
         int m_server_fd{ -1 };
+        int m_stop_pipe[2]{ -1, -1 };
         bool m_connected{ false };
+        struct sockaddr_in m_remote_addr{ };
 
         remote_protocol::register_t m_server_register{ nullptr };
         remote_protocol::unregister_t m_server_unregister{ nullptr };
+        remote_protocol::disconnect_t m_server_disconnect{ nullptr };
         remote_protocol::init_handshake_t m_server_init_handshake{ nullptr };
 
         std::atomic<bool> m_running{ false };
@@ -82,9 +85,18 @@ namespace zero_mate::peripheral
         , m_set_pin{ set_pin }
         , m_logging_system{ logging_system }
         {
+            if (pipe(m_stop_pipe) == -1)
+            {
+                if (m_logging_system)
+                {
+                    m_logging_system->Error("Remote I2C Slave: Failed to create stop pipe");
+                }
+            }
+
             void* proc = LIB_SELF();
             m_server_register = (remote_protocol::register_t)LIB_SYM(proc, "server_register_channel");
             m_server_unregister = (remote_protocol::unregister_t)LIB_SYM(proc, "server_unregister_channel");
+            m_server_disconnect = (remote_protocol::disconnect_t)LIB_SYM(proc, "server_disconnect_channel");
             m_server_init_handshake = (remote_protocol::init_handshake_t)LIB_SYM(proc, "server_init_handshake");
 
             if (m_server_register != nullptr)
@@ -101,15 +113,45 @@ namespace zero_mate::peripheral
 
         ~CRemote_I2C_Slave() override
         {
-            m_running = false;
-            if (m_rx_thread.joinable())
-            {
-                m_rx_thread.join();
-            }
+            Stop_RX_Thread();
 
             if (m_server_fd != -1 && (m_server_unregister != nullptr))
             {
                 m_server_unregister(m_server_fd);
+            }
+
+            if (m_stop_pipe[0] != -1)
+            {
+                close(m_stop_pipe[0]);
+                close(m_stop_pipe[1]);
+            }
+        }
+
+        void ResetState()
+        {
+            // Reset any internal state if needed
+        }
+
+        void Stop_RX_Thread()
+        {
+            if (!m_running)
+            {
+                return;
+            }
+
+            m_running = false;
+
+            if (m_stop_pipe[1] != -1)
+            {
+                uint64_t val = 1;
+                (void)write(m_stop_pipe[1], &val, sizeof(val));
+            }
+
+            ResetState();
+
+            if (m_rx_thread.joinable())
+            {
+                m_rx_thread.join();
             }
         }
 
@@ -125,19 +167,16 @@ namespace zero_mate::peripheral
                 {
                     ImGui::InputText("Remote IP", m_remote_ip, sizeof(m_remote_ip));
                     ImGui::InputInt("Remote Port", &m_remote_port);
-                    ImGui::InputInt("Slave ID", &m_slave_id);
                     ImGui::InputInt("Bus ID", &m_bus_id);
                     ImGui::InputInt("Address", &m_address);
                     ImGui::InputInt("SDA Pin", &m_sda_pin);
                     ImGui::InputInt("SCL Pin", &m_scl_pin);
                     if (ImGui::Button("Connect to Master"))
                     {
+                        ResetState();
                         if (m_server_fd != -1 && (m_server_init_handshake != nullptr))
                         {
-                            I2CPayload payload = { .proto = 1,
-                                                   .is_master = 0,
-                                                   .slave_id = (int32_t)m_slave_id,
-                                                   .bus_id = (uint32_t)m_bus_id };
+                            I2CPayload payload = { .proto = 1, .is_master = 0, .bus_id = (uint32_t)m_bus_id };
 
                             m_server_init_handshake(m_server_fd,
                                                     m_remote_ip,
@@ -153,12 +192,13 @@ namespace zero_mate::peripheral
                     ImGui::Text("Status: Connected");
                     if (ImGui::Button("Disconnect"))
                     {
-                        m_connected = false;
-                        if (m_server_fd != -1 && (m_server_unregister != nullptr))
+                        if (m_server_fd != -1 && (m_server_disconnect != nullptr))
                         {
-                            m_server_unregister(m_server_fd);
-                            m_server_fd = -1;
+                            m_server_disconnect(m_server_fd);
                         }
+                        m_connected = false;
+                        Stop_RX_Thread();
+                        ResetState();
                     }
                 }
             }
@@ -214,9 +254,17 @@ namespace zero_mate::peripheral
             }
         }
 
-        static void On_Disconnect_Static(void* context)
+        static void On_Disconnect_Static(void* context, const char* remote_ip, uint16_t remote_port)
         {
-            static_cast<CRemote_I2C_Slave*>(context)->m_connected = false;
+            auto* slave = static_cast<CRemote_I2C_Slave*>(context);
+            if (slave->m_logging_system)
+            {
+                slave->m_logging_system->Info(
+                fmt::format("Remote I2C Slave: Disconnected from peer {}:{}", remote_ip, remote_port).c_str());
+            }
+            slave->m_connected = false;
+            slave->Stop_RX_Thread();
+            slave->ResetState();
         }
 
         static void
@@ -229,13 +277,13 @@ namespace zero_mate::peripheral
         {
             if (success)
             {
-                struct sockaddr_in remote_addr{ };
-                remote_addr.sin_family = AF_INET;
-                remote_addr.sin_port = htons(remote_port);
-                inet_pton(AF_INET, remote_ip, &remote_addr.sin_addr);
+                m_remote_addr.sin_family = AF_INET;
+                m_remote_addr.sin_port = htons(remote_port);
+                inet_pton(AF_INET, remote_ip, &m_remote_addr.sin_addr);
 
-                if (connect(fd, (struct sockaddr*)&remote_addr, sizeof(remote_addr)) == 0)
+                if (connect(fd, (struct sockaddr*)&m_remote_addr, sizeof(m_remote_addr)) == 0)
                 {
+                    Stop_RX_Thread();
                     m_connected = true;
                     m_running = true;
                     m_rx_thread = std::thread(&CRemote_I2C_Slave::RX_Thread, this);
@@ -248,6 +296,29 @@ namespace zero_mate::peripheral
             uint8_t buffer[1024];
             while (m_running)
             {
+                struct pollfd pfds[2];
+                pfds[0].fd = m_server_fd;
+                pfds[0].events = POLLIN;
+                pfds[1].fd = m_stop_pipe[0];
+                pfds[1].events = POLLIN;
+
+                const auto poll_ret = poll(pfds, 2, -1);
+
+                if (poll_ret <= 0)
+                {
+                    continue;
+                }
+
+                if (pfds[1].revents & POLLIN)
+                {
+                    break;
+                }
+
+                if (!(pfds[0].revents & POLLIN))
+                {
+                    continue;
+                }
+
                 ssize_t received = recv(m_server_fd, buffer, sizeof(buffer), 0);
                 if (received > 0)
                 {
@@ -255,6 +326,10 @@ namespace zero_mate::peripheral
                 }
                 else if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
                 {
+                    if (m_logging_system)
+                    {
+                        m_logging_system->Info("Remote I2C Slave: Network connection closed");
+                    }
                     m_connected = false;
                     break;
                 }

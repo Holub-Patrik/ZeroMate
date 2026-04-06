@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <poll.h>
 
 #include "fmt/format.h"
 #include "imgui.h"
@@ -45,7 +46,9 @@ namespace zero_mate::peripheral
         int m_remote_port{ 9000 };
         char m_remote_ip[64]{ 0 };
         int m_fd{ -1 };
+        int m_stop_pipe[2]{ -1, -1 };
         bool m_connected{ false };
+        struct sockaddr_in m_remote_addr{ };
 
         int m_tx_pin{ 14 };
         int m_rx_pin{ 15 };
@@ -65,6 +68,7 @@ namespace zero_mate::peripheral
         void* m_imgui_context{ nullptr };
         remote_protocol::register_t m_server_register{ nullptr };
         remote_protocol::unregister_t m_server_unregister{ nullptr };
+        remote_protocol::disconnect_t m_server_disconnect{ nullptr };
         remote_protocol::init_handshake_t m_server_init_handshake{ nullptr };
 
         TSP::Queue::Buffer<bool, QUEUE_SIZE> m_rx_buffer_buf;
@@ -92,7 +96,7 @@ namespace zero_mate::peripheral
         UART_State m_tx_state{ UART_State::Idle };
 
         std::uint32_t m_cpu_cycles{ 0 };
-        std::uint32_t m_baud_rate;
+        std::uint32_t m_baud_rate{ };
         int m_baudrate_val{ 115200 };
 
         std::atomic<bool> m_running{ false };
@@ -111,12 +115,21 @@ namespace zero_mate::peripheral
         , m_rx_writer(&m_rx_buffer_buf)
         , m_rx_backoff(10, 100)
         {
+            if (pipe(m_stop_pipe) == -1)
+            {
+                if (m_logging_system)
+                {
+                    m_logging_system->Error("Remote UART: Failed to create stop pipe");
+                }
+            }
+
             void* proc = LIB_SELF();
             m_server_register = (remote_protocol::register_t)LIB_SYM(proc, "server_register_channel");
             m_server_unregister = (remote_protocol::unregister_t)LIB_SYM(proc, "server_unregister_channel");
+            m_server_disconnect = (remote_protocol::disconnect_t)LIB_SYM(proc, "server_disconnect_channel");
             m_server_init_handshake = (remote_protocol::init_handshake_t)LIB_SYM(proc, "server_init_handshake");
 
-            if (m_server_register)
+            if (m_server_register != nullptr)
             {
                 m_fd =
                 m_server_register("uart", On_Compare_Static, On_Disconnect_Static, On_Handshake_Result_Static, this);
@@ -127,12 +140,58 @@ namespace zero_mate::peripheral
 
         ~CRemote_UART() override
         {
-            m_running = false;
-            if (m_rx_thread.joinable())
-                m_rx_thread.join();
+            Stop_RX_Thread();
 
-            if (m_fd != -1 && m_server_unregister)
+            if (m_fd != -1 && (m_server_unregister != nullptr))
+            {
                 m_server_unregister(m_fd);
+            }
+
+            if (m_stop_pipe[0] != -1)
+            {
+                close(m_stop_pipe[0]);
+                close(m_stop_pipe[1]);
+            }
+        }
+
+        void ResetState()
+        {
+            m_tx_state = UART_State::Idle;
+            m_tx_buf_idx = 0;
+            m_start_bits_curr = m_start_bits;
+            m_data_bits_curr = m_data_bits;
+            m_stop_bits_curr = m_stop_bits;
+            m_cpu_cycles = 0;
+
+            while (m_rx_reader.try_advance())
+            {
+                m_rx_reader.advance();
+            }
+            m_rx_backoff.wake();
+        }
+
+        void Stop_RX_Thread()
+        {
+            if (!m_running)
+            {
+                return;
+            }
+
+            m_running = false;
+            m_rx_backoff.wake();
+
+            if (m_stop_pipe[1] != -1)
+            {
+                uint64_t val = 1;
+                (void)write(m_stop_pipe[1], &val, sizeof(val));
+            }
+
+            ResetState();
+
+            if (m_rx_thread.joinable())
+            {
+                m_rx_thread.join();
+            }
         }
 
         void SendWord()
@@ -143,7 +202,6 @@ namespace zero_mate::peripheral
             {
                 if (i < 32)
                 {
-                    // set the bits in order of receiving;
                     word |= (m_tx_buf[i] ? 1U : 0U) << i;
                 }
             }
@@ -152,7 +210,6 @@ namespace zero_mate::peripheral
                 .bit_count = m_tx_buf_idx,
                 .word = word,
             };
-            // printf("Sending: %b |%d|\n", u_word.word, u_word.bit_count);
 
             send(m_fd, &u_word, sizeof(u_word), 0);
 
@@ -268,16 +325,11 @@ namespace zero_mate::peripheral
 
                     if (ImGui::Button("Connect"))
                     {
-                        m_tx_state = UART_State::Idle;
-                        m_tx_buf_idx = 0;
-                        m_start_bits_curr = m_start_bits;
-                        m_data_bits_curr = m_data_bits;
-                        m_stop_bits_curr = m_stop_bits;
-
+                        ResetState();
                         m_baud_rate = ((Clock_Rate / (uint32_t)m_baudrate_val) / 8) - 1;
+
                         if (m_fd != -1 && (m_server_init_handshake != nullptr))
                         {
-
                             const UARTPayload payload = { .proto = 0,
                                                           .baud = (uint32_t)m_baudrate_val,
                                                           .net_id = (uint32_t)m_net_id };
@@ -295,12 +347,13 @@ namespace zero_mate::peripheral
                     ImGui::Text("Status: Connected");
                     if (ImGui::Button("Disconnect"))
                     {
-                        m_connected = false;
-                        if (m_fd != -1 && (m_server_unregister != nullptr))
+                        if (m_fd != -1 && (m_server_disconnect != nullptr))
                         {
-                            m_server_unregister(m_fd);
-                            m_fd = -1;
+                            m_server_disconnect(m_fd);
                         }
+                        m_connected = false;
+                        Stop_RX_Thread();
+                        ResetState();
                     }
                 }
             }
@@ -325,13 +378,36 @@ namespace zero_mate::peripheral
                 return false;
             }
 
+            if (m_connected)
+            {
+                return false;
+            }
+
             const auto* protocol = static_cast<const UARTPayload*>(payload);
-            return (protocol->proto == 0 && protocol->net_id == (uint32_t)m_net_id);
+
+            if (protocol->proto != 0)
+            {
+                return false;
+            }
+
+            if (protocol->net_id != m_net_id)
+            {
+                return false;
+            }
+
+            return true;
         }
 
-        static void On_Disconnect_Static(void* context)
+        static void On_Disconnect_Static(void* context, const char* /*remote_ip*/, uint16_t /*remote_port*/)
         {
-            static_cast<CRemote_UART*>(context)->m_connected = false;
+            auto* uart = static_cast<CRemote_UART*>(context);
+            if (uart->m_logging_system != nullptr)
+            {
+                uart->m_logging_system->Info("Remote UART: Disconnected remotely");
+            }
+            uart->m_connected = false;
+            uart->Stop_RX_Thread();
+            uart->ResetState();
         }
 
         static void
@@ -363,6 +439,7 @@ namespace zero_mate::peripheral
                                                .c_str());
                     }
 
+                    Stop_RX_Thread();
                     m_connected = true;
                     m_running = true;
                     m_rx_thread = std::thread(&CRemote_UART::RX_Thread, this);
@@ -384,25 +461,48 @@ namespace zero_mate::peripheral
             std::array<std::uint8_t, 1024> buffer{ 0 };
             while (m_running)
             {
+                struct pollfd pfds[2];
+                pfds[0].fd = m_fd;
+                pfds[0].events = POLLIN;
+                pfds[1].fd = m_stop_pipe[0];
+                pfds[1].events = POLLIN;
+
+                const auto poll_ret = poll(pfds, 2, -1);
+
+                if (poll_ret <= 0)
+                {
+                    continue;
+                }
+
+                if (pfds[1].revents & POLLIN)
+                {
+                    break;
+                }
+
+                if (!(pfds[0].revents & POLLIN))
+                {
+                    continue;
+                }
 
                 const auto received = recv(m_fd, buffer.data(), sizeof(buffer), 0);
 
                 if (received > 0)
                 {
-
-                    if (received < sizeof(UART_Word))
+                    if (received < (ssize_t)sizeof(UART_Word))
                     {
                         continue;
                     }
 
                     UART_Word u_word{ };
                     std::memcpy(&u_word, buffer.data(), sizeof(UART_Word));
-                    printf("Received: %b |%d| \n", u_word.word, u_word.bit_count);
 
                     for (std::uint8_t i = 0; i < u_word.bit_count; i++)
                     {
                         const bool bit = (u_word.word & (1U << i)) > 0;
-                        m_rx_writer.insert_with_backoff(bit, m_rx_backoff);
+                        if (!m_rx_writer.insert(bit))
+                        {
+                            break;
+                        }
                     }
                 }
                 else if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
