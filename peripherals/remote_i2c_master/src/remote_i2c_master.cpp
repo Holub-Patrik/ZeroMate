@@ -9,7 +9,6 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <poll.h>
-#include <unordered_map>
 
 #include "fmt/format.h"
 #include "imgui.h"

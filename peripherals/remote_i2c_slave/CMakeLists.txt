@@ -31,6 +31,7 @@ target_sources(remote_i2c_slave
 # Link imgui_glfw and logging_system
 target_link_libraries(remote_i2c_slave
     PRIVATE
+        fmt
         imgui_glfw
         logging_system
 )
