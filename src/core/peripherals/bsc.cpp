@@ -199,17 +199,29 @@ namespace zero_mate::peripheral
 
             // Receive the ACK_1 bit.
             case NState_Machine::ACK_1:
-                I2C_Receive_ACK_1();
                 break;
 
             // Send the data payload.
             case NState_Machine::Data:
-                I2C_Send_Data();
+                if (m_transaction.read)
+                {
+                    // Release SDA to allow the slave device to set it.
+                    Set_GPIO_pin(SDA_Pin_Idx, true);
+                }
+                else
+                {
+                    I2C_Send_Data();
+                }
                 break;
 
             // Receive the ACK_2 bit.
             case NState_Machine::ACK_2:
-                I2C_Receive_ACK_2();
+                if (m_transaction.read)
+                {
+                    // Master sends ACK/NACK (SDA=0 for ACK, SDA=1 for NACK)
+                    // For now, let's just always send ACK (SDA=0)
+                    Set_GPIO_pin(SDA_Pin_Idx, false);
+                }
                 break;
 
             // Send the stop bit.
@@ -357,6 +369,54 @@ namespace zero_mate::peripheral
 
             case NSCL_State::SCL_High:
                 Set_GPIO_pin(SCL_Pin_Idx, true);
+                
+                if (m_transaction.state == NState_Machine::ACK_1)
+                {
+                    I2C_Receive_ACK_1();
+                }
+                else if (m_transaction.state == NState_Machine::ACK_2)
+                {
+                    if (!m_transaction.read)
+                    {
+                        I2C_Receive_ACK_2();
+                    }
+                    else
+                    {
+                        // Master sent ACK, finish the byte.
+                        --m_transaction.length;
+                        if (m_transaction.length != 0)
+                        {
+                            m_transaction.state = NState_Machine::Data;
+                            m_transaction.data_idx = Data_Length;
+                        }
+                        else
+                        {
+                            m_transaction.state = NState_Machine::Stop_Bit;
+                        }
+                    }
+                }
+                else if (m_transaction.state == NState_Machine::Data && m_transaction.read)
+                {
+                    // Receive another bit of data.
+                    --m_transaction.data_idx;
+                    const auto curr_bit = (m_gpio->Read_GPIO_Pin(SDA_Pin_Idx) == CGPIO_Manager::CPin::NState::High);
+                    
+                    // We're building the byte here, let's keep it in the current FIFO front? 
+                    // No, wait, let's build it locally.
+                    static uint8_t received_byte = 0;
+                    if (curr_bit)
+                    {
+                        received_byte |= (1 << m_transaction.data_idx);
+                    }
+                    
+                    if (m_transaction.data_idx == 0)
+                    {
+                        m_fifo.push(received_byte);
+                        received_byte = 0;
+                        m_transaction.state = NState_Machine::ACK_2;
+                    }
+                }
+
                 m_SCL_state = NSCL_State::SCL_Low;
                 break;
 

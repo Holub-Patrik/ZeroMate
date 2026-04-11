@@ -83,6 +83,9 @@ namespace zero_mate::soc
     // BSC 3
     std::shared_ptr<peripheral::CBSC> g_bsc_3 = std::make_shared<peripheral::CBSC>(g_gpio);
 
+    // BSC Slave
+    std::shared_ptr<peripheral::CBSC_Slave> g_bsc_slave = std::make_shared<peripheral::CBSC_Slave>(g_gpio);
+
     // Halt and Start CPU functions
     Halt_CPU_t g_halt_cpu{ nullptr };
     Start_CPU_t g_start_cpu{ nullptr };
@@ -237,6 +240,7 @@ namespace zero_mate::soc
             Attach_Peripheral_To_Bus<peripheral::CBSC>("BSC_1", config::BSC_1_Address, g_bsc_1);
             Attach_Peripheral_To_Bus<peripheral::CBSC>("BSC_2", config::BSC_2_Address, g_bsc_2);
             Attach_Peripheral_To_Bus<peripheral::CBSC>("BSC_3", config::BSC_3_Address, g_bsc_3);
+            Attach_Peripheral_To_Bus<peripheral::CBSC_Slave>("BSC_Slave", config::BSC_Slave_Address, g_bsc_slave);
 
             // Attach the interrupt controller, MMU, external peripherals, and CP15 to the CPU.
             g_cpu->Set_Interrupt_Controller(g_ic);
@@ -252,6 +256,10 @@ namespace zero_mate::soc
             g_cpu->Register_System_Clock_Listener(g_bsc_1);
             g_cpu->Register_System_Clock_Listener(g_bsc_2);
             g_cpu->Register_System_Clock_Listener(g_bsc_3);
+            g_cpu->Register_System_Clock_Listener(g_bsc_slave);
+
+            // Register BSC_Slave as a GPIO listener
+            g_gpio->Add_External_Peripheral(g_bsc_slave.get());
 
             // Add a reference to CP15 to the bus, so it knows whether to check for unaligned memory access.
             g_bus->Set_CP15(g_cp15);

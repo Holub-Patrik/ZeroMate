@@ -77,10 +77,14 @@ namespace zero_mate::peripheral
         std::thread m_rx_thread;
 
         CRemote_I2C_Slave(std::string name,
+                          uint32_t sda_pin,
+                          uint32_t scl_pin,
                           IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
                           IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
                           utils::CLogging_System* logging_system)
         : m_name{ std::move(name) }
+        , m_sda_pin{ (int)sda_pin }
+        , m_scl_pin{ (int)scl_pin }
         , m_read_pin{ read_pin }
         , m_set_pin{ set_pin }
         , m_logging_system{ logging_system }
@@ -224,6 +228,13 @@ namespace zero_mate::peripheral
             }
 
             const auto* packet = static_cast<const I2C_Packet*>(data);
+
+            if (m_logging_system != nullptr)
+            {
+                m_logging_system->Debug(fmt::format("Remote I2C Slave: Received packet: {} (value: 0x{:02X})",
+                                                   static_cast<int>(packet->type), packet->value).c_str());
+            }
+
             switch (packet->type)
             {
                 case I2C_Packet_Type::I2C_START:
@@ -234,9 +245,11 @@ namespace zero_mate::peripheral
                     break;
                 case I2C_Packet_Type::I2C_ADDRESS: {
                     start_local();
+                    // packet->value contains 8 bits (7-bit address + 1-bit RW)
+                    // bit_bang_byte_local will send 8 bits, which corresponds to 
+                    // CBSC_Slave's Address (7 bits) and RW (1 bit) states.
                     bit_bang_byte_local(packet->value);
-                    bool ack = (packet->value >> 1U) == (uint32_t)m_address;
-                    Send_Packet(I2C_Packet_Type::I2C_ACK, ack ? 1 : 0);
+                    Send_Packet(I2C_Packet_Type::I2C_ACK, read_ack_local() ? 1 : 0);
                     break;
                 }
                 case I2C_Packet_Type::I2C_WRITE_BYTE:
@@ -381,7 +394,7 @@ namespace zero_mate::peripheral
             m_set_pin(m_sda_pin, true);
             m_set_pin(m_scl_pin, true);
 
-            bool ack = m_read_pin(m_sda_pin);
+            bool ack = !m_read_pin(m_sda_pin);
 
             m_set_pin(m_scl_pin, false);
             return ack;
@@ -397,6 +410,12 @@ namespace zero_mate::peripheral
 
         void Send_Packet(I2C_Packet_Type type, uint8_t value) const
         {
+            if (m_logging_system != nullptr)
+            {
+                m_logging_system->Debug(fmt::format("Remote I2C Slave: Sending packet: {} (value: 0x{:02X})",
+                                                   static_cast<int>(type), value).c_str());
+            }
+
             I2C_Packet packet{ .type = type, .value = value };
             if (m_server_fd != -1)
             {
@@ -411,16 +430,21 @@ extern "C"
     zero_mate::IExternal_Peripheral::NInit_Status
     Create_Peripheral(zero_mate::IExternal_Peripheral** peripheral,
                       const char* const name,
-                      const uint32_t* const,
-                      size_t,
+                      const uint32_t* const connection,
+                      size_t pin_count,
                       zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
                       zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
                       zero_mate::IExternal_Peripheral::Halt_t,
                       zero_mate::IExternal_Peripheral::Start_t,
                       zero_mate::utils::CLogging_System* logging_system)
     {
+        if (pin_count != 2)
+        {
+            return zero_mate::IExternal_Peripheral::NInit_Status::GPIO_Mismatch;
+        }
+
         *peripheral =
-        new (std::nothrow) zero_mate::peripheral::CRemote_I2C_Slave(name, read_pin, set_pin, logging_system);
+        new (std::nothrow) zero_mate::peripheral::CRemote_I2C_Slave(name, connection[0], connection[1], read_pin, set_pin, logging_system);
         return (*peripheral == nullptr) ? zero_mate::IExternal_Peripheral::NInit_Status::Allocation_Error
                                         : zero_mate::IExternal_Peripheral::NInit_Status::OK;
     }

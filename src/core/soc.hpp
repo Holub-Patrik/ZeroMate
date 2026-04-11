@@ -35,6 +35,7 @@
 #include "peripherals/trng.hpp"
 #include "peripherals/gpio.hpp"
 #include "peripherals/bsc.hpp"
+#include "peripherals/bsc_slave.hpp"
 #include "peripherals/auxiliary/auxiliary.hpp"
 
 namespace zero_mate::soc
@@ -94,7 +95,7 @@ namespace zero_mate::soc
         inline constexpr std::uint32_t BSC_3_Address = 0x20805000;
 
         /// Default address of the broadcom serial controller for I2C/SPI Slave mode
-        inline constexpr std::uint32_t BSC_Slave_Address = 0x7E214000;
+        inline constexpr std::uint32_t BSC_Slave_Address = 0x20214000;
 
     } // namespace zero_mate::config
 
@@ -151,6 +152,9 @@ namespace zero_mate::soc
 
     /// Broadcom serial controller 3 (BSC 3)
     extern std::shared_ptr<peripheral::CBSC> g_bsc_3;
+
+    /// Broadcom serial controller for I2C/SPI Slave mode
+    extern std::shared_ptr<peripheral::CBSC_Slave> g_bsc_slave;
 
     /// Type of a function that halts the CPU
     using Halt_CPU_t = std::function<void()>;

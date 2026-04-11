@@ -1,22 +1,22 @@
 {
-	"peripherals": [
-		{
-			"name": "Server",
-			"connection": [],
-			"lib_dir": "peripherals",
-			"lib_name": "gpio_server"
-		},
-		{
-			"name": "Remote I2C",
-			"connection": [2, 3],
-			"lib_dir": "peripherals",
-			"lib_name": "remote_i2c_master"
-		},
-		{
-			"name": "LED",
-			"connection": [47],
-			"lib_dir": "peripherals",
-			"lib_name": "led"
-		}
-	]
+  "peripherals": [
+    {
+      "name": "Server",
+      "connection": [9000],
+      "lib_dir": "peripherals",
+      "lib_name": "gpio_server"
+    },
+    {
+      "name": "Remote I2C",
+      "connection": [2, 3],
+      "lib_dir": "peripherals",
+      "lib_name": "remote_i2c_master"
+    },
+    {
+      "name": "LED",
+      "connection": [47],
+      "lib_dir": "peripherals",
+      "lib_name": "led"
+    }
+  ]
 }

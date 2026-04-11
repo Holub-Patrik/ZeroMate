@@ -79,6 +79,7 @@ namespace zero_mate::peripheral
         bool m_sda_lvl{ true };
         bool m_is_read{ false };
         bool m_ack_from_slave{ false };
+        std::atomic<bool> m_halted{ false };
 
         I2C_State m_state{ I2C_State::IDLE };
         std::uint8_t m_bit_count{ 0 };
@@ -100,12 +101,16 @@ namespace zero_mate::peripheral
         std::thread m_rx_thread;
 
         CRemote_I2C_Master(const std::string& name,
+                           uint32_t sda_pin,
+                           uint32_t scl_pin,
                            IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
                            IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
                            IExternal_Peripheral::Halt_t halt,
                            IExternal_Peripheral::Start_t start,
                            utils::CLogging_System* logging_system)
         : m_name{ name }
+        , m_sda_pin{ (int)sda_pin }
+        , m_scl_pin{ (int)scl_pin }
         , m_read_pin{ read_pin }
         , m_set_pin{ set_pin }
         , m_halt{ halt }
@@ -116,6 +121,9 @@ namespace zero_mate::peripheral
         , m_reader_backoff(10, 100)
         , m_writer_backoff(10, 100)
         {
+            m_gpio_subscription.insert(sda_pin);
+            m_gpio_subscription.insert(scl_pin);
+
             if (pipe(m_stop_pipe) == -1)
             {
                 if (m_logging_system)
@@ -215,15 +223,146 @@ namespace zero_mate::peripheral
                 return;
             }
 
-            const bool curr_pin_state = m_read_pin(pin_idx);
+            const bool current_sda = m_read_pin(m_sda_pin);
+            const bool current_scl = m_read_pin(m_scl_pin);
 
-            if (pin_idx == (uint32_t)m_scl_pin)
+            if (pin_idx == (uint32_t)m_sda_pin)
             {
-                Handle_SCL(curr_pin_state);
+                if (current_scl)
+                {
+                    if (m_sda_lvl && !current_sda)
+                    {
+                        // START
+                        if (m_logging_system != nullptr)
+                        {
+                            m_logging_system->Debug("Remote I2C Master: Detected START");
+                        }
+                        while (m_queue_reader.try_advance())
+                        {
+                            m_queue_reader.advance();
+                            m_writer_backoff.wake();
+                        }
+                        Send_Packet(I2C_Packet_Type::I2C_START, 0);
+                        m_state = I2C_State::ADDRESS;
+                        m_bit_count = 0;
+                        m_shift_reg = 0;
+                    }
+                    else if (!m_sda_lvl && current_sda)
+                    {
+                        // STOP
+                        if (m_logging_system != nullptr)
+                        {
+                            m_logging_system->Debug("Remote I2C Master: Detected STOP");
+                        }
+                        Send_Packet(I2C_Packet_Type::I2C_STOP, 0);
+                        m_state = I2C_State::IDLE;
+                    }
+                }
+                m_sda_lvl = current_sda;
             }
-            else
+            else if (pin_idx == (uint32_t)m_scl_pin)
             {
-                Handle_SDA(curr_pin_state);
+                if (!m_scl_lvl && current_scl)
+                {
+                    Handle_SCL_Rising(current_sda);
+                }
+                else if (m_scl_lvl && !current_scl)
+                {
+                    Handle_SCL_Falling(current_sda);
+                }
+                m_scl_lvl = current_scl;
+            }
+        }
+
+        void Handle_SCL_Rising(bool current_sda)
+        {
+            if (m_state != I2C_State::IDLE)
+            {
+                m_bit_count++;
+                if (m_state == I2C_State::ADDRESS || m_state == I2C_State::WRITE_BYTE)
+                {
+                    m_shift_reg = static_cast<uint8_t>((m_shift_reg << 1U) | (current_sda ? 1U : 0U));
+                }
+            }
+            if (m_state == I2C_State::ADDRESS && m_bit_count == 8)
+            {
+                m_is_read = (m_shift_reg & 0x01U);
+            }
+        }
+
+        void Handle_SCL_Falling(bool /*current_sda*/)
+        {
+            bool wait_for_response = false;
+
+            const bool slave_drives = (m_state == I2C_State::READ_BYTE && m_bit_count < 8) ||
+                                      (m_state == I2C_State::RESPONSE && m_ack_from_slave && m_bit_count == 0);
+            if (slave_drives)
+            {
+                Drive_SDA_From_Queue();
+            }
+            else if (m_state == I2C_State::READ_BYTE)
+            {
+                m_set_pin(m_sda_pin, true);
+            }
+            else if (m_state == I2C_State::RESPONSE)
+            {
+                if (!m_is_read)
+                {
+                    m_set_pin(m_sda_pin, true);
+                }
+            }
+
+            if (m_state == I2C_State::ADDRESS && m_bit_count == 8)
+            {
+                if (m_logging_system != nullptr)
+                {
+                    m_logging_system->Debug(fmt::format("Remote I2C Master: Sent Address: 0x{:02X} ({})",
+                                                        m_shift_reg >> 1,
+                                                        m_is_read ? "R" : "W")
+                                            .c_str());
+                }
+                Send_Packet(I2C_Packet_Type::I2C_ADDRESS, m_shift_reg);
+                m_state = I2C_State::RESPONSE;
+                m_bit_count = 0;
+                wait_for_response = true;
+            }
+            else if (m_state == I2C_State::WRITE_BYTE && m_bit_count == 8)
+            {
+                if (m_logging_system != nullptr)
+                {
+                    m_logging_system->Debug(fmt::format("Remote I2C Master: Sent Byte: 0x{:02X}", m_shift_reg).c_str());
+                }
+                Send_Packet(I2C_Packet_Type::I2C_WRITE_BYTE, m_shift_reg);
+                m_state = I2C_State::RESPONSE;
+                m_bit_count = 0;
+                wait_for_response = true;
+            }
+            else if (m_state == I2C_State::READ_BYTE && m_bit_count == 8)
+            {
+                m_state = I2C_State::RESPONSE;
+                m_bit_count = 0;
+                m_ack_from_slave = false;
+            }
+            else if (m_state == I2C_State::RESPONSE)
+            {
+                if (m_is_read && m_bit_count == 0)
+                {
+                    Send_Packet(I2C_Packet_Type::I2C_ACK, m_sda_lvl ? 0 : 1);
+                }
+                m_state = m_is_read ? I2C_State::READ_BYTE : I2C_State::WRITE_BYTE;
+                m_bit_count = 0;
+                m_shift_reg = 0;
+                if (m_is_read)
+                {
+                    Send_Packet(I2C_Packet_Type::I2C_READ_BYTE, 0);
+                    wait_for_response = true;
+                }
+            }
+
+            if (wait_for_response)
+            {
+                m_halted = true;
+                m_halt();
             }
         }
 
@@ -238,6 +377,17 @@ namespace zero_mate::peripheral
                 ImGui::InputInt("Bus ID", &m_bus_id);
                 ImGui::InputInt("SDA Pin", &m_sda_pin);
                 ImGui::InputInt("SCL Pin", &m_scl_pin);
+
+                if (m_halted)
+                {
+                    ImGui::SameLine();
+                    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+                    ImVec2 pos = ImGui::GetCursorScreenPos();
+                    pos.x -= 20;
+                    pos.y += ImGui::GetTextLineHeight() * 0.5f;
+                    draw_list->AddCircleFilled(pos, 5.0f, IM_COL32(255, 0, 0, 255));
+                }
+
                 ImGui::Separator();
                 ImGui::Text("Registered Slaves: %zu", m_slave_addrs.size());
                 if (ImGui::Button("Disconnect All"))
@@ -377,6 +527,15 @@ namespace zero_mate::peripheral
                 if (received == (ssize_t)sizeof(I2C_Packet))
                 {
                     const auto* packet = reinterpret_cast<const I2C_Packet*>(buffer);
+
+                    if (m_logging_system != nullptr)
+                    {
+                        m_logging_system->Debug(fmt::format("Remote I2C Master: Received packet: {} (value: 0x{:02X})",
+                                                            static_cast<int>(packet->type),
+                                                            packet->value)
+                                                .c_str());
+                    }
+
                     if (packet->type == I2C_Packet_Type::I2C_ACK)
                     {
                         m_ack_from_slave = (packet->value != 0);
@@ -405,6 +564,7 @@ namespace zero_mate::peripheral
                             Drive_SDA_From_Queue();
                         }
                     }
+                    m_halted = false;
                     m_start();
                 }
                 else if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
@@ -416,106 +576,6 @@ namespace zero_mate::peripheral
                     break;
                 }
             }
-        }
-
-        void Handle_SCL(bool is_high)
-        {
-            bool wait_for_response = false;
-            if (!m_scl_lvl && is_high) // Rising
-            {
-                if (m_state != I2C_State::IDLE)
-                {
-                    m_bit_count++;
-                    if (m_state == I2C_State::ADDRESS || m_state == I2C_State::WRITE_BYTE)
-                    {
-                        m_shift_reg = static_cast<uint8_t>((m_shift_reg << 1U) | (m_sda_lvl ? 1U : 0U));
-                    }
-                }
-                if (m_state == I2C_State::ADDRESS && m_bit_count == 8)
-                {
-                    m_is_read = (m_shift_reg & 0x01U);
-                }
-            }
-            else if (m_scl_lvl && !is_high) // Falling
-            {
-                const bool slave_drives = (m_state == I2C_State::READ_BYTE && m_bit_count < 8) ||
-                                          (m_state == I2C_State::RESPONSE && m_ack_from_slave && m_bit_count == 0);
-                if (slave_drives)
-                {
-                    Drive_SDA_From_Queue();
-                }
-                else
-                {
-                    m_set_pin(m_sda_pin, true);
-                    m_sda_lvl = true;
-                }
-
-                if (m_state == I2C_State::ADDRESS && m_bit_count == 8)
-                {
-                    Send_Packet(I2C_Packet_Type::I2C_ADDRESS, m_shift_reg);
-                    m_state = I2C_State::RESPONSE;
-                    m_bit_count = 0;
-                    wait_for_response = true;
-                }
-                else if (m_state == I2C_State::WRITE_BYTE && m_bit_count == 8)
-                {
-                    Send_Packet(I2C_Packet_Type::I2C_WRITE_BYTE, m_shift_reg);
-                    m_state = I2C_State::RESPONSE;
-                    m_bit_count = 0;
-                    wait_for_response = true;
-                }
-                else if (m_state == I2C_State::READ_BYTE && m_bit_count == 8)
-                {
-                    m_state = I2C_State::RESPONSE;
-                    m_bit_count = 0;
-                    m_ack_from_slave = false;
-                }
-                else if (m_state == I2C_State::RESPONSE)
-                {
-                    if (m_is_read && m_bit_count == 0)
-                    {
-                        Send_Packet(I2C_Packet_Type::I2C_ACK, m_sda_lvl ? 0 : 1);
-                    }
-                    m_state = m_is_read ? I2C_State::READ_BYTE : I2C_State::WRITE_BYTE;
-                    m_bit_count = 0;
-                    m_shift_reg = 0;
-                    if (m_is_read)
-                    {
-                        Send_Packet(I2C_Packet_Type::I2C_READ_BYTE, 0);
-                        wait_for_response = true;
-                    }
-                }
-            }
-            m_scl_lvl = is_high;
-            if (wait_for_response)
-            {
-                m_halt();
-            }
-        }
-
-        void Handle_SDA(bool is_high)
-        {
-            if (m_scl_lvl)
-            {
-                if (m_sda_lvl && !is_high)
-                { // START
-                    while (m_queue_reader.try_advance())
-                    {
-                        m_queue_reader.advance();
-                        m_writer_backoff.wake();
-                    }
-                    Send_Packet(I2C_Packet_Type::I2C_START, 0);
-                    m_state = I2C_State::ADDRESS;
-                    m_bit_count = 0;
-                    m_shift_reg = 0;
-                }
-                else if (!m_sda_lvl && is_high)
-                { // STOP
-                    Send_Packet(I2C_Packet_Type::I2C_STOP, 0);
-                    m_state = I2C_State::IDLE;
-                }
-            }
-            m_sda_lvl = is_high;
         }
 
         void Drive_SDA_From_Queue()
@@ -537,6 +597,13 @@ namespace zero_mate::peripheral
 
         void Send_Packet(I2C_Packet_Type type, uint8_t value)
         {
+            if (m_logging_system != nullptr)
+            {
+                m_logging_system->Debug(
+                fmt::format("Remote I2C Master: Sending packet: {} (value: 0x{:02X})", static_cast<int>(type), value)
+                .c_str());
+            }
+
             I2C_Packet packet{ .type = type, .value = value };
             std::lock_guard<std::mutex> lock(m_slaves_mutex);
             for (const auto& addr : m_slave_addrs)
@@ -552,16 +619,27 @@ extern "C"
     zero_mate::IExternal_Peripheral::NInit_Status
     Create_Peripheral(zero_mate::IExternal_Peripheral** peripheral,
                       const char* const name,
-                      const uint32_t* const,
-                      size_t,
+                      const uint32_t* const connection,
+                      size_t pin_count,
                       zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
                       zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
                       zero_mate::IExternal_Peripheral::Halt_t halt,
                       zero_mate::IExternal_Peripheral::Start_t start,
                       zero_mate::utils::CLogging_System* logging_system)
     {
-        *peripheral = new (std::nothrow)
-        zero_mate::peripheral::CRemote_I2C_Master(name, read_pin, set_pin, halt, start, logging_system);
+        if (pin_count != 2)
+        {
+            return zero_mate::IExternal_Peripheral::NInit_Status::GPIO_Mismatch;
+        }
+
+        *peripheral = new (std::nothrow) zero_mate::peripheral::CRemote_I2C_Master(name,
+                                                                                   connection[0],
+                                                                                   connection[1],
+                                                                                   read_pin,
+                                                                                   set_pin,
+                                                                                   halt,
+                                                                                   start,
+                                                                                   logging_system);
         return (*peripheral == nullptr) ? zero_mate::IExternal_Peripheral::NInit_Status::Allocation_Error
                                         : zero_mate::IExternal_Peripheral::NInit_Status::OK;
     }
