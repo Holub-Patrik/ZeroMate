@@ -1,12 +1,12 @@
 // ---------------------------------------------------------------------------------------------------------------------
-/// \file bsc.hpp
-/// \date 20. 08. 2023
-/// \author Jakub Silhavy (jakub.silhavy.cz@gmail.com)
+/// \file bsc_slave.hpp
+/// \date 10. 04. 2026
+/// \author Patrik Holub (23bulohp@gmail.com)
 ///
 /// \brief This file defines the BSC peripheral used in BCM2835.
 ///
 /// To find more information about this peripheral, please visit
-/// https://www.raspberrypi.org/app/uploads/2012/02/BCM2835-ARM-Peripherals.pdf (chapter 3)
+/// https://www.raspberrypi.org/app/uploads/2012/02/BCM2835-ARM-Peripherals.pdf (chapter 11)
 // ---------------------------------------------------------------------------------------------------------------------
 
 #pragma once
@@ -54,36 +54,107 @@ namespace zero_mate::peripheral
         // -------------------------------------------------------------------------------------------------------------
         enum class NRegister : std::uint32_t
         {
-            Control = 0,           ///< Control register
-            Status,                ///< Status register
-            Data_Length,           ///< Data length (number of bytes to be sent/received)
-            Slave_Address,         ///< Address of the target device (slave)
-            Data_FIFO,             ///< Interaction with the data FIFO (read/write)
-            Clock_Div,             ///< Clock div (not used)
-            Data_Delay,            ///< Clock delay (not used)
-            Clock_Stretch_Timeout, ///< Clock stretch timeout (not used)
-            Count                  ///< Help record (total number of registers)
+            Data,
+            Status_And_Error_Clear, /// Operation status register and error clear register
+            Slave_Address,          /// Holds the I2C Slave register
+            Control,                /// Control register used to configure I2C/SPI Slave
+            Flag,
+            Interrupt_FIFO_Level_Select,
+            Interrupt_Mask_Set_Clear,
+            Raw_Interrupt_Status,
+            Masked_Interrupt_Status,
+            Interrupt_Clear,
+            DMA_Control_Register, /// Unsupported
+            Test_Data_Register,
+            GPUSTAT, // GPU Status
+            Host_Control,
+            Debug_1, // I2C Debug Register
+            Debug_2, // SPI Debug Register
+            Count
+        };
+
+        // -------------------------------------------------------------------------------------------------------------
+        /// \enum NData_Sections
+        /// \brief Enumation of the Data Register bit position of different sections within Data Register
+        // -------------------------------------------------------------------------------------------------------------
+        enum class NData_Sections : std::uint8_t
+        {
+            Data_Start = 0,
+            Data_End = 7,
+            RX_Overrun = 8,
+            TX_Underrun = 9,
+            // 10 - 15 is reserved
+            TX_Busy = 16,
+            RX_FIFO_Empty = 17,
+            TX_FIFO_Full = 18,
+            RX_FIFO_Full = 19,
+            TX_FIFO_Empty = 20,
+            RX_Busy = 21,
+            TX_FIFO_Level_Start = 22,
+            TX_FIFO_Level_End = 26,
+            RX_FIFO_Level_Start = 27,
+            RX_FIFO_Level_End = 31,
+        };
+
+        // -------------------------------------------------------------------------------------------------------------
+        /// \enum NError_Bit_position
+        /// \brief Enumeration of different bit position for flags of the error register.
+        // -------------------------------------------------------------------------------------------------------------
+        enum class NError_Bit_Positions : std::uint8_t
+        {
+            RX_Overrun_Error = 0, ///< Reset 0
+            TX_Underrun_Error = 1 ///< Reset 0
+                                  // rest of bit are unsupported or reserved
         };
 
         // -------------------------------------------------------------------------------------------------------------
         /// \enum NControl_Flags
-        /// \brief Enumeration of different flags of the control register.
+        /// \brief Enumeration of control flags in the control register
         // -------------------------------------------------------------------------------------------------------------
         enum class NControl_Flags : std::uint32_t
         {
-            I2C_Enable = 0b1U << 15U,    ///< Enable the I2C peripheral
-            Start_Transfer = 0b1U << 7U, ///< Begin data transfer
-            FIFO_Clear = 4U,             ///< Clear the data FIFO
-            Read_Transfer = 0b1U << 0U   ///< Begin read transfer
+            Enable_Device = 0b1U << 0U,
+            Enable_SPI = 0b1U << 1U,
+            Enable_I2C = 0b1U << 2U,
+            Clock_Phase = 0b1U << 3U,
+            Clock_Polarity = 0b1U << 4U,
+            // 0 = implies ordinary I2C mode
+            // 1 = status register will be transfered as 1st data character to the bus
+            Enable_Status_8bit_Register = 0b1U << 5U,
+            // 0 = implies ordinary I2C mode
+            // 1 = control register will be received as 1st data character from the bus
+            Enable_Control_8bit_Register = 0b1U << 6U,
+            Break = 0b1U << 7U,     // Stop operation and clear all FIFOs
+            TX_Enable = 0b1U << 8U, // Transmit mode enable
+            RX_Enable = 0b1U << 9U, // Receive mode enable
+            // 0 = Default status flag bit 6 will be reset to 0 -> RX FIFO Full
+            // 1 = Inverse status flag bit 6 will be reset to 1 -> RX FIFO Empty
+            Inverse_RX_Status_Flag = 0b1U << 10U,
+            Test_FIFO = 0b1U << 11U,
+            // Allows host to request GPUSTAT or HCTRL register
+            // The same can be achieved using ENSTAT and ENCTRL
+            Enable_Control_For_Host = 0b1U << 12U,
+            // 0 = Default status flag bit 6 will be reset to 1 -> TX FIFO Empty
+            // 1 = Inverse status flag bit 6 will be reset to 0 -> TX FIFO Full
+            Inverse_TX_Status_Flag = 0b1U << 13U,
         };
 
         // -------------------------------------------------------------------------------------------------------------
-        /// \enum NStatus_Flags
-        /// \brief Enumeration of different flags of the status register.
+        /// \enum NFlag_Bit_Positions
+        /// \brief Enumeration of bit position of different flags
         // -------------------------------------------------------------------------------------------------------------
-        enum class NStatus_Flags : std::uint32_t
+        enum class NFlag_Bit_Positions : std::uint8_t
         {
-            Transfer_Done = 0b1U << 1U ///< Transfer is done
+            TX_Busy = 0,
+            RX_FIFO_Empty = 1, // Reset to 1
+            TX_FIFO_Full = 2,
+            RX_FIFO_Full = 3,
+            TX_FIFO_Empty = 4, // Reset to 1
+            RX_Busy = 5,
+            TX_FIFO_Level_Start = 6,
+            TX_FIFO_Level_End = 10,
+            RX_FIFO_Level_Start = 11,
+            RX_FIFO_Level_End = 15
         };
 
         /// Total number of the peripheral's registers

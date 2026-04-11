@@ -93,6 +93,9 @@ namespace zero_mate::soc
         /// Default address of the broadcom serial controller 3 (BSC 3)
         inline constexpr std::uint32_t BSC_3_Address = 0x20805000;
 
+        /// Default address of the broadcom serial controller for I2C/SPI Slave mode
+        inline constexpr std::uint32_t BSC_Slave_Address = 0x7E214000;
+
     } // namespace zero_mate::config
 
     /// Global reference to a logging system used throughout the project
