@@ -16,8 +16,12 @@
 #include <utility>
 /// \endcond
 
-// Project file imports
+#include <cstdio>
 
+// 3rd party library includes
+#include "fmt/format.h"
+
+// Project file imports
 #include "bsc_slave.hpp"
 #include "zero_mate/utils/singleton.hpp"
 
@@ -73,6 +77,16 @@ namespace zero_mate::peripheral
         const std::size_t reg_idx = addr / Reg_Size;
         const auto reg_type = static_cast<NRegister>(reg_idx);
 
+        if (size == sizeof(std::uint32_t))
+        {
+            const std::uint32_t value = *reinterpret_cast<const std::uint32_t*>(data);
+            m_logging_system.Debug(fmt::format("CBSC Slave: Write to register 0x{:02X}, value: 0x{:08X}", addr, value).c_str());
+        }
+        else
+        {
+            m_logging_system.Debug(fmt::format("CBSC Slave: Write to register 0x{:02X}, size: {}", addr, size).c_str());
+        }
+
         // Write data to the peripheral's registers.
         std::copy_n(data, size, &std::bit_cast<char*>(m_regs.data())[addr]);
 
@@ -82,8 +96,9 @@ namespace zero_mate::peripheral
                 // Writing to Data register adds a byte to the TX FIFO.
                 if (m_tx_fifo.size() < FIFO_Depth)
                 {
-                    m_tx_fifo.push(
-                    static_cast<std::uint8_t>(m_regs[static_cast<std::uint32_t>(NRegister::Data)] & DATA_Mask));
+                    const std::uint8_t val = static_cast<std::uint8_t>(m_regs[static_cast<std::uint32_t>(NRegister::Data)] & DATA_Mask);
+                    m_logging_system.Debug(fmt::format("CBSC Slave: Guest wrote to TX FIFO: 0x{:02X}", val).c_str());
+                    m_tx_fifo.push(val);
                 }
                 Update_Status_Flags();
                 break;
@@ -130,6 +145,7 @@ namespace zero_mate::peripheral
                 if (!m_rx_fifo.empty())
                 {
                     m_regs[static_cast<std::uint32_t>(NRegister::Data)] = m_rx_fifo.front();
+                    m_logging_system.Debug(fmt::format("CBSC Slave: Read from RX FIFO, value: 0x{:02X}", m_regs[static_cast<std::uint32_t>(NRegister::Data)]).c_str());
                     m_rx_fifo.pop();
                 }
                 else
@@ -156,6 +172,9 @@ namespace zero_mate::peripheral
     {
         const bool curr_pin_state = (m_gpio->Read_GPIO_Pin(pin_idx) == CGPIO_Manager::CPin::NState::High);
 
+        m_logging_system.Debug(fmt::format("CBSC Slave: GPIO Subscription Callback for pin {}, state: {}", 
+                                           pin_idx, curr_pin_state ? 1 : 0).c_str());
+
         if (pin_idx == SDA_Pin_Idx)
         {
             SDA_Pin_Change_Callback(curr_pin_state);
@@ -178,34 +197,38 @@ namespace zero_mate::peripheral
 
         if (!m_scl_prev_state && curr_pin_state) // Rising edge
         {
+            m_logging_system.Debug("CBSC Slave: SCL Rising Edge detected");
             m_scl_rising_edge = true;
             m_scl_rising_edge_timestamp = m_clock;
             I2C_Update();
         }
         else if (m_scl_prev_state && !curr_pin_state) // Falling edge
         {
+            m_logging_system.Debug("CBSC Slave: SCL Falling Edge detected");
             if (m_transaction.state == NState_Machine::Data && m_transaction.read)
             {
                 I2C_Send_Data();
             }
-            else if (m_transaction.state == NState_Machine::ACK_1 && m_transaction.read)
+            else if (m_transaction.state == NState_Machine::ACK_1)
             {
-                // Prepare the first bit of the first byte for read transactions
-                I2C_Send_Data();
+                Send_ACK();
             }
-            else if (m_transaction.state == NState_Machine::ACK_2 && m_transaction.read)
+            else if (m_transaction.state == NState_Machine::ACK_2)
             {
-                if (m_gpio->Read_GPIO_Pin(SDA_Pin_Idx) == CGPIO_Manager::CPin::NState::Low)
+                if (!m_transaction.read)
                 {
-                    // Master sent ACK, prepare first bit of next byte
-                    I2C_Send_Data();
+                    Send_ACK();
                 }
             }
             else if (m_transaction.state == NState_Machine::Data || m_transaction.state == NState_Machine::Address ||
-                     m_transaction.state == NState_Machine::RW)
+                     m_transaction.state == NState_Machine::RW || m_transaction.state == NState_Machine::Start_Bit)
             {
                 // Release SDA for ACK/NACK or master bits
-                static_cast<void>(m_gpio->Set_Pin_State(SDA_Pin_Idx, CGPIO_Manager::CPin::NState::High));
+                // Friendly release: only if not already Low
+                if (m_gpio->Read_GPIO_Pin(SDA_Pin_Idx) == CGPIO_Manager::CPin::NState::Low)
+                {
+                    static_cast<void>(m_gpio->Set_Pin_State(SDA_Pin_Idx, CGPIO_Manager::CPin::NState::High));
+                }
             }
         }
 
@@ -218,12 +241,14 @@ namespace zero_mate::peripheral
 
         if (!m_sda_prev_state && curr_pin_state)
         {
+            m_logging_system.Debug("CBSC Slave: SDA Rising Edge detected");
             m_sda_rising_edge = true;
             m_sda_rising_edge_timestamp = m_clock;
-            
+
             // Stop bit detection
             if (m_scl_prev_state)
             {
+                m_logging_system.Debug("CBSC Slave: Stop Bit Detected");
                 m_transaction.state = NState_Machine::Start_Bit;
                 Update_Status_Flags();
             }
@@ -232,6 +257,7 @@ namespace zero_mate::peripheral
         // Start bit detection
         if (m_sda_prev_state && !curr_pin_state && m_scl_prev_state)
         {
+            m_logging_system.Debug("CBSC Slave: Start Bit Detected");
             Init_Transaction();
             m_transaction.state = NState_Machine::Address;
         }
@@ -241,6 +267,7 @@ namespace zero_mate::peripheral
 
     void CBSC_Slave::Init_Transaction()
     {
+        m_logging_system.Debug("CBSC Slave: Init Transaction");
         m_transaction.address = 0;
         m_transaction.data = 0;
         m_transaction.addr_idx = Slave_Addr_Length;
@@ -250,80 +277,75 @@ namespace zero_mate::peripheral
 
     void CBSC_Slave::I2C_Update()
     {
+        m_logging_system.Debug(fmt::format("CBSC Slave: I2C Update, State: {}", static_cast<int>(m_transaction.state)).c_str());
         switch (m_transaction.state)
         {
             case NState_Machine::Address:
                 I2C_Receive_Address();
                 break;
-
             case NState_Machine::RW:
                 I2C_Receive_RW_Bit();
                 break;
-
-            case NState_Machine::ACK_1:
-                if (m_gpio->Read_GPIO_Pin(SDA_Pin_Idx) == CGPIO_Manager::CPin::NState::Low)
-                {
-                    m_transaction.state = NState_Machine::Data;
-                    if (m_transaction.read)
-                    {
-                        if (!m_tx_fifo.empty())
-                        {
-                            m_transaction.data = m_tx_fifo.front();
-                            m_tx_fifo.pop();
-                        }
-                        else
-                        {
-                            m_transaction.data = 0xFF;
-                        }
-                    }
-                }
-                else
-                {
-                    m_transaction.state = NState_Machine::Start_Bit;
-                }
-                break;
-
             case NState_Machine::Data:
-                if (m_transaction.read)
-                {
-                    if (m_transaction.data_idx == 0)
-                    {
-                        m_transaction.state = NState_Machine::ACK_2;
-                    }
-                }
-                else
+                if (!m_transaction.read)
                 {
                     I2C_Receive_Data();
                 }
-                break;
-
-            case NState_Machine::ACK_2:
-                if (m_transaction.read)
+                else
                 {
-                    if (m_gpio->Read_GPIO_Pin(SDA_Pin_Idx) == CGPIO_Manager::CPin::NState::Low)
+                    // Wait for ACK
+                    if (m_transaction.data_idx == 0)
                     {
-                        if (!m_tx_fifo.empty())
+                        if (m_gpio->Read_GPIO_Pin(SDA_Pin_Idx) == CGPIO_Manager::CPin::NState::Low)
                         {
-                            m_transaction.data = m_tx_fifo.front();
-                            m_tx_fifo.pop();
+                            m_transaction.data_idx = Data_Length;
+                            // Next byte to send
+                            if (!m_tx_fifo.empty())
+                            {
+                                m_transaction.data = m_tx_fifo.front();
+                                m_logging_system.Debug(fmt::format("CBSC Slave: Sending next byte from TX FIFO: 0x{:02X}", m_transaction.data).c_str());
+                                m_tx_fifo.pop();
+                            }
+                            else
+                            {
+                                m_transaction.data = 0; // Underrun
+                            }
                         }
                         else
                         {
-                            m_transaction.data = 0xFF;
+                            // NACK
+                            m_transaction.state = NState_Machine::Start_Bit;
                         }
-                        m_transaction.data_idx = Data_Length;
-                        m_transaction.state = NState_Machine::Data;
                     }
-                    else
-                    {
-                        m_transaction.state = NState_Machine::Start_Bit;
-                    }
+                }
+                break;
+            case NState_Machine::ACK_1:
+                if (!m_transaction.read)
+                {
+                    m_transaction.state = NState_Machine::Data;
+                    m_transaction.data_idx = Data_Length;
                 }
                 else
                 {
-                    m_transaction.data = 0;
-                    m_transaction.data_idx = Data_Length;
                     m_transaction.state = NState_Machine::Data;
+                    m_transaction.data_idx = Data_Length;
+                    if (!m_tx_fifo.empty())
+                    {
+                        m_transaction.data = m_tx_fifo.front();
+                        m_logging_system.Debug(fmt::format("CBSC Slave: Sending first byte from TX FIFO: 0x{:02X}", m_transaction.data).c_str());
+                        m_tx_fifo.pop();
+                    }
+                    else
+                    {
+                        m_transaction.data = 0;
+                    }
+                }
+                break;
+            case NState_Machine::ACK_2:
+                if (!m_transaction.read)
+                {
+                    m_transaction.state = NState_Machine::Data;
+                    m_transaction.data_idx = Data_Length;
                 }
                 break;
             default:
@@ -335,10 +357,13 @@ namespace zero_mate::peripheral
     void CBSC_Slave::I2C_Receive_Address()
     {
         --m_transaction.addr_idx;
-        if (m_gpio->Read_GPIO_Pin(SDA_Pin_Idx) == CGPIO_Manager::CPin::NState::High)
+        const bool sda = (m_gpio->Read_GPIO_Pin(SDA_Pin_Idx) == CGPIO_Manager::CPin::NState::High);
+        if (sda)
         {
             m_transaction.address |= (1U << m_transaction.addr_idx);
         }
+        
+        m_logging_system.Debug(fmt::format("CBSC Slave: Received Address bit {}, SDA: {}", m_transaction.addr_idx, sda ? 1 : 0).c_str());
 
         if (m_transaction.addr_idx == 0)
         {
@@ -348,16 +373,22 @@ namespace zero_mate::peripheral
 
     void CBSC_Slave::I2C_Receive_RW_Bit()
     {
-        m_transaction.read = (m_gpio->Read_GPIO_Pin(SDA_Pin_Idx) == CGPIO_Manager::CPin::NState::High);
+        const bool sda = (m_gpio->Read_GPIO_Pin(SDA_Pin_Idx) == CGPIO_Manager::CPin::NState::High);
+        m_transaction.read = sda;
+        
+        m_logging_system.Debug(fmt::format("CBSC Slave: Received RW bit, SDA: {}", sda ? 1 : 0).c_str());
 
         const std::uint32_t my_addr = m_regs[static_cast<std::uint32_t>(NRegister::Slave_Address)] & 0x7FU;
+        m_logging_system.Debug(fmt::format("CBSC Slave: Comparing received addr 0x{:02X} with my addr 0x{:02X}", m_transaction.address, my_addr).c_str());
+
         if (m_transaction.address == my_addr)
         {
-            Send_ACK();
+            m_logging_system.Debug("CBSC Slave: Address MATCHED");
             m_transaction.state = NState_Machine::ACK_1;
         }
         else
         {
+            m_logging_system.Debug("CBSC Slave: Address MISMATCH");
             m_transaction.state = NState_Machine::Start_Bit;
         }
     }
@@ -365,18 +396,21 @@ namespace zero_mate::peripheral
     void CBSC_Slave::I2C_Receive_Data()
     {
         --m_transaction.data_idx;
-        if (m_gpio->Read_GPIO_Pin(SDA_Pin_Idx) == CGPIO_Manager::CPin::NState::High)
+        const bool sda = (m_gpio->Read_GPIO_Pin(SDA_Pin_Idx) == CGPIO_Manager::CPin::NState::High);
+        if (sda)
         {
             m_transaction.data |= (1U << m_transaction.data_idx);
         }
+        
+        m_logging_system.Debug(fmt::format("CBSC Slave: Received Data bit {}, SDA: {}", m_transaction.data_idx, sda ? 1 : 0).c_str());
 
         if (m_transaction.data_idx == 0)
         {
+            m_logging_system.Debug(fmt::format("CBSC Slave: Pushing received byte to RX FIFO: 0x{:02X}", m_transaction.data).c_str());
             if (m_rx_fifo.size() < FIFO_Depth)
             {
                 m_rx_fifo.push(m_transaction.data);
             }
-            Send_ACK();
             m_transaction.state = NState_Machine::ACK_2;
         }
     }
@@ -421,20 +455,16 @@ namespace zero_mate::peripheral
         // FIFO levels
         flags |= (static_cast<std::uint32_t>(m_tx_fifo.size()) & 0x1FU)
                  << static_cast<std::uint32_t>(NFlag_Bit_Positions::TX_FIFO_Level_Start);
-        flags |= (static_cast<std::uint32_t>(m_rx_fifo.size()) & 0x1FU)
-                 << static_cast<std::uint32_t>(NFlag_Bit_Positions::RX_FIFO_Level_Start);
 
-        if (m_transaction.state != NState_Machine::Start_Bit)
+        if (m_regs[static_cast<std::uint32_t>(NRegister::Flag)] != flags)
         {
-            if (m_transaction.read)
-                flags |= (1U << static_cast<std::uint32_t>(NFlag_Bit_Positions::TX_Busy));
-            else
-                flags |= (1U << static_cast<std::uint32_t>(NFlag_Bit_Positions::RX_Busy));
+            m_logging_system.Debug(fmt::format("CBSC Slave: Flag register changed from 0x{:08X} to 0x{:08X}", 
+                                               m_regs[static_cast<std::uint32_t>(NRegister::Flag)], flags).c_str());
         }
-
         m_regs[static_cast<std::uint32_t>(NRegister::Flag)] = flags;
 
         // Update Data register bits based on NData_Sections
+        const std::uint32_t old_data_reg = m_regs[static_cast<std::uint32_t>(NRegister::Data)];
         m_regs[static_cast<std::uint32_t>(NRegister::Data)] &= 0xFFU;
         if (m_tx_fifo.size() >= FIFO_Depth)
         {
@@ -456,13 +486,19 @@ namespace zero_mate::peripheral
             m_regs[static_cast<std::uint32_t>(NRegister::Data)] |=
             (1U << static_cast<std::uint32_t>(NData_Sections::RX_FIFO_Empty));
         }
+        
+        m_regs[static_cast<std::uint32_t>(NRegister::Data)] |=
+        (static_cast<std::uint32_t>(m_rx_fifo.size()) & 0x1FU)
+        << static_cast<std::uint32_t>(NData_Sections::RX_FIFO_Level_Start);
 
         m_regs[static_cast<std::uint32_t>(NRegister::Data)] |=
         (static_cast<std::uint32_t>(m_tx_fifo.size()) & 0x1FU)
         << static_cast<std::uint32_t>(NData_Sections::TX_FIFO_Level_Start);
-        m_regs[static_cast<std::uint32_t>(NRegister::Data)] |=
-        (static_cast<std::uint32_t>(m_rx_fifo.size()) & 0x1FU)
-        << static_cast<std::uint32_t>(NData_Sections::RX_FIFO_Level_Start);
-    }
 
+        if (m_regs[static_cast<std::uint32_t>(NRegister::Data)] != old_data_reg)
+        {
+            m_logging_system.Debug(fmt::format("CBSC Slave: Data register changed from 0x{:08X} to 0x{:08X}", 
+                                               old_data_reg, m_regs[static_cast<std::uint32_t>(NRegister::Data)]).c_str());
+        }
+    }
 } // namespace zero_mate::peripheral

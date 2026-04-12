@@ -14,6 +14,8 @@
 #include <algorithm>
 /// \endcond
 
+#include <cstdio>
+
 // 3rd party library includes
 
 #include "fmt/format.h"
@@ -230,6 +232,8 @@ namespace zero_mate::peripheral
 
     void CGPIO_Manager::Notify_External_Peripherals(std::uint32_t pin_idx)
     {
+        m_logging_system.Debug(fmt::format("GPIO: Notifying external peripherals about pin {}", pin_idx).c_str());
+
         std::for_each(m_external_peripherals.begin(), m_external_peripherals.end(), [pin_idx](const auto& peripheral) {
             const auto subscription = peripheral->Get_GPIO_Subscription();
 
@@ -474,12 +478,18 @@ namespace zero_mate::peripheral
 
         const CPin::NFunction pin_function = pin.Get_Function();
 
+        m_logging_system.Debug(fmt::format("GPIO: Set_Pin_State(pin={}, state={}, function={})", 
+                                           pin_idx, static_cast<int>(state), 
+                                           magic_enum::enum_name(pin_function)).c_str());
+
         // Make sure the pin function has been set to input.
         // clang-format off
         if ((pin_function != CPin::NFunction::Input) &&
             (pin_function != CPin::NFunction::Alt_5) &&
-            (pin_function != CPin::NFunction::Alt_0))
+            (pin_function != CPin::NFunction::Alt_0) &&
+            (pin_function != CPin::NFunction::Alt_3))
         {
+            m_logging_system.Debug(fmt::format("GPIO: Invalid pin function for pin {}", pin_idx).c_str());
             return NPin_Set_Status::Invalid_Pin_Function;
         }
         // clang-format on

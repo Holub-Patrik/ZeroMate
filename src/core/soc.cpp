@@ -44,6 +44,9 @@ namespace zero_mate::soc
     // CPU
     std::shared_ptr<arm1176jzf_s::CCPU_Core> g_cpu = std::make_shared<arm1176jzf_s::CCPU_Core>(0, g_bus);
 
+    // Execution engine
+    std::shared_ptr<core::CExecution_Engine> g_execution_engine = std::make_shared<core::CExecution_Engine>(g_cpu);
+
     // CP15
     std::shared_ptr<coprocessor::cp15::CCP15> g_cp15 =
     std::make_shared<coprocessor::cp15::CCP15>(g_cpu->Get_CPU_Context());
@@ -401,6 +404,13 @@ namespace zero_mate::soc
                         // Add the peripheral to the GPIO manager, so it can notify it
                         // whenever the state of its pins changes.
                         g_gpio->Add_External_Peripheral(g_external_peripherals.back());
+
+                        // Check if the peripheral also implements the IExecution_Listener interface.
+                        if (auto* listener = dynamic_cast<IExecution_Listener*>(g_external_peripherals.back());
+                            listener != nullptr)
+                        {
+                            g_execution_engine->Register_Listener(listener);
+                        }
 
                         // No other external peripheral with the same name can be connected to the system again.
                         s_external_peripheral_names.insert(config.name);

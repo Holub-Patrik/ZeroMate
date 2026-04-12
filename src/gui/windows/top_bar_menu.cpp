@@ -20,6 +20,7 @@
 #include "../../app_info.hpp"
 #include "top_bar_menu.hpp"
 #include "zero_mate/utils/singleton.hpp"
+#include "../../core/soc.hpp"
 
 namespace zero_mate::gui
 {
@@ -28,7 +29,6 @@ namespace zero_mate::gui
                                  utils::elf::Source_Codes_t& source_codes,
                                  bool& kernel_has_been_loaded,
                                  std::vector<std::shared_ptr<peripheral::IPeripheral>>& peripherals,
-                                 const bool& cpu_running,
                                  std::string& kernel_filename)
     : m_bus{ bus }
     , m_cpu{ cpu }
@@ -38,7 +38,6 @@ namespace zero_mate::gui
     , m_peripherals{ peripherals }
     , m_file_browser{ ImGuiFileBrowserFlags_MultipleSelection | ImGuiFileBrowserFlags_CloseOnEsc }
     , m_loading_kernel{ true }
-    , m_cpu_running{ cpu_running }
     , m_kernel_filename{ kernel_filename }
     , m_show_about_window{ false }
     {
@@ -150,7 +149,7 @@ namespace zero_mate::gui
     void CTop_Bar_Menu::Open_File_Browser(bool loading_kernel)
     {
         // The user must stop the execution before loading any input ELF files.
-        if (m_cpu_running)
+        if (soc::g_execution_engine->Is_Running())
         {
             m_logging_system.Error("The CPU is running. You need to first stop the execution.");
         }
@@ -167,7 +166,7 @@ namespace zero_mate::gui
     void CTop_Bar_Menu::Reload_Kernel()
     {
         // Do not allow the user to reload the kernel if the CPU is still running.
-        if (m_cpu_running)
+        if (soc::g_execution_engine->Is_Running())
         {
             m_logging_system.Error("The CPU is running. You need to first stop the execution.");
             return;

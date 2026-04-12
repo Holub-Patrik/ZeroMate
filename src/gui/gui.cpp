@@ -76,7 +76,6 @@ namespace zero_mate::gui
 
         bool s_scroll_to_curr_line{ false };    ///< Should the source code window scroll to the current line of exec.
         bool s_kernel_has_been_loaded{ false }; ///< Has the kernel been loaded?
-        bool s_cpu_running{ false };            ///< Is the CPU running?
         std::string s_kernel_filename;          ///< Currently loaded kernel
 
         // -------------------------------------------------------------------------------------------------------------
@@ -107,11 +106,10 @@ namespace zero_mate::gui
             auto control_window = std::make_shared<CControl_Window>(soc::g_cpu,
                                                                     s_scroll_to_curr_line,
                                                                     s_kernel_has_been_loaded,
-                                                                    s_cpu_running,
                                                                     s_kernel_filename);
 
-            soc::g_halt_cpu = [control_window]() { control_window->Request_Stop(); };
-            soc::g_start_cpu = [control_window]() { control_window->Request_Start(); };
+            soc::g_halt_cpu = []() { soc::g_execution_engine->Stop(); };
+            soc::g_start_cpu = []() { soc::g_execution_engine->Start(); };
 
             s_windows.emplace_back(control_window);
 
@@ -119,8 +117,7 @@ namespace zero_mate::gui
             // clang-format off
             s_windows.emplace_back(std::make_shared<CSource_Code_Window>(soc::g_cpu,
                                                                          s_source_codes,
-                                                                         s_scroll_to_curr_line,
-                                                                         s_cpu_running));
+                                                                         s_scroll_to_curr_line));
             // clang-format on
 
             // Top bar menu
@@ -129,7 +126,6 @@ namespace zero_mate::gui
                                                                    s_source_codes,
                                                                    s_kernel_has_been_loaded,
                                                                    soc::g_peripherals,
-                                                                   s_cpu_running,
                                                                    s_kernel_filename));
         }
 

@@ -14,17 +14,16 @@
 
 #include "../../utils/elf_loader.hpp"
 #include "source_code_window.hpp"
+#include "../../core/soc.hpp"
 
 namespace zero_mate::gui
 {
     CSource_Code_Window::CSource_Code_Window(std::shared_ptr<arm1176jzf_s::CCPU_Core> cpu,
                                              utils::elf::Source_Codes_t& source_codes,
-                                             bool& scroll_to_curr_line,
-                                             const bool& cpu_running)
+                                             bool& scroll_to_curr_line)
     : m_cpu{ cpu }
     , m_source_codes{ source_codes }
     , m_scroll_to_curr_line{ scroll_to_curr_line }
-    , m_cpu_running{ cpu_running }
     {
     }
 
@@ -137,7 +136,7 @@ namespace zero_mate::gui
             }
 
             // Is the PC register - current instruction somewhere in the body of the function?
-            if (!m_cpu_running &&
+            if (!soc::g_execution_engine->Is_Running() &&
                 source_code.code[i].addr == m_cpu->Get_CPU_Context()[arm1176jzf_s::CCPU_Context::PC_Reg_Idx])
             {
                 return true; // This block of code should be highlighted
@@ -217,7 +216,7 @@ namespace zero_mate::gui
             }
 
             // Has the CPU stopped?
-            if (!m_cpu_running &&
+            if (!soc::g_execution_engine->Is_Running() &&
                 source_code.code[idx].addr == m_cpu->Get_CPU_Context()[arm1176jzf_s::CCPU_Context::PC_Reg_Idx])
             {
                 // Color the current line.
@@ -246,7 +245,7 @@ namespace zero_mate::gui
 
         // clang-format off
         if (ImGui::RadioButton(fmt::format("##{}", source_code.code[idx].addr).c_str(),
-                               m_breakpoints[source_code.code[idx].addr]) && !m_cpu_running)
+                               m_breakpoints[source_code.code[idx].addr]) && !soc::g_execution_engine->Is_Running())
         {
             // Switch the state of the breakpoint.
             m_breakpoints[source_code.code[idx].addr] = !m_breakpoints[source_code.code[idx].addr];
@@ -322,7 +321,7 @@ namespace zero_mate::gui
             }
 
             // Has the execution stop?.
-            if (!m_cpu_running &&
+            if (!soc::g_execution_engine->Is_Running() &&
                 source_code.code[idx].addr == m_cpu->Get_CPU_Context()[arm1176jzf_s::CCPU_Context::PC_Reg_Idx])
             {
                 // Is the block visible to the user?

@@ -13,10 +13,22 @@
       "lib_name": "remote_i2c_master"
     },
     {
-      "name": "LED",
-      "connection": [47],
+      "name": "Button",
+      "connection": [5],
       "lib_dir": "peripherals",
-      "lib_name": "led"
+      "lib_name": "button"
+    },
+    {
+      "name": "Tens",
+      "connection": [10, 11, 12],
+      "lib_dir": "peripherals",
+      "lib_name": "seven_seg_display"
+    },
+    {
+      "name": "Ones",
+      "connection": [13, 14, 15],
+      "lib_dir": "peripherals",
+      "lib_name": "seven_seg_display"
     }
   ]
 }

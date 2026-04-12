@@ -17,6 +17,7 @@
 #include <memory>
 #include <cstdint>
 #include <algorithm>
+#include <cstdio>
 /// \endcond
 
 // Project file imports

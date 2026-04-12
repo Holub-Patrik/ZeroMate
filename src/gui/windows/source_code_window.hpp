@@ -37,8 +37,7 @@ namespace zero_mate::gui
         // -------------------------------------------------------------------------------------------------------------
         explicit CSource_Code_Window(std::shared_ptr<arm1176jzf_s::CCPU_Core> cpu,
                                      utils::elf::Source_Codes_t& source_codes,
-                                     bool& scroll_to_curr_line,
-                                     const bool& cpu_running);
+                                     bool& scroll_to_curr_line);
 
         // -------------------------------------------------------------------------------------------------------------
         /// \brief Renders the window (IGUI_Window interface).
@@ -133,7 +132,6 @@ namespace zero_mate::gui
         utils::elf::Source_Codes_t& m_source_codes;            ///< Collection of all ELF files loaded into the emulator
         std::unordered_map<std::uint32_t, bool> m_breakpoints; ///< Collection of all breakpoints [addr, active]
         bool& m_scroll_to_curr_line;                           ///< Should the windows scroll to the line of execution?
-        const bool& m_cpu_running;                             ///< Is the CPU running?
         std::unordered_map<std::string, bool> m_open_tabs;     ///< Collection of open tabs (ELF source files)
     };
 

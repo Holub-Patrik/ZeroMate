@@ -42,7 +42,6 @@ namespace zero_mate::gui
         explicit CControl_Window(std::shared_ptr<arm1176jzf_s::CCPU_Core> cpu,
                                  bool& scroll_to_curr_line,
                                  const bool& elf_file_has_been_loaded,
-                                 bool& cpu_running,
                                  const std::string& kernel_filename);
 
         // -------------------------------------------------------------------------------------------------------------
@@ -87,11 +86,6 @@ namespace zero_mate::gui
 
     private:
         // -------------------------------------------------------------------------------------------------------------
-        /// \brief Runs CPU execution (separate thread).
-        // -------------------------------------------------------------------------------------------------------------
-        void Run();
-
-        // -------------------------------------------------------------------------------------------------------------
         /// \brief Renders the current CPU state (running, breakpoint, ...)
         // -------------------------------------------------------------------------------------------------------------
         inline void Render_CPU_State() const;
@@ -105,11 +99,6 @@ namespace zero_mate::gui
         /// \brief Log an error message saying that no ELF file (kernel) has been loaded yet.
         // -------------------------------------------------------------------------------------------------------------
         inline void Print_No_ELF_File_Loaded_Error_Msg() const;
-
-        // -------------------------------------------------------------------------------------------------------------
-        /// \brief Starts CPU execution as a separate thread.
-        // -------------------------------------------------------------------------------------------------------------
-        inline void Start_CPU_Thread();
 
         // -------------------------------------------------------------------------------------------------------------
         /// \brief Renders the step control button.
@@ -136,10 +125,6 @@ namespace zero_mate::gui
         bool& m_scroll_to_curr_line;                    ///< Should the GUI scroll to the current line of execution?
         const bool& m_elf_file_has_been_loaded;         ///< Has a kernel been loaded?
         utils::CLogging_System& m_logging_system;       ///< Logging system
-        bool& m_cpu_running;                            ///< Is the CPU running?
-        bool m_breakpoint_hit;                          ///< Has CPU execution hit a breakpoint?
-        std::atomic<bool> m_start_cpu_thread;           ///< Flag indicating that CPU execution should be started
-        std::atomic<bool> m_stop_cpu_thread;            ///< Flag indicating that CPU execution should be stopped
         const std::string& m_kernel_filename;           ///< Name (filepath) of the currently loaded kernel
     };
 

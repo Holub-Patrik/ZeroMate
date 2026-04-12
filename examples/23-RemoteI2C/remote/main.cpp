@@ -2,12 +2,29 @@
 #include <drivers/i2c_slave.h>
 #include <interrupt_controller.h>
 
-// GPIO
-#define GPSET1 0x20200020
-#define GPCLR1 0x2020002C
-
 // I2C Slave
 #define I2C_SLAVE_ADDRESS 0x74
+
+// I2C Slave Registers (Direct Access)
+#define BSCSL_BASE 0x20214000
+#define BSCSL_DATA (BSCSL_BASE + 0x00)
+#define BSCSL_STAT (BSCSL_BASE + 0x04)
+#define BSCSL_ADDR (BSCSL_BASE + 0x08)
+#define BSCSL_CTRL (BSCSL_BASE + 0x0C)
+#define BSCSL_FLAG (BSCSL_BASE + 0x10)
+
+// BSCSL Control Bits
+#define BSCSL_CTRL_RXE  (1 << 9)
+#define BSCSL_CTRL_TXE  (1 << 8)
+#define BSCSL_CTRL_BRK  (1 << 7)
+#define BSCSL_CTRL_I2C  (1 << 2)
+#define BSCSL_CTRL_EN   (1 << 0)
+
+// BSCSL Flag Bits
+#define BSCSL_FLAG_RXFE (1 << 1)
+#define BSCSL_FLAG_TXFF (1 << 2)
+#define BSCSL_FLAG_TXCOUNT_MASK  (0x1F << 6)
+#define BSCSL_FLAG_TXCOUNT_SHIFT 6
 
 void write32(unsigned int addr, unsigned int value)
 {
@@ -19,20 +36,6 @@ unsigned int read32(unsigned int addr)
     return *((volatile unsigned int*)addr);
 }
 
-bool g_led_on = false;
-void led_toggle(void)
-{
-    g_led_on = !g_led_on;
-    if (g_led_on)
-    {
-        write32(GPCLR1, 1 << (47 - 32)); // LED ON
-    }
-    else
-    {
-        write32(GPSET1, 1 << (47 - 32)); // LED OFF
-    }
-}
-
 extern "C" void _irq_handler(void)
 {
 }
@@ -42,38 +45,51 @@ extern "C" void _fiq_handler(void)
 
 extern "C" int _kernel_main(void)
 {
-    sGPIO.Set_GPIO_Function(47, NGPIO_Function::Output);
-    write32(GPSET1, 1 << (47 - 32)); // Start OFF
+    // Configure I2C Slave pins (Alt 3 for GPIO 18, 19)
+    sGPIO.Set_GPIO_Function(18, NGPIO_Function::Alt_3);
+    sGPIO.Set_GPIO_Function(19, NGPIO_Function::Alt_3);
 
-    sI2C_Slave.Open(I2C_SLAVE_ADDRESS);
+    // Reset and initialize I2C Slave
+    write32(BSCSL_CTRL, BSCSL_CTRL_BRK);
+    write32(BSCSL_CTRL, 0);
+    write32(BSCSL_STAT, 0);
+    write32(BSCSL_ADDR, I2C_SLAVE_ADDRESS);
+    write32(BSCSL_CTRL, BSCSL_CTRL_RXE | BSCSL_CTRL_TXE | BSCSL_CTRL_I2C | BSCSL_CTRL_EN);
 
-    unsigned char last_val = 0;
-    bool first_receive = true;
+    char equation[3];
+    int bytes_received = 0;
 
     while (1)
     {
-        // Check for errors (TX Underrun or RX Overrun)
-        if (sI2C_Slave.Get_Status() != 0)
+        // Check for errors
+        if (read32(BSCSL_STAT) != 0)
         {
-            sI2C_Slave.Clear_Status();
+            write32(BSCSL_STAT, 0);
         }
 
         // Check if RX FIFO is not empty
-        if (!sI2C_Slave.Is_RX_Empty())
+        if (!(read32(BSCSL_FLAG) & BSCSL_FLAG_RXFE))
         {
-            unsigned char new_val = sI2C_Slave.Read();
-            if (first_receive || new_val != last_val)
-            {
-                last_val = new_val;
-                led_toggle();
-                first_receive = false;
-            }
-        }
+            equation[bytes_received++] = (char)(read32(BSCSL_DATA) & 0xFF);
 
-        // If TX FIFO is empty, queue the response
-        if (sI2C_Slave.Get_TX_Count() == 0)
-        {
-            sI2C_Slave.Write((last_val + 1) & 0xFF);
+            if (bytes_received == 3)
+            {
+                // Calculate result
+                char op1 = equation[0];
+                char op = equation[1];
+                char op2 = equation[2];
+                char result = 0;
+
+                if (op == 0) result = op1 + op2;
+                else if (op == 1) result = op1 - op2;
+                else if (op == 2) result = op1 * op2;
+
+                // Send result back (wait for TX FIFO space)
+                while (read32(BSCSL_FLAG) & BSCSL_FLAG_TXFF);
+                write32(BSCSL_DATA, result);
+
+                bytes_received = 0;
+            }
         }
     }
 

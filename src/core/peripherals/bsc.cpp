@@ -199,6 +199,7 @@ namespace zero_mate::peripheral
 
             // Receive the ACK_1 bit.
             case NState_Machine::ACK_1:
+                Set_GPIO_pin(SDA_Pin_Idx, true);
                 break;
 
             // Send the data payload.
@@ -221,6 +222,11 @@ namespace zero_mate::peripheral
                     // Master sends ACK/NACK (SDA=0 for ACK, SDA=1 for NACK)
                     // For now, let's just always send ACK (SDA=0)
                     Set_GPIO_pin(SDA_Pin_Idx, false);
+                }
+                else
+                {
+                    // Master should release SDA to allow the slave to drive it
+                    Set_GPIO_pin(SDA_Pin_Idx, true);
                 }
                 break;
 
@@ -248,20 +254,12 @@ namespace zero_mate::peripheral
 
         // Send the bit out to the target device.
         Set_GPIO_pin(SDA_Pin_Idx, curr_bit);
-
-        // Have we sent all bits of the slave's address?
-        if (m_transaction.addr_idx == 0)
-        {
-            // Move on to sending the RW bit.
-            m_transaction.state = NState_Machine::RW;
-        }
     }
 
     void CBSC::I2C_Send_RW_Bit()
     {
-        // Send the RW bit to the device and move on to receiving the ACK_1 bit.
+        // Send the RW bit to the device.
         Set_GPIO_pin(SDA_Pin_Idx, m_transaction.read);
-        m_transaction.state = NState_Machine::ACK_1;
     }
 
     void CBSC::I2C_Receive_ACK_1()
@@ -303,9 +301,6 @@ namespace zero_mate::peripheral
             {
                 m_fifo.pop();
             }
-
-            // Move on to receiving the ACK_2 bit.
-            m_transaction.state = NState_Machine::ACK_2;
         }
     }
 
@@ -370,7 +365,19 @@ namespace zero_mate::peripheral
             case NSCL_State::SCL_High:
                 Set_GPIO_pin(SCL_Pin_Idx, true);
                 
-                if (m_transaction.state == NState_Machine::ACK_1)
+                if (m_transaction.state == NState_Machine::Address && m_transaction.addr_idx == 0)
+                {
+                    m_transaction.state = NState_Machine::RW;
+                }
+                else if (m_transaction.state == NState_Machine::RW)
+                {
+                    m_transaction.state = NState_Machine::ACK_1;
+                }
+                else if (m_transaction.state == NState_Machine::Data && m_transaction.data_idx == 0)
+                {
+                    m_transaction.state = NState_Machine::ACK_2;
+                }
+                else if (m_transaction.state == NState_Machine::ACK_1)
                 {
                     I2C_Receive_ACK_1();
                 }
@@ -406,14 +413,19 @@ namespace zero_mate::peripheral
                     static uint8_t received_byte = 0;
                     if (curr_bit)
                     {
-                        received_byte |= (1 << m_transaction.data_idx);
+                        received_byte |= static_cast<uint8_t>(1 << m_transaction.data_idx);
                     }
                     
                     if (m_transaction.data_idx == 0)
                     {
                         m_fifo.push(received_byte);
                         received_byte = 0;
-                        m_transaction.state = NState_Machine::ACK_2;
+                        // state will be set to ACK_2 in the NEXT SCL_High if we use the same logic,
+                        // but here we already reached data_idx == 0.
+                        // So the NEXT SCL_High should be the ACK bit.
+                        // Wait, my logic for Address/RW says we transition on SCL_High.
+                        // So here, on SCL_High of bit 0, we should transition to ACK_2.
+                        // Let's use the unified logic above.
                     }
                 }
 
@@ -450,6 +462,16 @@ namespace zero_mate::peripheral
 
     void CBSC::Set_GPIO_pin(std::uint8_t pin_idx, bool set)
     {
+        if (pin_idx == SDA_Pin_Idx && set && m_gpio->Read_GPIO_Pin(pin_idx) == CGPIO_Manager::CPin::NState::Low)
+        {
+            if (m_transaction.state == NState_Machine::ACK_1 || 
+                m_transaction.state == NState_Machine::ACK_2 ||
+                (m_transaction.state == NState_Machine::Data && m_transaction.read))
+            {
+                return;
+            }
+        }
+
         // Set the state of the given pin.
         const auto status = m_gpio->Set_Pin_State(pin_idx, static_cast<CGPIO_Manager::CPin::NState>(set));
 

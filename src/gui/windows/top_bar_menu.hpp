@@ -45,7 +45,6 @@ namespace zero_mate::gui
                                utils::elf::Source_Codes_t& source_codes,
                                bool& kernel_has_been_loaded,
                                std::vector<std::shared_ptr<peripheral::IPeripheral>>& peripherals,
-                               const bool& cpu_running,
                                std::string& kernel_filename);
 
         // -------------------------------------------------------------------------------------------------------------
@@ -108,7 +107,6 @@ namespace zero_mate::gui
         std::vector<std::shared_ptr<peripheral::IPeripheral>>& m_peripherals; ///< Collection of peripherals
         ImGui::FileBrowser m_file_browser;                                    ///< File browser
         bool m_loading_kernel;                                                ///< Is a kernel being loaded?
-        const bool& m_cpu_running;                                            ///< Is the CPU running?
         std::string& m_kernel_filename;                                       ///< Filepath of the kernel
         bool m_show_about_window;                                             ///< Show the about windnow
     };

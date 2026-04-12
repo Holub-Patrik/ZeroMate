@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <poll.h>
 
+#include <cstdio>
+
 #include "fmt/format.h"
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
@@ -244,10 +246,6 @@ namespace zero_mate::peripheral
                     stop_local();
                     break;
                 case I2C_Packet_Type::I2C_ADDRESS: {
-                    start_local();
-                    // packet->value contains 8 bits (7-bit address + 1-bit RW)
-                    // bit_bang_byte_local will send 8 bits, which corresponds to 
-                    // CBSC_Slave's Address (7 bits) and RW (1 bit) states.
                     bit_bang_byte_local(packet->value);
                     Send_Packet(I2C_Packet_Type::I2C_ACK, read_ack_local() ? 1 : 0);
                     break;
@@ -357,17 +355,20 @@ namespace zero_mate::peripheral
                 m_set_pin(m_scl_pin, true);
                 m_set_pin(m_scl_pin, false);
             }
+            // Release SDA at the end
+            m_set_pin(m_sda_pin, true);
         }
 
         uint8_t read_byte_local() const
         {
             uint8_t value = 0;
+            // Ensure SDA is released (high) so slave can drive it
             m_set_pin(m_sda_pin, true);
 
             for (int i = 7; i >= 0; --i)
             {
                 m_set_pin(m_scl_pin, true);
-                value |= (m_read_pin(m_sda_pin) << i);
+                value |= static_cast<uint8_t>(m_read_pin(m_sda_pin) << i);
                 m_set_pin(m_scl_pin, false);
             }
 
@@ -380,6 +381,7 @@ namespace zero_mate::peripheral
             m_set_pin(m_scl_pin, true);
             m_set_pin(m_sda_pin, false);
             m_set_pin(m_scl_pin, false);
+            m_set_pin(m_sda_pin, true); // Release SDA after start
         }
 
         void stop_local() const
@@ -391,7 +393,7 @@ namespace zero_mate::peripheral
 
         bool read_ack_local() const
         {
-            m_set_pin(m_sda_pin, true);
+            m_set_pin(m_sda_pin, true); // Release SDA
             m_set_pin(m_scl_pin, true);
 
             bool ack = !m_read_pin(m_sda_pin);
@@ -405,7 +407,7 @@ namespace zero_mate::peripheral
             m_set_pin(m_sda_pin, !ack);
             m_set_pin(m_scl_pin, true);
             m_set_pin(m_scl_pin, false);
-            m_set_pin(m_sda_pin, true);
+            m_set_pin(m_sda_pin, true); // Release SDA
         }
 
         void Send_Packet(I2C_Packet_Type type, uint8_t value) const

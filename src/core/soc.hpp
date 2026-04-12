@@ -24,6 +24,7 @@
 #include "zero_mate/external_peripheral.hpp"
 
 #include "bus.hpp"
+#include "execution_engine.hpp"
 #include "arm1176jzf_s/core.hpp"
 #include "arm1176jzf_s/mmu/mmu.hpp"
 #include "coprocessors/cp15/cp15.hpp"
@@ -110,6 +111,9 @@ namespace zero_mate::soc
 
     /// Global reference to the CPU
     extern std::shared_ptr<arm1176jzf_s::CCPU_Core> g_cpu;
+
+    /// Global reference to the execution engine
+    extern std::shared_ptr<core::CExecution_Engine> g_execution_engine;
 
     /// Global reference to the CP15 (system control coprocessor)
     extern std::shared_ptr<coprocessor::cp15::CCP15> g_cp15;

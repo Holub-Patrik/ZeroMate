@@ -9,10 +9,12 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <poll.h>
+#include <cstdio>
 
 #include "fmt/format.h"
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
+#include "zero_mate/execution_listener.hpp"
 #include "zero_mate/RemoteProtocol.hpp"
 #include "CircularBufferQueue.hpp"
 
@@ -55,7 +57,7 @@ namespace
 
 namespace zero_mate::peripheral
 {
-    class CRemote_I2C_Master final : public IExternal_Peripheral
+    class CRemote_I2C_Master final : public IExternal_Peripheral, public IExecution_Listener
     {
     public:
         static constexpr size_t QUEUE_SIZE = 128;
@@ -79,6 +81,7 @@ namespace zero_mate::peripheral
         bool m_sda_lvl{ true };
         bool m_is_read{ false };
         bool m_ack_from_slave{ false };
+        bool m_master_drives_ack{ false };
         std::atomic<bool> m_halted{ false };
 
         I2C_State m_state{ I2C_State::IDLE };
@@ -99,6 +102,11 @@ namespace zero_mate::peripheral
 
         std::atomic<bool> m_running{ false };
         std::thread m_rx_thread;
+
+        [[nodiscard]] bool Should_Stop() override
+        {
+            return m_halted;
+        }
 
         CRemote_I2C_Master(const std::string& name,
                            uint32_t sda_pin,
@@ -226,6 +234,8 @@ namespace zero_mate::peripheral
             const bool current_sda = m_read_pin(m_sda_pin);
             const bool current_scl = m_read_pin(m_scl_pin);
 
+            printf("DEBUG 4: Remote_Master::GPIO_Callback(pin=%d, sda=%d, scl=%d)\n", pin_idx, current_sda, current_scl);
+
             if (pin_idx == (uint32_t)m_sda_pin)
             {
                 if (current_scl)
@@ -281,6 +291,13 @@ namespace zero_mate::peripheral
                 m_bit_count++;
                 if (m_state == I2C_State::ADDRESS || m_state == I2C_State::WRITE_BYTE)
                 {
+                    if (m_logging_system != nullptr)
+                    {
+                        m_logging_system->Debug(fmt::format("Remote I2C Master: SCL Rising, SDA: {}, State: {}, Bit: {}",
+                                                            current_sda ? 1 : 0,
+                                                            static_cast<int>(m_state),
+                                                            static_cast<int>(m_bit_count)).c_str());
+                    }
                     m_shift_reg = static_cast<uint8_t>((m_shift_reg << 1U) | (current_sda ? 1U : 0U));
                 }
             }
@@ -323,6 +340,7 @@ namespace zero_mate::peripheral
                 }
                 Send_Packet(I2C_Packet_Type::I2C_ADDRESS, m_shift_reg);
                 m_state = I2C_State::RESPONSE;
+                m_master_drives_ack = false;
                 m_bit_count = 0;
                 wait_for_response = true;
             }
@@ -334,24 +352,28 @@ namespace zero_mate::peripheral
                 }
                 Send_Packet(I2C_Packet_Type::I2C_WRITE_BYTE, m_shift_reg);
                 m_state = I2C_State::RESPONSE;
+                m_master_drives_ack = false;
                 m_bit_count = 0;
                 wait_for_response = true;
             }
             else if (m_state == I2C_State::READ_BYTE && m_bit_count == 8)
             {
                 m_state = I2C_State::RESPONSE;
+                m_master_drives_ack = true;
                 m_bit_count = 0;
                 m_ack_from_slave = false;
             }
             else if (m_state == I2C_State::RESPONSE)
             {
-                if (m_is_read && m_bit_count == 0)
+                if (m_master_drives_ack && m_bit_count == 1)
                 {
                     Send_Packet(I2C_Packet_Type::I2C_ACK, m_sda_lvl ? 0 : 1);
                 }
+                
                 m_state = m_is_read ? I2C_State::READ_BYTE : I2C_State::WRITE_BYTE;
                 m_bit_count = 0;
                 m_shift_reg = 0;
+
                 if (m_is_read)
                 {
                     Send_Packet(I2C_Packet_Type::I2C_READ_BYTE, 0);
@@ -563,6 +585,10 @@ namespace zero_mate::peripheral
                         {
                             Drive_SDA_From_Queue();
                         }
+                    }
+                    if (m_logging_system != nullptr)
+                    {
+                        m_logging_system->Debug("Remote I2C Master: Resuming after packet reception");
                     }
                     m_halted = false;
                     m_start();

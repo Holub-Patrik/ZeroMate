@@ -20,6 +20,7 @@
 
 #include "control_window.hpp"
 #include "zero_mate/utils/singleton.hpp"
+#include "../../core/soc.hpp"
 
 namespace zero_mate::gui
 {
@@ -44,16 +45,11 @@ namespace zero_mate::gui
     CControl_Window::CControl_Window(std::shared_ptr<arm1176jzf_s::CCPU_Core> cpu,
                                      bool& scroll_to_curr_line,
                                      const bool& elf_file_has_been_loaded,
-                                     bool& cpu_running,
                                      const std::string& kernel_filename)
     : m_cpu{ cpu }
     , m_scroll_to_curr_line{ scroll_to_curr_line }
     , m_elf_file_has_been_loaded{ elf_file_has_been_loaded }
     , m_logging_system{ *utils::CSingleton<utils::CLogging_System>::Get_Instance() }
-    , m_cpu_running{ cpu_running }
-    , m_breakpoint_hit{ false }
-    , m_start_cpu_thread{ false }
-    , m_stop_cpu_thread{ false }
     , m_kernel_filename{ kernel_filename }
     {
     }
@@ -61,15 +57,13 @@ namespace zero_mate::gui
     CControl_Window::~CControl_Window()
     {
         // Is the CPU execution thread still running?
-        if (m_cpu_running)
+        if (Is_Running())
         {
             // Terminate the execution thread.
-            m_stop_cpu_thread = true;
+            soc::g_execution_engine->Stop();
 
             // Wait for the CPU (execution thread) to stop.
-            while (m_cpu_running)
-            {
-            }
+            soc::g_execution_engine->Get_Running_Flag().wait(true);
         }
     }
 
@@ -84,12 +78,6 @@ namespace zero_mate::gui
 
             // Just for debugging purposes.
             // Render_ImGUI_Demo();
-
-            // Should we start CPU execution?
-            if (m_start_cpu_thread)
-            {
-                Start_CPU_Thread();
-            }
         }
 
         ImGui::End();
@@ -98,21 +86,6 @@ namespace zero_mate::gui
     void CControl_Window::Render_Currently_Loaded_Kernel()
     {
         ImGui::Text("Loaded kernel: %s", m_kernel_filename.c_str());
-    }
-
-    void CControl_Window::Start_CPU_Thread()
-    {
-        // Clear the flags.
-        m_start_cpu_thread = false;
-        m_stop_cpu_thread = false;
-        m_breakpoint_hit = false;
-
-        // The CPU is now running.
-        m_cpu_running = true;
-
-        // Start CPU execution in a separate thread.
-        std::thread cpu_thread(&CControl_Window::Run, this);
-        cpu_thread.detach();
     }
 
     void CControl_Window::Render_Step_Button()
@@ -127,7 +100,7 @@ namespace zero_mate::gui
             else
             {
                 // Perform a single step regardless of any set breakpoints.
-                m_cpu->Step(true);
+                soc::g_execution_engine->Step();
 
                 // Trigger the GUI to scroll to the current line of execution.
                 m_scroll_to_curr_line = true;
@@ -160,34 +133,30 @@ namespace zero_mate::gui
 
     void CControl_Window::Request_Stop() noexcept
     {
-        if (m_cpu_running)
-        {
-            m_stop_cpu_thread = true;
-        }
+        soc::g_execution_engine->Stop();
     }
 
     void CControl_Window::Request_Start() noexcept
     {
-        if (!m_cpu_running && m_elf_file_has_been_loaded)
+        if (!Is_Running() && m_elf_file_has_been_loaded)
         {
-            // Set the flag to start CPU execution.
-            m_start_cpu_thread = true;
+            soc::g_execution_engine->Start();
         }
     }
 
     bool CControl_Window::Is_Running() const noexcept
     {
-        return m_cpu_running && !m_stop_cpu_thread;
+        return soc::g_execution_engine->Is_Running();
     }
 
     bool CControl_Window::Is_Stopping() const noexcept
     {
-        return m_cpu_running && m_stop_cpu_thread;
+        return false; // Not really supported anymore in this simple way
     }
 
     bool CControl_Window::Is_Stopped() const noexcept
     {
-        return !m_cpu_running;
+        return !Is_Running();
     }
 
     void CControl_Window::Render_Control_Buttons()
@@ -211,7 +180,7 @@ namespace zero_mate::gui
         ImGui::Text("State:");
         ImGui::SameLine();
 
-        if (m_breakpoint_hit)
+        if (soc::g_execution_engine->Has_Hit_Breakpoint())
         {
             // Breakpoint
             ImGui::PushStyleColor(ImGuiCol_Text, color::Light_Blue);
@@ -224,12 +193,6 @@ namespace zero_mate::gui
                 // Running
                 ImGui::PushStyleColor(ImGuiCol_Text, color::Green);
                 ImGui::Text("Running");
-            }
-            else if (Is_Stopping())
-            {
-                // Stopping
-                ImGui::PushStyleColor(ImGuiCol_Text, color::Yellow);
-                ImGui::Text("Stopping");
             }
             else
             {
@@ -246,42 +209,6 @@ namespace zero_mate::gui
     inline void CControl_Window::Print_No_ELF_File_Loaded_Error_Msg() const
     {
         m_logging_system.Error("No .ELF file has been loaded");
-    }
-
-    void CControl_Window::Run()
-    {
-        m_logging_system.Info("CPU execution has started");
-        // do one step with breakpoint ignore to unblock
-        m_cpu->Step(true);
-
-        // Keep stepping the CPU
-        while (!m_stop_cpu_thread)
-        {
-            // Perform a single step and check if the execution has hit a breakpoint.
-            if (!m_cpu->Step())
-            {
-                // Breakpoint hit -> CPU has execution stopped.
-                m_breakpoint_hit = true;
-                m_stop_cpu_thread = true;
-
-                // clang-format off
-                m_logging_system.Info(fmt::format("CPU execution has hit a breakpoint at address 0x{:08X}",
-                                      m_cpu->Get_CPU_Context()[arm1176jzf_s::CCPU_Context::PC_Reg_Idx]).c_str());
-                // clang-format on
-            }
-        }
-
-        // CPU is no longer in a running mode.
-        m_cpu_running = false;
-
-        // The GUI should scroll to the current line of execution.
-        m_scroll_to_curr_line = true;
-
-        // If the CPU was not due to a breakpoint.
-        if (!m_breakpoint_hit)
-        {
-            m_logging_system.Info("CPU execution has stopped");
-        }
     }
 
 } // namespace zero_mate::gui
