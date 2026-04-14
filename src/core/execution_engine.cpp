@@ -10,6 +10,7 @@
 /// \cond
 #include <thread>
 #include <algorithm>
+#include <utility>
 /// \endcond
 
 // Project file imports
@@ -20,7 +21,7 @@
 namespace zero_mate::core
 {
     CExecution_Engine::CExecution_Engine(std::shared_ptr<arm1176jzf_s::CCPU_Core> cpu)
-    : m_cpu{ cpu }
+    : m_cpu{ std::move(cpu) }
     , m_running{ false }
     , m_stop_requested{ false }
     , m_breakpoint_hit{ false }
@@ -103,9 +104,8 @@ namespace zero_mate::core
             }
 
             // Check if any of the listeners want to stop the execution.
-            bool should_stop = std::any_of(m_listeners.begin(), m_listeners.end(), [](auto* listener) {
-                return listener->Should_Stop();
-            });
+            bool should_stop =
+            std::any_of(m_listeners.begin(), m_listeners.end(), [](auto* listener) { return listener->Should_Stop(); });
 
             if (should_stop)
             {

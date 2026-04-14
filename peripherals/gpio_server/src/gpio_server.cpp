@@ -777,33 +777,34 @@ namespace zero_mate::peripheral
     }
 }
 
+#include "zero_mate/gpio_server_abi.hpp"
+
 extern "C"
 {
-    int server_register_channel(const char* protocol,
-                                zero_mate::remote_protocol::comparison_func_t comp_func,
-                                zero_mate::remote_protocol::disconnect_callback_t on_disconnect,
-                                zero_mate::remote_protocol::handshake_result_callback_t on_handshake_result,
-                                void* context)
+    zero_mate::peripheral::TGPIOServerABI Get_GPIO_Server_ABI()
     {
-        return zero_mate::peripheral::CGPIO_Server::s_instance->Register(protocol,
-                                                                         comp_func,
-                                                                         on_disconnect,
-                                                                         on_handshake_result,
-                                                                         context);
-    }
-
-    void server_unregister_channel(int fd)
-    {
-        zero_mate::peripheral::CGPIO_Server::s_instance->Unregister(fd);
-    }
-    void server_disconnect_channel(int fd)
-    {
-        zero_mate::peripheral::CGPIO_Server::s_instance->Disconnect(fd);
-    }
-    void
-    server_init_handshake(int fd, const char* remote_ip, uint16_t remote_port, const void* comp_payload, size_t size)
-    {
-        zero_mate::peripheral::CGPIO_Server::s_instance->Init_Handshake(fd, remote_ip, remote_port, comp_payload, size);
+        return { .register_channel =
+                 [](const char* protocol,
+                    zero_mate::remote_protocol::comparison_func_t comp_func,
+                    zero_mate::remote_protocol::disconnect_callback_t on_disconnect,
+                    zero_mate::remote_protocol::handshake_result_callback_t on_handshake_result,
+                    void* context) {
+                     return zero_mate::peripheral::CGPIO_Server::s_instance->Register(protocol,
+                                                                                      comp_func,
+                                                                                      on_disconnect,
+                                                                                      on_handshake_result,
+                                                                                      context);
+                 },
+                 .unregister_channel = [](int fd) { zero_mate::peripheral::CGPIO_Server::s_instance->Unregister(fd); },
+                 .disconnect_channel = [](int fd) { zero_mate::peripheral::CGPIO_Server::s_instance->Disconnect(fd); },
+                 .init_handshake =
+                 [](int fd, const char* remote_ip, uint16_t remote_port, const void* comp_payload, size_t size) {
+                     zero_mate::peripheral::CGPIO_Server::s_instance->Init_Handshake(fd,
+                                                                                     remote_ip,
+                                                                                     remote_port,
+                                                                                     comp_payload,
+                                                                                     size);
+                 } };
     }
 
     zero_mate::IExternal_Peripheral::NInit_Status

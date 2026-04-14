@@ -5,12 +5,14 @@
 
 #ifdef _WIN32
     #include <windows.h>
-    #define LIB_SELF() GetModuleHandle(NULL)
-    #define LIB_SYM(h, name) (void*)GetProcAddress((HMODULE)h, name)
+    #define LIB_OPEN_SERVER(name) GetModuleHandle(name)
+    #define LIB_LOOKUP_SYMBOL(h, name) (void*)GetProcAddress((HMODULE)h, name)
+    #define LIB_NAME(name) name ".dll"
 #else
     #include <dlfcn.h>
-    #define LIB_SELF() dlopen(NULL, RTLD_NOW)
-    #define LIB_SYM(h, name) dlsym(h, name)
+    #define LIB_OPEN_SERVER(name) dlopen(name, RTLD_NOW | RTLD_NOLOAD)
+    #define LIB_LOOKUP_SYMBOL(h, name) dlsym(h, name)
+    #define LIB_NAME(name) "lib" name ".so"
 #endif
 
 namespace zero_mate::remote_protocol

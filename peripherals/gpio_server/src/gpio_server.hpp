@@ -91,9 +91,8 @@ namespace zero_mate::peripheral
                                        const std::array<std::uint8_t, 4096>& buffer,
                                        ssize_t received,
                                        const char* remote_ip_str);
-        [[nodiscard]] std::vector<int> Update_Peers_On_Disconnect(const PeerKey& key,
-                                                                  const sockaddr_in& remote_addr,
-                                                                  uint16_t remote_data_port);
+        [[nodiscard]] std::vector<int>
+        Update_Peers_On_Disconnect(const PeerKey& key, const sockaddr_in& remote_addr, uint16_t remote_data_port);
         void Notify_Components_Of_Disconnect(const std::vector<int>& fds_to_notify,
                                              const char* remote_ip_str,
                                              uint16_t remote_data_port);

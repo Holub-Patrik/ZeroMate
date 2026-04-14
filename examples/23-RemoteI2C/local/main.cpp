@@ -49,7 +49,7 @@ void Update_Display(int result)
 {
     if (result < 0)
     {
-        result = 0;
+        result = -result;
     }
     if (result > 99)
     {
@@ -87,9 +87,9 @@ extern "C" void _irq_handler(void)
 
     // Receive result
     char result = 0;
-    sI2C1.Receive(I2C_SLAVE_ADDRESS, &result, 1);
+    sI2C1.Receive(I2C_SLAVE_ADDRESS, (char*)&result, 1);
 
-    Update_Display(result);
+    Update_Display((int)result);
 
     op1 = (op1 + 1) % 10;
     op2 = (op2 + 2) % 10;

@@ -1,7 +1,5 @@
-#include <vector>
 #include <string>
 #include <array>
-#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <thread>
@@ -14,9 +12,19 @@
 #include "fmt/format.h"
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
+#include "zero_mate/gpio_server_abi.hpp"
 #include "zero_mate/RemoteProtocol.hpp"
-#include "zero_mate/Protocol.hpp"
 #include "CircularBufferQueue.hpp"
+
+namespace
+{
+    struct UARTPayload
+    {
+        uint8_t proto;
+        uint32_t baud;
+        uint32_t net_id;
+    } __attribute__((packed));
+}
 
 namespace zero_mate::peripheral
 {
@@ -33,13 +41,6 @@ namespace zero_mate::peripheral
             Data_Bits,
             Stop_Bits
         };
-
-        struct UARTPayload
-        {
-            uint8_t proto;
-            uint32_t baud;
-            uint32_t net_id;
-        } __attribute__((packed));
 
         std::string m_name;
         int m_net_id{ 1 };
@@ -117,17 +118,24 @@ namespace zero_mate::peripheral
         {
             if (pipe(m_stop_pipe) == -1)
             {
-                if (m_logging_system)
+                if (m_logging_system != nullptr)
                 {
                     m_logging_system->Error("Remote UART: Failed to create stop pipe");
                 }
             }
 
-            void* proc = LIB_SELF();
-            m_server_register = (remote_protocol::register_t)LIB_SYM(proc, "server_register_channel");
-            m_server_unregister = (remote_protocol::unregister_t)LIB_SYM(proc, "server_unregister_channel");
-            m_server_disconnect = (remote_protocol::disconnect_t)LIB_SYM(proc, "server_disconnect_channel");
-            m_server_init_handshake = (remote_protocol::init_handshake_t)LIB_SYM(proc, "server_init_handshake");
+            void* proc = LIB_OPEN_SERVER(LIB_NAME("gpio_server"));
+            auto get_gs_abi = (TGPIOServerABI (*)())LIB_LOOKUP_SYMBOL(proc, "Get_GPIO_Server_ABI");
+
+            if (get_gs_abi != nullptr)
+            {
+                const auto abi = get_gs_abi();
+
+                m_server_register = abi.register_channel;
+                m_server_unregister = abi.unregister_channel;
+                m_server_disconnect = abi.disconnect_channel;
+                m_server_init_handshake = abi.init_handshake;
+            }
 
             if (m_server_register != nullptr)
             {

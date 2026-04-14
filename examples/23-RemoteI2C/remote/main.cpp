@@ -1,11 +1,10 @@
 #include <drivers/gpio.h>
-#include <drivers/i2c_slave.h>
 #include <interrupt_controller.h>
 
 // I2C Slave
 #define I2C_SLAVE_ADDRESS 0x74
 
-// I2C Slave Registers (Direct Access)
+// I2C Slave Registers
 #define BSCSL_BASE 0x20214000
 #define BSCSL_DATA (BSCSL_BASE + 0x00)
 #define BSCSL_STAT (BSCSL_BASE + 0x04)
@@ -14,16 +13,16 @@
 #define BSCSL_FLAG (BSCSL_BASE + 0x10)
 
 // BSCSL Control Bits
-#define BSCSL_CTRL_RXE  (1 << 9)
-#define BSCSL_CTRL_TXE  (1 << 8)
-#define BSCSL_CTRL_BRK  (1 << 7)
-#define BSCSL_CTRL_I2C  (1 << 2)
-#define BSCSL_CTRL_EN   (1 << 0)
+#define BSCSL_CTRL_RXE (1 << 9)
+#define BSCSL_CTRL_TXE (1 << 8)
+#define BSCSL_CTRL_BRK (1 << 7)
+#define BSCSL_CTRL_I2C (1 << 2)
+#define BSCSL_CTRL_EN (1 << 0)
 
 // BSCSL Flag Bits
 #define BSCSL_FLAG_RXFE (1 << 1)
 #define BSCSL_FLAG_TXFF (1 << 2)
-#define BSCSL_FLAG_TXCOUNT_MASK  (0x1F << 6)
+#define BSCSL_FLAG_TXCOUNT_MASK (0x1F << 6)
 #define BSCSL_FLAG_TXCOUNT_SHIFT 6
 
 void write32(unsigned int addr, unsigned int value)
@@ -75,18 +74,37 @@ extern "C" int _kernel_main(void)
             if (bytes_received == 3)
             {
                 // Calculate result
-                char op1 = equation[0];
-                char op = equation[1];
-                char op2 = equation[2];
+                char operand_1 = equation[0];
+                char operation = equation[1];
+                char operand_2 = equation[2];
                 char result = 0;
 
-                if (op == 0) result = op1 + op2;
-                else if (op == 1) result = op1 - op2;
-                else if (op == 2) result = op1 * op2;
+                if (operation == 0)
+                {
+                    result = (char)(operand_1 + operand_2);
+                }
+                else if (operation == 1)
+                {
+                    if (operand_1 > operand_2)
+                    {
+                        result = (char)(operand_1 - operand_2);
+                    }
+                    else
+                    {
+                        result = (char)(operand_2 - operand_1);
+                    }
+                }
+                else if (operation == 2)
+                {
+                    result = (char)(operand_1 * operand_2);
+                }
 
                 // Send result back (wait for TX FIFO space)
-                while (read32(BSCSL_FLAG) & BSCSL_FLAG_TXFF);
-                write32(BSCSL_DATA, result);
+                while (read32(BSCSL_FLAG) & BSCSL_FLAG_TXFF)
+                {
+                    ;
+                }
+                write32(BSCSL_DATA, (int)result);
 
                 bytes_received = 0;
             }

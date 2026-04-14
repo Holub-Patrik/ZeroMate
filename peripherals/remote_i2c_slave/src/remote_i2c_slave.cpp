@@ -1,21 +1,20 @@
-#include <utility>
 #include <vector>
 #include <string>
-#include <array>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <poll.h>
-
 #include <cstdio>
 
 #include "fmt/format.h"
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
+#include "zero_mate/gpio_server_abi.hpp"
 #include "zero_mate/RemoteProtocol.hpp"
 #include "zero_mate/Protocol.hpp"
 #include "CircularBufferQueue.hpp"
@@ -32,6 +31,7 @@ namespace
         I2C_ACK,
         I2C_DATA
     };
+
     struct I2C_Packet
     {
         I2C_Packet_Type type;
@@ -45,24 +45,20 @@ namespace
         uint32_t bus_id;
     } __attribute__((packed));
 
-}
-
-namespace zero_mate::peripheral
-{
-    class CRemote_I2C_Slave final : public IExternal_Peripheral
+    class CRemote_I2C_Slave final : public zero_mate::IExternal_Peripheral
     {
     public:
         std::string m_name;
-        int m_sda_pin{ 2 };
-        int m_scl_pin{ 3 };
-        int m_address{ 0x3C };
+        int m_sda_pin{ 18 };
+        int m_scl_pin{ 19 };
+        int m_address{ 0x76 };
         int m_bus_id{ 1 };
         int m_remote_port{ 9000 };
         char m_remote_ip[64]{ 0 };
 
-        IExternal_Peripheral::Read_GPIO_Pin_t m_read_pin;
-        IExternal_Peripheral::Set_GPIO_Pin_t m_set_pin;
-        utils::CLogging_System* m_logging_system;
+        zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t m_read_pin;
+        zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t m_set_pin;
+        zero_mate::utils::CLogging_System* m_logging_system;
         void* m_imgui_context{ nullptr };
 
         int m_server_fd{ -1 };
@@ -70,10 +66,10 @@ namespace zero_mate::peripheral
         bool m_connected{ false };
         struct sockaddr_in m_remote_addr{ };
 
-        remote_protocol::register_t m_server_register{ nullptr };
-        remote_protocol::unregister_t m_server_unregister{ nullptr };
-        remote_protocol::disconnect_t m_server_disconnect{ nullptr };
-        remote_protocol::init_handshake_t m_server_init_handshake{ nullptr };
+        zero_mate::remote_protocol::register_t m_server_register{ nullptr };
+        zero_mate::remote_protocol::unregister_t m_server_unregister{ nullptr };
+        zero_mate::remote_protocol::disconnect_t m_server_disconnect{ nullptr };
+        zero_mate::remote_protocol::init_handshake_t m_server_init_handshake{ nullptr };
 
         std::atomic<bool> m_running{ false };
         std::thread m_rx_thread;
@@ -81,9 +77,9 @@ namespace zero_mate::peripheral
         CRemote_I2C_Slave(std::string name,
                           uint32_t sda_pin,
                           uint32_t scl_pin,
-                          IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
-                          IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
-                          utils::CLogging_System* logging_system)
+                          zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
+                          zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
+                          zero_mate::utils::CLogging_System* logging_system)
         : m_name{ std::move(name) }
         , m_sda_pin{ (int)sda_pin }
         , m_scl_pin{ (int)scl_pin }
@@ -93,17 +89,25 @@ namespace zero_mate::peripheral
         {
             if (pipe(m_stop_pipe) == -1)
             {
-                if (m_logging_system)
+                if (m_logging_system != nullptr)
                 {
                     m_logging_system->Error("Remote I2C Slave: Failed to create stop pipe");
                 }
             }
 
-            void* proc = LIB_SELF();
-            m_server_register = (remote_protocol::register_t)LIB_SYM(proc, "server_register_channel");
-            m_server_unregister = (remote_protocol::unregister_t)LIB_SYM(proc, "server_unregister_channel");
-            m_server_disconnect = (remote_protocol::disconnect_t)LIB_SYM(proc, "server_disconnect_channel");
-            m_server_init_handshake = (remote_protocol::init_handshake_t)LIB_SYM(proc, "server_init_handshake");
+            void* proc = LIB_OPEN_SERVER(LIB_NAME("gpio_server"));
+            auto get_gs_abi =
+            (zero_mate::peripheral::TGPIOServerABI (*)())LIB_LOOKUP_SYMBOL(proc, "Get_GPIO_Server_ABI");
+
+            if (get_gs_abi != nullptr)
+            {
+                const auto abi = get_gs_abi();
+
+                m_server_register = abi.register_channel;
+                m_server_unregister = abi.unregister_channel;
+                m_server_disconnect = abi.disconnect_channel;
+                m_server_init_handshake = abi.init_handshake;
+            }
 
             if (m_server_register != nullptr)
             {
@@ -114,7 +118,7 @@ namespace zero_mate::peripheral
                                                 this);
             }
 
-            std::strncpy(m_remote_ip, "127.0.0.1", sizeof(m_remote_ip) - 1);
+            strncpy(m_remote_ip, "127.0.0.1", sizeof(m_remote_ip));
         }
 
         ~CRemote_I2C_Slave() override
@@ -129,6 +133,9 @@ namespace zero_mate::peripheral
             if (m_stop_pipe[0] != -1)
             {
                 close(m_stop_pipe[0]);
+            }
+            if (m_stop_pipe[1] != -1)
+            {
                 close(m_stop_pipe[1]);
             }
         }
@@ -234,7 +241,9 @@ namespace zero_mate::peripheral
             if (m_logging_system != nullptr)
             {
                 m_logging_system->Debug(fmt::format("Remote I2C Slave: Received packet: {} (value: 0x{:02X})",
-                                                   static_cast<int>(packet->type), packet->value).c_str());
+                                                    static_cast<int>(packet->type),
+                                                    packet->value)
+                                        .c_str());
             }
 
             switch (packet->type)
@@ -355,15 +364,11 @@ namespace zero_mate::peripheral
                 m_set_pin(m_scl_pin, true);
                 m_set_pin(m_scl_pin, false);
             }
-            // Release SDA at the end
-            m_set_pin(m_sda_pin, true);
         }
 
         uint8_t read_byte_local() const
         {
             uint8_t value = 0;
-            // Ensure SDA is released (high) so slave can drive it
-            m_set_pin(m_sda_pin, true);
 
             for (int i = 7; i >= 0; --i)
             {
@@ -381,11 +386,11 @@ namespace zero_mate::peripheral
             m_set_pin(m_scl_pin, true);
             m_set_pin(m_sda_pin, false);
             m_set_pin(m_scl_pin, false);
-            m_set_pin(m_sda_pin, true); // Release SDA after start
         }
 
         void stop_local() const
         {
+            m_set_pin(m_scl_pin, false);
             m_set_pin(m_sda_pin, false);
             m_set_pin(m_scl_pin, true);
             m_set_pin(m_sda_pin, true);
@@ -393,11 +398,8 @@ namespace zero_mate::peripheral
 
         bool read_ack_local() const
         {
-            m_set_pin(m_sda_pin, true); // Release SDA
             m_set_pin(m_scl_pin, true);
-
             bool ack = !m_read_pin(m_sda_pin);
-
             m_set_pin(m_scl_pin, false);
             return ack;
         }
@@ -407,17 +409,10 @@ namespace zero_mate::peripheral
             m_set_pin(m_sda_pin, !ack);
             m_set_pin(m_scl_pin, true);
             m_set_pin(m_scl_pin, false);
-            m_set_pin(m_sda_pin, true); // Release SDA
         }
 
         void Send_Packet(I2C_Packet_Type type, uint8_t value) const
         {
-            if (m_logging_system != nullptr)
-            {
-                m_logging_system->Debug(fmt::format("Remote I2C Slave: Sending packet: {} (value: 0x{:02X})",
-                                                   static_cast<int>(type), value).c_str());
-            }
-
             I2C_Packet packet{ .type = type, .value = value };
             if (m_server_fd != -1)
             {
@@ -436,8 +431,8 @@ extern "C"
                       size_t pin_count,
                       zero_mate::IExternal_Peripheral::Set_GPIO_Pin_t set_pin,
                       zero_mate::IExternal_Peripheral::Read_GPIO_Pin_t read_pin,
-                      zero_mate::IExternal_Peripheral::Halt_t,
-                      zero_mate::IExternal_Peripheral::Start_t,
+                      zero_mate::IExternal_Peripheral::Halt_t /* halt */,
+                      zero_mate::IExternal_Peripheral::Start_t /* start */,
                       zero_mate::utils::CLogging_System* logging_system)
     {
         if (pin_count != 2)
@@ -446,7 +441,7 @@ extern "C"
         }
 
         *peripheral =
-        new (std::nothrow) zero_mate::peripheral::CRemote_I2C_Slave(name, connection[0], connection[1], read_pin, set_pin, logging_system);
+        new (std::nothrow) CRemote_I2C_Slave(name, connection[0], connection[1], read_pin, set_pin, logging_system);
         return (*peripheral == nullptr) ? zero_mate::IExternal_Peripheral::NInit_Status::Allocation_Error
                                         : zero_mate::IExternal_Peripheral::NInit_Status::OK;
     }
