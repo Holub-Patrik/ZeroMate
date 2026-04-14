@@ -10,7 +10,7 @@
 
 #include "zero_mate/external_peripheral.hpp"
 #include "zero_mate/RemoteProtocol.hpp"
-#include "zero_mate/Protocol.hpp"
+#include "zero_mate/PollShimWrapper.hpp"
 
 namespace zero_mate::peripheral
 {
@@ -58,6 +58,7 @@ namespace zero_mate::peripheral
         };
 
         struct ComponentContext
+
         {
             struct PeerInfo
             {

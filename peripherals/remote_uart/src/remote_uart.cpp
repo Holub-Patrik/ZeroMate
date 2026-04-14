@@ -7,7 +7,6 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <poll.h>
 
 #include "fmt/format.h"
 #include "imgui.h"
@@ -15,6 +14,7 @@
 #include "zero_mate/gpio_server_abi.hpp"
 #include "zero_mate/RemoteProtocol.hpp"
 #include "CircularBufferQueue.hpp"
+#include "zero_mate/PollShimWrapper.hpp"
 
 namespace
 {
@@ -47,7 +47,7 @@ namespace zero_mate::peripheral
         int m_remote_port{ 9000 };
         char m_remote_ip[64]{ 0 };
         int m_fd{ -1 };
-        int m_stop_pipe[2]{ -1, -1 };
+        WakePipe m_stop_pipe;
         bool m_connected{ false };
         struct sockaddr_in m_remote_addr{ };
 
@@ -116,14 +116,6 @@ namespace zero_mate::peripheral
         , m_rx_writer(&m_rx_buffer_buf)
         , m_rx_backoff(10, 100)
         {
-            if (pipe(m_stop_pipe) == -1)
-            {
-                if (m_logging_system != nullptr)
-                {
-                    m_logging_system->Error("Remote UART: Failed to create stop pipe");
-                }
-            }
-
             void* proc = LIB_OPEN_SERVER(LIB_NAME("gpio_server"));
             auto get_gs_abi = (TGPIOServerABI (*)())LIB_LOOKUP_SYMBOL(proc, "Get_GPIO_Server_ABI");
 
@@ -154,12 +146,6 @@ namespace zero_mate::peripheral
             {
                 m_server_unregister(m_fd);
             }
-
-            if (m_stop_pipe[0] != -1)
-            {
-                close(m_stop_pipe[0]);
-                close(m_stop_pipe[1]);
-            }
         }
 
         void ResetState()
@@ -188,11 +174,7 @@ namespace zero_mate::peripheral
             m_running = false;
             m_rx_backoff.wake();
 
-            if (m_stop_pipe[1] != -1)
-            {
-                uint64_t val = 1;
-                (void)write(m_stop_pipe[1], &val, sizeof(val));
-            }
+            m_stop_pipe.signal();
 
             ResetState();
 
@@ -472,10 +454,10 @@ namespace zero_mate::peripheral
                 struct pollfd pfds[2];
                 pfds[0].fd = m_fd;
                 pfds[0].events = POLLIN;
-                pfds[1].fd = m_stop_pipe[0];
+                pfds[1].fd = m_stop_pipe.read_fd();
                 pfds[1].events = POLLIN;
 
-                const auto poll_ret = poll(pfds, 2, -1);
+                const auto poll_ret = poll_sockets(pfds, 2, -1);
 
                 if (poll_ret <= 0)
                 {

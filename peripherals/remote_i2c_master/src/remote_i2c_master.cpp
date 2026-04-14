@@ -8,7 +8,6 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <poll.h>
 #include <cstdio>
 
 #include "fmt/format.h"
@@ -18,6 +17,7 @@
 #include "zero_mate/execution_listener.hpp"
 #include "zero_mate/RemoteProtocol.hpp"
 #include "CircularBufferQueue.hpp"
+#include "zero_mate/PollShimWrapper.hpp"
 
 namespace
 {
@@ -76,7 +76,7 @@ public:
     void* m_imgui_context{ nullptr };
 
     int m_server_fd{ -1 };
-    int m_stop_pipe[2]{ -1, -1 };
+    WakePipe m_stop_pipe;
     std::atomic<uint32_t> m_slave_count{ 0 };
     bool m_scl_lvl{ true };
     bool m_sda_lvl{ true };
@@ -133,14 +133,6 @@ public:
         m_gpio_subscription.insert(sda_pin);
         m_gpio_subscription.insert(scl_pin);
 
-        if (pipe(m_stop_pipe) == -1)
-        {
-            if (m_logging_system != nullptr)
-            {
-                m_logging_system->Error("Remote I2C Master: Failed to create stop pipe");
-            }
-        }
-
         void* proc = LIB_OPEN_SERVER(LIB_NAME("gpio_server"));
         auto get_gs_abi = (zero_mate::peripheral::TGPIOServerABI (*)())(LIB_LOOKUP_SYMBOL(proc, "Get_GPIO_Server_ABI"));
 
@@ -173,12 +165,6 @@ public:
         if (m_server_fd != -1 && (m_server_unregister != nullptr))
         {
             m_server_unregister(m_server_fd);
-        }
-
-        if (m_stop_pipe[0] != -1)
-        {
-            close(m_stop_pipe[0]);
-            close(m_stop_pipe[1]);
         }
     }
 
@@ -215,11 +201,7 @@ public:
         m_reader_backoff.wake();
         m_writer_backoff.wake();
 
-        if (m_stop_pipe[1] != -1)
-        {
-            uint64_t val = 1;
-            (void)write(m_stop_pipe[1], &val, sizeof(val));
-        }
+        m_stop_pipe.signal();
 
         ResetState();
 
@@ -418,7 +400,8 @@ public:
                 if (m_server_fd != -1)
                 {
                     void* proc = LIB_OPEN_SERVER(LIB_NAME("gpio_server"));
-                    auto get_gs_abi = (TGPIOServerABI (*)())LIB_LOOKUP_SYMBOL(proc, "Get_GPIO_Server_ABI");
+                    auto get_gs_abi =
+                    (zero_mate::peripheral::TGPIOServerABI (*)())LIB_LOOKUP_SYMBOL(proc, "Get_GPIO_Server_ABI");
 
                     if (get_gs_abi != nullptr)
                     {
@@ -562,10 +545,10 @@ private:
             struct pollfd pfds[2];
             pfds[0].fd = m_server_fd;
             pfds[0].events = POLLIN;
-            pfds[1].fd = m_stop_pipe[0];
+            pfds[1].fd = m_stop_pipe.read_fd();
             pfds[1].events = POLLIN;
 
-            const auto poll_ret = poll(pfds, 2, -1);
+            const auto poll_ret = poll_sockets(pfds, 2, -1);
 
             if (poll_ret <= 0)
             {

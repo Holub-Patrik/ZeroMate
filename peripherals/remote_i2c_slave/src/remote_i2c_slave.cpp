@@ -1,23 +1,17 @@
-#include <vector>
 #include <string>
 #include <atomic>
 #include <cstring>
-#include <mutex>
 #include <thread>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
-#include <poll.h>
-#include <cstdio>
 
 #include "fmt/format.h"
 #include "imgui.h"
 #include "zero_mate/external_peripheral.hpp"
 #include "zero_mate/gpio_server_abi.hpp"
 #include "zero_mate/RemoteProtocol.hpp"
-#include "zero_mate/Protocol.hpp"
-#include "CircularBufferQueue.hpp"
+#include "zero_mate/PollShimWrapper.hpp"
 
 namespace
 {
@@ -62,7 +56,7 @@ namespace
         void* m_imgui_context{ nullptr };
 
         int m_server_fd{ -1 };
-        int m_stop_pipe[2]{ -1, -1 };
+        WakePipe m_stop_pipe;
         bool m_connected{ false };
         struct sockaddr_in m_remote_addr{ };
 
@@ -87,14 +81,6 @@ namespace
         , m_set_pin{ set_pin }
         , m_logging_system{ logging_system }
         {
-            if (pipe(m_stop_pipe) == -1)
-            {
-                if (m_logging_system != nullptr)
-                {
-                    m_logging_system->Error("Remote I2C Slave: Failed to create stop pipe");
-                }
-            }
-
             void* proc = LIB_OPEN_SERVER(LIB_NAME("gpio_server"));
             auto get_gs_abi =
             (zero_mate::peripheral::TGPIOServerABI (*)())LIB_LOOKUP_SYMBOL(proc, "Get_GPIO_Server_ABI");
@@ -129,15 +115,6 @@ namespace
             {
                 m_server_unregister(m_server_fd);
             }
-
-            if (m_stop_pipe[0] != -1)
-            {
-                close(m_stop_pipe[0]);
-            }
-            if (m_stop_pipe[1] != -1)
-            {
-                close(m_stop_pipe[1]);
-            }
         }
 
         void ResetState()
@@ -154,11 +131,7 @@ namespace
 
             m_running = false;
 
-            if (m_stop_pipe[1] != -1)
-            {
-                uint64_t val = 1;
-                (void)write(m_stop_pipe[1], &val, sizeof(val));
-            }
+            m_stop_pipe.signal();
 
             ResetState();
 
@@ -319,10 +292,10 @@ namespace
                 struct pollfd pfds[2];
                 pfds[0].fd = m_server_fd;
                 pfds[0].events = POLLIN;
-                pfds[1].fd = m_stop_pipe[0];
+                pfds[1].fd = m_stop_pipe.read_fd();
                 pfds[1].events = POLLIN;
 
-                const auto poll_ret = poll(pfds, 2, -1);
+                const auto poll_ret = poll_sockets(pfds, 2, -1);
 
                 if (poll_ret <= 0)
                 {

@@ -2,7 +2,6 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#include <poll.h>
 #include <vector>
 #include <array>
 #include <algorithm>
@@ -11,6 +10,8 @@
 #include "fmt/format.h"
 #include "imgui.h"
 #include "gpio_server.hpp"
+#include "zero_mate/Protocol.hpp"
+#include "zero_mate/RemoteProtocol.hpp"
 
 constexpr std::uint16_t DEFAULT_PORT = 9000;
 
@@ -434,7 +435,7 @@ namespace zero_mate::peripheral
         while (m_running)
         {
             struct pollfd pfd{ .fd = m_handshake_sock, .events = POLLIN, .revents = 0 };
-            int ret = poll(&pfd, 1, 100);
+            int ret = poll_sockets(&pfd, 1, 100);
             if (ret > 0)
             {
                 if (pfd.revents & POLLIN)
