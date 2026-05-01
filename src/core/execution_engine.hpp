@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------------------------------------------------
 /// \file execution_engine.hpp
 /// \date 12. 04. 2026
-/// \author Gemini CLI
+/// \author Patrik Holub
 ///
 /// \brief This file defines the execution engine of the emulator.
 // ---------------------------------------------------------------------------------------------------------------------
@@ -91,9 +91,9 @@ namespace zero_mate::core
     private:
         std::shared_ptr<arm1176jzf_s::CCPU_Core> m_cpu; ///< CPU
         std::vector<IExecution_Listener*> m_listeners;  ///< Collection of execution listeners
-        std::atomic<bool> m_running;                   ///< Is the CPU running?
-        std::atomic<bool> m_stop_requested;            ///< Has a stop been requested?
-        std::atomic<bool> m_breakpoint_hit;            ///< Has a breakpoint been hit?
+        std::atomic<bool> m_running;                    ///< Is the CPU running?
+        std::atomic<bool> m_stop_requested;             ///< Has a stop been requested?
+        std::atomic<bool> m_breakpoint_hit;             ///< Has a breakpoint been hit?
     };
 
 } // namespace zero_mate::core

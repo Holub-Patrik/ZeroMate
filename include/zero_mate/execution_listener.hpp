@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------------------------------------------------
 /// \file execution_listener.hpp
 /// \date 12. 04. 2026
-/// \author Gemini CLI
+/// \author Patrik Holub
 ///
 /// \brief This file defines an interface for objects that want to control the execution loop of the emulator.
 // ---------------------------------------------------------------------------------------------------------------------
