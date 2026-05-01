@@ -10,7 +10,7 @@ namespace handshake
     {
         Conf = 0,
         Response = 1,
-        Disconnect = 3,
+        Disconnect = 2,
     };
 
     // Generic envelope for component-driven handshakes
